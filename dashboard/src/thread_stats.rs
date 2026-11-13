@@ -1,12 +1,12 @@
-//! Where each of the validator's threads spent the last second, from
-//! `/proc/self/task`.
+//! Where each of the validator's threads spent the last second, from its
+//! process's `task` directory under `/proc`.
 
 use {
     serde::Serialize,
     std::{
         cmp::Ordering,
         collections::{BTreeSet, HashMap},
-        io,
+        io::{self, Read as _},
     },
 };
 
@@ -31,12 +31,15 @@ pub struct ThreadGroup {
     pub other: bool,
 }
 
-/// A thread in `known` keeps the name it has there; only the others have `comm` read.
-#[cfg(target_os = "linux")]
-pub fn read(known: Option<&HashMap<u64, ThreadReading>>) -> io::Result<Vec<ThreadReading>> {
+/// The threads of the process `pid`. A thread in `known` keeps the name it has there; only the
+/// others have `comm` read.
+pub fn read_of(
+    pid: u32,
+    known: Option<&HashMap<u64, ThreadReading>>,
+) -> io::Result<Vec<ThreadReading>> {
     let mut threads = Vec::new();
     let mut buf = [0u8; 128];
-    for entry in std::fs::read_dir("/proc/self/task")?.flatten() {
+    for entry in std::fs::read_dir(format!("/proc/{pid}/task"))?.flatten() {
         let Some(tid) = entry
             .file_name()
             .to_str()
@@ -71,66 +74,31 @@ pub fn read(known: Option<&HashMap<u64, ThreadReading>>) -> io::Result<Vec<Threa
 }
 
 /// One open and one read: both files are a few dozen bytes.
-#[cfg(target_os = "linux")]
 fn read_small<'a>(path: &std::path::Path, buf: &'a mut [u8]) -> Option<&'a str> {
-    use std::io::Read as _;
     let len = std::fs::File::open(path).ok()?.read(buf).ok()?;
     std::str::from_utf8(buf.get(..len)?).ok()
 }
 
-#[cfg(not(target_os = "linux"))]
-pub fn read(_known: Option<&HashMap<u64, ThreadReading>>) -> io::Result<Vec<ThreadReading>> {
-    Err(io::ErrorKind::Unsupported.into())
-}
-
+/// The cores the thread `tid` may run on, of whichever process; a process's own are its main
+/// thread's, whose id is the process's.
 #[cfg(target_os = "linux")]
-pub fn cores_allowed(tid: u64) -> Option<String> {
-    let status = std::fs::read_to_string(format!("/proc/self/task/{tid}/status")).ok()?;
-    parse_cpus_allowed(&status)
+pub fn cores_allowed(tid: u64) -> Option<BTreeSet<usize>> {
+    let cpus = agave_cpu_utils::cpu_affinity(Some(i32::try_from(tid).ok()?)).ok()?;
+    Some(cpus.iter().map(|cpu| **cpu).collect())
 }
 
 #[cfg(not(target_os = "linux"))]
-pub fn cores_allowed(_tid: u64) -> Option<String> {
+pub fn cores_allowed(_tid: u64) -> Option<BTreeSet<usize>> {
     None
 }
 
 /// `12345678 2345 67`: nanoseconds on a cpu, nanoseconds runnable and waiting
 /// for one, and timeslices.
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn parse_schedstat(contents: &str) -> Option<(u64, u64)> {
     let mut fields = contents.split_whitespace();
     let on_cpu = fields.next()?.parse().ok()?;
     let waiting = fields.next()?.parse().ok()?;
     Some((on_cpu, waiting))
-}
-
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-fn parse_cpus_allowed(status: &str) -> Option<String> {
-    status
-        .lines()
-        .find_map(|line| line.strip_prefix("Cpus_allowed_list:"))
-        .map(|list| list.trim().to_string())
-        .filter(|list| !list.is_empty())
-}
-
-pub fn cores_in(list: &str) -> usize {
-    parse_cores(list).len()
-}
-
-fn parse_cores(list: &str) -> BTreeSet<usize> {
-    list.split(',')
-        .flat_map(|part| match part.trim().split_once('-') {
-            Some((from, to)) => {
-                let from: usize = from.parse().unwrap_or(0);
-                let to: usize = to.parse().unwrap_or(0);
-                from..=to
-            }
-            None => {
-                let core: usize = part.trim().parse().unwrap_or(0);
-                core..=core
-            }
-        })
-        .collect()
 }
 
 /// Cores back into the kernel's form, runs folded: `{2, 4, 5, 6, 7}` is `2,4-7`.
@@ -172,7 +140,7 @@ struct GroupSum {
 pub fn group_shares(
     previous: &HashMap<u64, ThreadReading>,
     current: &[ThreadReading],
-    pinning: &HashMap<u64, Option<String>>,
+    pinning: &HashMap<u64, Option<BTreeSet<usize>>>,
     interval_nanos: u64,
 ) -> Vec<ThreadGroup> {
     let mut groups: HashMap<&str, GroupSum> = HashMap::new();
@@ -191,10 +159,7 @@ pub fn group_shares(
         sum.waiting_nanos = sum
             .waiting_nanos
             .saturating_add(thread.waiting_nanos.saturating_sub(before.waiting_nanos));
-        let allowed = pinning
-            .get(&thread.tid)
-            .and_then(|list| list.as_deref())
-            .map(parse_cores);
+        let allowed = pinning.get(&thread.tid).cloned().flatten();
         sum.cores = match (sum.cores.take(), allowed) {
             (None, allowed) => Some(allowed),
             (Some(Some(mut held)), Some(allowed)) => {
@@ -325,28 +290,23 @@ mod tests {
         assert_eq!(parse_schedstat(""), None);
     }
 
-    #[test]
-    fn test_the_allowed_cores_are_one_line_of_the_status_file() {
-        let status = "Name:\tsolPohTickProd\nState:\tR \
-                      (running)\nCpus_allowed:\t8\nCpus_allowed_list:\t3\nMems_allowed_list:\t0\n";
-        assert_eq!(parse_cpus_allowed(status).as_deref(), Some("3"));
-        assert_eq!(parse_cpus_allowed("Name:\tx\n"), None);
+    fn cores(list: &[usize]) -> BTreeSet<usize> {
+        list.iter().copied().collect()
     }
 
     #[test]
-    fn test_a_core_list_is_counted_across_ranges() {
-        assert_eq!(cores_in("0-23"), 24);
-        assert_eq!(cores_in("3"), 1);
-        assert_eq!(cores_in("0-3,8-11"), 8);
-        assert_eq!(cores_in("0-3,8"), 5);
+    fn test_a_core_list_is_folded_into_runs() {
+        assert_eq!(format_cores(&cores(&[2, 4, 5, 6, 7])), "2,4-7");
+        assert_eq!(format_cores(&cores(&[3])), "3");
+        assert_eq!(format_cores(&(0..=23).collect()), "0-23");
+        assert_eq!(format_cores(&cores(&[7, 5, 4, 6])), "4-7");
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
-    fn test_a_core_list_survives_the_round_trip() {
-        assert_eq!(format_cores(&parse_cores("2,4-7")), "2,4-7");
-        assert_eq!(format_cores(&parse_cores("3")), "3");
-        assert_eq!(format_cores(&parse_cores("0-23")), "0-23");
-        assert_eq!(format_cores(&parse_cores("7,5,4,6")), "4-7");
+    fn test_this_process_may_run_on_some_core() {
+        let main = u64::from(std::process::id());
+        assert!(cores_allowed(main).is_some_and(|cores| !cores.is_empty()));
     }
 
     #[test]
@@ -405,22 +365,19 @@ mod tests {
 
     #[test]
     fn test_pinning_needs_the_whole_group() {
-        let before = by_tid(&[
-            reading(1, "solPohTickProd", 0, 0),
-            reading(10, "solScHandleV00", 0, 0),
-            reading(11, "solScHandleV01", 0, 0),
-        ]);
-        let now = [
-            reading(1, "solPohTickProd", 1, 0),
-            reading(10, "solScHandleV00", 1, 0),
-            reading(11, "solScHandleV01", 1, 0),
-        ];
+        let at = |on_cpu| {
+            [
+                reading(1, "solPohTickProd", on_cpu, 0),
+                reading(10, "solScHandleV00", on_cpu, 0),
+                reading(11, "solScHandleV01", on_cpu, 0),
+            ]
+        };
         let pinning = HashMap::from([
-            (1, Some("3".to_string())),
-            (10, Some("12-22".to_string())),
+            (1, Some(cores(&[3]))),
+            (10, Some((12..=22).collect())),
             (11, None),
         ]);
-        let mut groups = group_shares(&before, &now, &pinning, SECOND);
+        let mut groups = group_shares(&by_tid(&at(0)), &at(1), &pinning, SECOND);
         groups.sort_by(|a, b| a.name.cmp(&b.name));
         assert_eq!(groups[0].name, "solPohTickProd");
         assert_eq!(groups[0].cores.as_deref(), Some("3"));
@@ -433,25 +390,16 @@ mod tests {
 
     #[test]
     fn test_a_pool_pinned_one_thread_to_a_core_reports_the_union() {
-        let before = by_tid(&[
-            reading(10, "solTransmIO00", 0, 0),
-            reading(11, "solTransmIO01", 0, 0),
-            reading(12, "solTransmIO02", 0, 0),
-            reading(13, "solTransmIO03", 0, 0),
-        ]);
-        let now = [
-            reading(10, "solTransmIO00", 1, 0),
-            reading(11, "solTransmIO01", 1, 0),
-            reading(12, "solTransmIO02", 1, 0),
-            reading(13, "solTransmIO03", 1, 0),
-        ];
-        let pinning = HashMap::from([
-            (10, Some("4".to_string())),
-            (11, Some("5".to_string())),
-            (12, Some("6".to_string())),
-            (13, Some("7".to_string())),
-        ]);
-        let groups = group_shares(&before, &now, &pinning, SECOND);
+        let at = |on_cpu| -> Vec<ThreadReading> {
+            (10..14)
+                .map(|tid| reading(tid, &format!("solTransmIO{tid}"), on_cpu, 0))
+                .collect()
+        };
+        let pinning: HashMap<u64, _> = (10..)
+            .zip(4..8)
+            .map(|(tid, core)| (tid, Some(cores(&[core]))))
+            .collect();
+        let groups = group_shares(&by_tid(&at(0)), &at(1), &pinning, SECOND);
         assert_eq!(groups[0].cores.as_deref(), Some("4-7"));
     }
 
@@ -464,32 +412,6 @@ mod tests {
             waiting: 0.0,
             other: false,
         }
-    }
-
-    #[test]
-    fn test_rows_are_top_groups_plus_the_rest() {
-        // Gossip is quiet this second but busy all minute, so it keeps its row above the handler
-        // that just spiked.
-        let groups = vec![
-            group("solPohTickProd", 1, 0.94),
-            group("solGossip", 6, 0.01),
-            group("solScHandleV", 11, 0.30),
-            group("solRepairSvc", 1, 0.02),
-        ];
-        let means = HashMap::from([
-            ("solPohTickProd", 0.95),
-            ("solGossip", 0.40),
-            ("solScHandleV", 0.08),
-            ("solRepairSvc", 0.02),
-        ]);
-        let rows = select_rows(groups, &means, 2);
-        assert_eq!(rows.len(), 3);
-        assert_eq!(rows[0].name, "solPohTickProd");
-        assert_eq!(rows[1].name, "solGossip");
-        assert!(rows[2].other);
-        assert_eq!(rows[2].count, 12, "every thread not shown");
-        // A mean per thread across the rest: (0.30 * 11 + 0.02 * 1) / 12.
-        assert!((rows[2].on_cpu - (0.30 * 11.0 + 0.02) / 12.0).abs() < 1e-9);
     }
 
     #[test]
@@ -526,23 +448,26 @@ mod tests {
                 ("solScHandleV".to_string(), 0.125),
             ],
         ];
+        // Gossip is quiet this second but busy across the window, so it keeps its row above the
+        // handler that just spiked.
         let groups = vec![
             group("solPohTickProd", 1, 0.75),
-            group("solGossip", 6, 0.5),
+            group("solGossip", 6, 0.0625),
             group("solScHandleV", 11, 0.25),
             group("solRepairSvc", 1, 0.0625),
         ];
         let rows = select_rows(groups, &window_means(&recent), 2);
+        // The rest fold into a mean per thread: (0.25 * 11 + 0.0625) / 12.
         assert_eq!(
             serde_json::to_string(&rows).unwrap(),
-            r#"[{"name":"solPohTickProd","count":1,"cores":null,"on_cpu":0.75,"waiting":0.0,"other":false},{"name":"solGossip","count":6,"cores":null,"on_cpu":0.5,"waiting":0.0,"other":false},{"name":"","count":12,"cores":null,"on_cpu":0.234375,"waiting":0.0,"other":true}]"#
+            r#"[{"name":"solPohTickProd","count":1,"cores":null,"on_cpu":0.75,"waiting":0.0,"other":false},{"name":"solGossip","count":6,"cores":null,"on_cpu":0.0625,"waiting":0.0,"other":false},{"name":"","count":12,"cores":null,"on_cpu":0.234375,"waiting":0.0,"other":true}]"#
         );
     }
 
     #[cfg(target_os = "linux")]
     #[test]
     fn test_this_process_reports_its_own_threads() {
-        let threads = read(None).unwrap();
+        let threads = read_of(std::process::id(), None).unwrap();
         assert!(!threads.is_empty());
         assert!(threads.iter().all(|thread| !thread.name.is_empty()));
     }
@@ -555,12 +480,12 @@ mod tests {
             let _ = wait.recv();
         });
         let main = u64::from(std::process::id());
-        let mut known = by_tid(&read(None).unwrap());
+        let mut known = by_tid(&read_of(std::process::id(), None).unwrap());
         for reading in known.values_mut() {
             reading.name = "carried".to_string();
         }
         known.remove(&main);
-        let threads = read(Some(&known)).unwrap();
+        let threads = read_of(std::process::id(), Some(&known)).unwrap();
         drop(release);
         helper.join().unwrap();
 

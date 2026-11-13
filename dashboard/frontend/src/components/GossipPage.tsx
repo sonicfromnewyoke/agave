@@ -16,21 +16,16 @@ import {
   gossipPeers,
   gossipVerdict,
   inFilter,
-  ledgerParts,
   matchesSearch,
   MESSAGE_LABELS,
   nextSort,
   PEER_FILTERS,
   rate,
-  SILENT_MILLIS,
-  snapshotParts,
   sortPeers,
-  spanParts,
   stakeText,
   timeParts,
   type EntryRow,
   type GossipPeer,
-  type Part,
   type PeerColumn,
   type ArrivalKind,
   type PeerFilter,
@@ -343,10 +338,6 @@ const HEADINGS: { column: PeerColumn; label: string; numeric: boolean }[] = [
   { column: "client", label: "Client", numeric: false },
   { column: "ip", label: "IP", numeric: false },
   { column: "rpc", label: "RPC", numeric: true },
-  { column: "heard", label: "Last heard", numeric: true },
-  { column: "up", label: "Up for", numeric: true },
-  { column: "snapshot", label: "Snapshot", numeric: true },
-  { column: "ledger", label: "Ledger from", numeric: true },
 ];
 
 function PeersCard({
@@ -367,26 +358,24 @@ function PeersCard({
   const { text, only, where, picked } = search;
   const [sort, setSort] = useState<PeerSort>(FIRST_SORT);
   const onSort = useCallback((column: PeerColumn) => setSort((was) => nextSort(was, column)), []);
-  // Read when the list arrives, so the filters and the table agree until the next one.
   const arrivalKind: ArrivalKind = picked?.kind ?? "notarize";
-  const { peers, now } = useMemo(() => ({ peers: list ? gossipPeers(list) : [], now: Date.now() }), [list]);
-  const offered = useMemo(() => peerOffered(peers, now), [peers, now]);
+  const peers = useMemo(() => (list ? gossipPeers(list) : []), [list]);
+  const offered = useMemo(() => peerOffered(peers), [peers]);
   const words = useMemo(() => readPeerSearch(text, offered).words, [text, offered]);
   const rows = useMemo(() => {
-    const clock = { now, slotMillis, arrivalKind };
+    const clock = { slotMillis, arrivalKind };
     return sortPeers(
       peers.filter(
         (peer) =>
           (!picked || picked.identities.has(peer.identity)) &&
-          only.every((filter) => inFilter(peer, filter, now)) &&
+          only.every((filter) => inFilter(peer, filter)) &&
           where.every((condition) => peerHolds(condition, peer, clock)) &&
           matchesSearch(peer, words),
       ),
       sort,
-      now,
       arrivalKind,
     );
-  }, [peers, picked, only, where, words, sort, now, slotMillis, arrivalKind]);
+  }, [peers, picked, only, where, words, sort, slotMillis, arrivalKind]);
   const searched = picked !== null || only.length > 0 || where.length > 0 || words !== "";
 
   const phone = useNarrow();
@@ -485,7 +474,7 @@ function PeersCard({
           suggestFor={suggestFor}
           rows={browseRows}
           titles={PEER_TITLES}
-          foot="Times take s, m, h or d; a bare number is minutes."
+          foot=""
           pills={pills}
           editing={editing}
           inputRef={searchBox}
@@ -518,16 +507,12 @@ function PeersCard({
           sort={sort}
           onSort={onSort}
           ours={ours}
-          now={now}
           slotMillis={slotMillis}
           searched={searched}
           arrivalEpoch={list.vote_arrival_epoch ?? null}
           arrivalKind={arrivalKind}
         />
       )}
-      <div className="card-footnote">
-        Snapshot: slots behind our root. Ledger from: how far back the peer can serve repair.
-      </div>
     </Card>
   );
 }
@@ -538,7 +523,6 @@ const PeersTable = memo(function PeersTable({
   sort,
   onSort,
   ours,
-  now,
   slotMillis,
   searched,
   arrivalEpoch,
@@ -548,7 +532,6 @@ const PeersTable = memo(function PeersTable({
   sort: PeerSort;
   onSort: (column: PeerColumn) => void;
   ours: string | null;
-  now: number;
   slotMillis: number | null;
   searched: boolean;
   arrivalEpoch: number | null;
@@ -619,7 +602,6 @@ const PeersTable = memo(function PeersTable({
               key={peer.identity}
               peer={peer}
               ours={peer.identity === ours}
-              now={now}
               slotMillis={slotMillis}
               finalization={finalization}
               arrivals={arrivals}
@@ -645,7 +627,6 @@ const PeersTable = memo(function PeersTable({
 const PeerLine = memo(function PeerLine({
   peer,
   ours,
-  now,
   slotMillis,
   finalization,
   arrivals,
@@ -655,7 +636,6 @@ const PeerLine = memo(function PeerLine({
 }: {
   peer: GossipPeer;
   ours: boolean;
-  now: number;
   slotMillis: number | null;
   finalization: boolean;
   arrivals: boolean;
@@ -714,18 +694,6 @@ const PeerLine = memo(function PeerLine({
         )}
       </td>
       <td className="is-num">{peer.rpc ?? "—"}</td>
-      <td className={`is-num${peer.heardAgo > SILENT_MILLIS ? " tone-warn" : ""}`}>
-        <Parts parts={spanParts(peer.heardAgo)} />
-      </td>
-      <td className="is-num">
-        <Parts parts={peer.started > 0 ? spanParts(now - peer.started) : null} />
-      </td>
-      <td className="is-num">
-        <SnapshotAges peer={peer} />
-      </td>
-      <td className="is-num">
-        <Parts parts={ledgerParts(peer.ledger, slotMillis)} />
-      </td>
     </tr>
   );
 });
@@ -735,37 +703,6 @@ function DelinquentTag({ behind, slotMillis }: { behind: number | null; slotMill
     <span className="tag-delinquent" title={delinquentTitle(behind, slotMillis === null ? undefined : slotMillis * 1e6)}>
       delinquent
     </span>
-  );
-}
-
-function Parts({ parts }: { parts: Part[] | null }) {
-  if (parts === null) return <>—</>;
-  return (
-    <>
-      {parts.map((part, index) => (
-        <span key={index}>
-          {index > 0 && " "}
-          {part.value}
-          <span className="gossip-unit">{part.unit}</span>
-        </span>
-      ))}
-    </>
-  );
-}
-
-function SnapshotAges({ peer }: { peer: GossipPeer }) {
-  const parts = snapshotParts(peer);
-  if (parts === null) return <>—</>;
-  return (
-    <>
-      {parts.map((part, index) => (
-        <span key={part.label}>
-          {index > 0 && <span className="gossip-unit"> · </span>}
-          <span className="gossip-unit">{part.label} </span>
-          {part.value ?? <span className="gossip-unit">none</span>}
-        </span>
-      ))}
-    </>
   );
 }
 

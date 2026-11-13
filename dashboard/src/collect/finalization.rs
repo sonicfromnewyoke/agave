@@ -3,21 +3,16 @@
 //! certificate's with the slot eight back, so a last vote near the newest in the bank was carried.
 
 use {
-    super::{Collector, cluster_charts::at_percent},
-    crate::geoip,
+    super::{MINUTE_MILLIS, cluster_charts::at_percent},
+    crate::metrics_tap::push_capped,
     serde::Serialize,
     solana_clock::Slot,
-    solana_gossip::contact_info::ContactInfo,
     solana_pubkey::Pubkey,
-    solana_runtime::bank::Bank,
-    solana_time_utils::timestamp,
     std::collections::{HashMap, VecDeque},
 };
 
 /// A last vote this close to the newest one in the bank counts as carried.
 const NEAR_SLOTS: u64 = 3;
-
-const MINUTE_MILLIS: u64 = 60_000;
 
 /// Minutes behind the trend.
 const TREND_MINUTES: usize = 60;
@@ -28,7 +23,7 @@ const WINDOW_MINUTES: u64 = 10;
 const BANDS: usize = 10;
 
 /// Behind the time to vote, as for finality.
-const VOTE_WINDOW_MILLIS: u64 = 60_000;
+pub const VOTE_WINDOW_MILLIS: u64 = 60_000;
 
 /// Fewer validators than this in our country and the share is compared with the cluster alone.
 const MIN_COUNTRY_VALIDATORS: usize = 5;
@@ -42,7 +37,7 @@ struct Minute {
 }
 
 #[derive(Debug, Default)]
-pub(super) struct FinalizationTally {
+pub struct FinalizationTally {
     minutes: VecDeque<Minute>,
 }
 
@@ -77,9 +72,9 @@ pub struct CountryShare {
 
 /// Our country and each staked vote account's, from gossip addresses.
 #[derive(Debug, Default)]
-pub(super) struct Places {
-    pub(super) ours: Option<&'static str>,
-    pub(super) by_vote: HashMap<Pubkey, &'static str>,
+pub struct Places {
+    pub ours: Option<&'static str>,
+    pub by_vote: HashMap<Pubkey, &'static str>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize)]
@@ -91,7 +86,7 @@ pub struct TrendMinute {
 
 impl FinalizationTally {
     /// One frozen block's staked vote accounts, each with its last voted slot.
-    pub(super) fn observe(&mut self, votes: &[(Pubkey, Slot)], now_millis: u64) {
+    pub fn observe(&mut self, votes: &[(Pubkey, Slot)], now_millis: u64) {
         let Some(front) = votes.iter().map(|(_, slot)| *slot).max() else {
             return;
         };
@@ -116,19 +111,17 @@ impl FinalizationTally {
             .back()
             .is_none_or(|minute| minute.start_millis != start_millis)
         {
-            self.minutes.push_back(Minute {
+            let minute = Minute {
                 start_millis,
                 ..Minute::default()
-            });
-            while self.minutes.len() > TREND_MINUTES.saturating_add(1) {
-                self.minutes.pop_front();
-            }
+            };
+            push_capped(&mut self.minutes, minute, TREND_MINUTES.saturating_add(1));
         }
         self.minutes.back_mut().expect("pushed above")
     }
 
     /// Each vote account's share over the window, for validators staked in at least half its blocks.
-    pub(super) fn shares(&self, now_millis: u64) -> HashMap<Pubkey, f64> {
+    pub fn shares(&self, now_millis: u64) -> HashMap<Pubkey, f64> {
         shares_of(self.window(now_millis))
     }
 
@@ -139,7 +132,7 @@ impl FinalizationTally {
             .filter(move |minute| minute.start_millis > since)
     }
 
-    pub(super) fn summary(
+    pub fn summary(
         &self,
         ours: &Pubkey,
         now_millis: u64,
@@ -191,92 +184,6 @@ impl FinalizationTally {
             vote_micros,
             country,
         })
-    }
-}
-
-impl Collector {
-    pub(super) fn observe_finalization(&mut self, bank: &Bank) {
-        if !bank.is_alpenglow() {
-            return;
-        }
-        // Only an account with a rank can be in a certificate.
-        let Some(ranks) = bank.get_rank_map(bank.slot()) else {
-            return;
-        };
-        let votes: Vec<(Pubkey, Slot)> = bank
-            .vote_accounts()
-            .iter()
-            .filter(|(vote, _)| ranks.get_rank_for_vote_pubkey(vote).is_some())
-            .filter_map(|(vote, (_, account))| {
-                Some((*vote, account.vote_state_view().last_voted_slot()?))
-            })
-            .collect();
-        self.finalization.observe(&votes, timestamp());
-    }
-
-    pub(super) fn collect_finalization_share(&mut self, bank: &Bank, peers: &[(ContactInfo, u64)]) {
-        let now_millis = timestamp();
-        let share = bank
-            .is_alpenglow()
-            .then(|| {
-                let vote_micros = self
-                    .metrics_tap
-                    .vote_lag_micros(now_millis, VOTE_WINDOW_MILLIS);
-                let places = self.places(bank, peers);
-                self.finalization
-                    .summary(&self.ctx.vote_account, now_millis, vote_micros, &places)
-            })
-            .flatten();
-        self.debounces
-            .finalization_share
-            .publish(&self.publisher, share);
-    }
-
-    /// Countries from gossip addresses; empty when our own address has none.
-    fn places(&self, bank: &Bank, peers: &[(ContactInfo, u64)]) -> Places {
-        let Some(ours) = self
-            .ctx
-            .cluster_info
-            .my_contact_info()
-            .gossip()
-            .and_then(|addr| geoip::country(addr.ip()))
-        else {
-            return Places::default();
-        };
-        let by_node: HashMap<Pubkey, &'static str> = peers
-            .iter()
-            .filter_map(|(contact, _)| {
-                Some((*contact.pubkey(), geoip::country(contact.gossip()?.ip())?))
-            })
-            .collect();
-        let mut by_vote: HashMap<Pubkey, &'static str> = bank
-            .vote_accounts()
-            .iter()
-            .filter(|(_, (stake, _))| *stake > 0)
-            .filter_map(|(vote, (_, account))| Some((*vote, *by_node.get(account.node_pubkey())?)))
-            .collect();
-        // The gossip table's copy leaves this node out.
-        by_vote.insert(self.ctx.vote_account, ours);
-        Places {
-            ours: Some(ours),
-            by_vote,
-        }
-    }
-
-    /// Each node's share over the window, for the peers list.
-    pub(super) fn finalization_by_node(
-        &self,
-        bank: &Bank,
-        now_millis: u64,
-    ) -> HashMap<Pubkey, f64> {
-        let shares = self.finalization.shares(now_millis);
-        if shares.is_empty() {
-            return HashMap::new();
-        }
-        bank.vote_accounts()
-            .iter()
-            .filter_map(|(vote, (_, account))| Some((*account.node_pubkey(), *shares.get(vote)?)))
-            .collect()
     }
 }
 
@@ -338,11 +245,7 @@ mod tests {
 
     #[test]
     fn test_a_vote_near_the_newest_was_carried() {
-        let (ours, near, behind) = (
-            Pubkey::new_unique(),
-            Pubkey::new_unique(),
-            Pubkey::new_unique(),
-        );
+        let [ours, near, behind] = std::array::from_fn(|_| Pubkey::new_unique());
         let mut tally = FinalizationTally::default();
         for slot in 100u64..110 {
             // Ours is carried in every other block, the reward certificate's eight back otherwise.

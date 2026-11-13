@@ -8,22 +8,22 @@ use {
         history::SlotHistory,
         proto::{
             DEFLATE_PROTOCOL, Frame, Message, Publisher, Request, coalesce, encode_json_with_id,
-            encode_with_id,
         },
         search::{SearchParams, future, leader_rows, search, summarize},
         validator_info::ValidatorInfoCache,
     },
+    serde::{Serialize, de::DeserializeOwned},
     soketto::{
         Incoming,
         handshake::{Server, server},
     },
     solana_clock::Slot,
+    solana_net_utils::token_bucket::TokenBucket,
     solana_time_utils::timestamp,
     std::{
         io,
         net::IpAddr,
-        sync::{Arc, RwLock, atomic::Ordering},
-        time::Instant,
+        sync::{Arc, PoisonError, RwLock},
     },
     thiserror::Error,
     tokio::{
@@ -45,12 +45,6 @@ const WEBSOCKET_PATH: &str = "/websocket";
 /// One search at a time across every connection, since each can read the whole history.
 static SEARCHES: Semaphore = Semaphore::const_new(1);
 
-/// Long messages are deflated on the blocking pool, one at a time across every connection.
-static DEFLATES: Semaphore = Semaphore::const_new(1);
-
-/// A millisecond or two of deflate; a shorter message is deflated as it is sent.
-const DEFLATE_AHEAD_FROM: usize = 64 * 1024;
-
 const MAX_REQUEST_HEAD: usize = 8192;
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
@@ -63,12 +57,14 @@ const WRITE_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Unsent bytes the kernel holds for a websocket. A slow viewer's backlog then waits in the
 /// update queue, where a burst is coalesced, rather than in a socket buffer that is sent as is.
+#[cfg(target_os = "linux")]
 const UNSENT_LIMIT: u32 = 16 * 1024;
 
 const MAX_WEBSOCKET_CLIENTS: usize = 64;
 
-const REPLY_BURST: u32 = 8;
-const REPLY_SPACING: Duration = Duration::from_millis(250);
+/// Requests answered at once; after those, one every quarter second.
+const REPLY_BURST: u64 = 8;
+const REPLIES_PER_SECOND: f64 = 4.0;
 
 /// Out of descriptors, `accept` fails at once, so retrying straight away spins.
 const ACCEPT_BACKOFF: Duration = Duration::from_millis(100);
@@ -111,7 +107,6 @@ enum ConnectionError {
     Oversized(usize),
 }
 
-/// What every connection is answered from.
 #[derive(Clone)]
 pub struct Handles {
     pub publisher: Arc<Publisher>,
@@ -156,18 +151,25 @@ async fn handle(
         return Ok(());
     };
 
-    let (head, head_len) = timeout(REQUEST_TIMEOUT, peek_request_head(&socket))
-        .await
-        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "request head"))??;
+    let (head, head_len) =
+        within(REQUEST_TIMEOUT, "request head", peek_request_head(&socket)).await??;
+
+    // The peek stops short of the blank line only at its limit.
+    if !head.contains("\r\n\r\n") {
+        log::debug!("dashboard: refusing a request head of {MAX_REQUEST_HEAD} bytes or more");
+        let reply = Reply::text(431, b"request head too large");
+        return answer_http(socket, &head, head_len, reply).await;
+    }
 
     // Checked before anything is served: a page served to a rebound name would be
     // same-origin with the dashboard.
     if !host_is_allowed(&head, allowed_hosts) {
         log::debug!(
-            "dashboard: refusing host {:?}; add it with --dashboard-allowed-host",
+            "dashboard: refusing host {:?}; add it with --allowed-host",
             for_logging(header(&head, "host").unwrap_or("(absent)"))
         );
-        return refuse(socket, head_len, 421, b"unrecognised host").await;
+        let reply = Reply::text(421, b"unrecognised host");
+        return answer_http(socket, &head, head_len, reply).await;
     }
 
     if is_websocket_upgrade(&head) {
@@ -176,37 +178,70 @@ async fn handle(
                 "dashboard: refusing websocket from origin {:?}",
                 for_logging(header(&head, "origin").unwrap_or("(absent)"))
             );
-            return refuse(socket, head_len, 403, b"origin not allowed").await;
+            let reply = Reply::text(403, b"origin not allowed");
+            return answer_http(socket, &head, head_len, reply).await;
         }
         let Ok(_permit) = limits.websockets.try_acquire_owned() else {
             log::info!(
                 "dashboard: refusing a websocket, {MAX_WEBSOCKET_CLIENTS} clients already \
                  connected"
             );
-            return refuse(socket, head_len, 503, b"too many dashboard clients").await;
+            let reply = Reply::text(503, b"too many dashboard clients");
+            return answer_http(socket, &head, head_len, reply).await;
         };
         let path = request_path(&head).to_string();
         serve_websocket(socket, handles, &path).await
     } else {
-        // Closing with unread data sends RST rather than FIN, which truncates the response.
-        let mut consumed = vec![0u8; head_len];
-        socket.read_exact(&mut consumed).await?;
-        serve_http(socket, &head)
-            .await
-            .map_err(ConnectionError::from)
+        let reply = http_reply(&head);
+        answer_http(socket, &head, head_len, reply).await
     }
 }
 
-async fn refuse(
-    mut socket: TcpStream,
-    head_len: usize,
+struct Reply {
     status: u16,
-    body: &[u8],
+    content_type: &'static str,
+    body: &'static [u8],
+    immutable: bool,
+    /// The content-encoding and vary lines, empty for a body with one form.
+    coding: &'static str,
+}
+
+impl Reply {
+    fn text(status: u16, body: &'static [u8]) -> Self {
+        Self {
+            status,
+            content_type: "text/plain; charset=utf-8",
+            body,
+            immutable: false,
+            coding: "",
+        }
+    }
+}
+
+/// Reads the head off the socket, answers and closes. A HEAD request is sent the headers alone.
+async fn answer_http(
+    mut socket: TcpStream,
+    head: &str,
+    head_len: usize,
+    reply: Reply,
 ) -> Result<(), ConnectionError> {
+    // Closing with unread data sends RST rather than FIN, which truncates the response.
     let mut consumed = vec![0u8; head_len];
     socket.read_exact(&mut consumed).await?;
-    let head = response_head(status, "text/plain; charset=utf-8", body.len(), false, "");
-    write_and_close(&mut socket, head.as_bytes(), body).await?;
+    let response = response_head(&reply);
+    // Embedded assets are written from the binary, not copied.
+    let body = if head.starts_with("HEAD ") {
+        &[]
+    } else {
+        reply.body
+    };
+    within(WRITE_TIMEOUT, "http response", async {
+        socket.write_all(response.as_bytes()).await?;
+        socket.write_all(body).await?;
+        socket.flush().await?;
+        socket.shutdown().await
+    })
+    .await??;
     Ok(())
 }
 
@@ -305,75 +340,46 @@ fn request_path(head: &str) -> &str {
         .unwrap_or("/")
 }
 
-async fn serve_http(mut socket: TcpStream, head: &str) -> io::Result<()> {
-    let path = request_path(head);
-    let is_read = head.starts_with("GET ") || head.starts_with("HEAD ");
-
-    let gzip = accepts_gzip(head);
-    let (status, content_type, body, immutable, coding): (u16, &str, &[u8], bool, &str) =
-        if !is_read {
-            (
-                405,
-                "text/plain; charset=utf-8",
-                b"method not allowed",
-                false,
-                "",
-            )
-        } else if assets::ASSETS.is_empty() {
-            (
-                200,
-                "text/html; charset=utf-8",
-                MISSING_FRONTEND.as_bytes(),
-                false,
-                "",
-            )
-        } else {
-            match lookup(path, gzip) {
-                // Hashed filenames cache forever; the entry document must not, or a redeploy is
-                // never picked up.
-                Some((content_type, body, coding)) => (
-                    200,
-                    content_type,
-                    body,
-                    path.starts_with("/assets/"),
-                    coding,
-                ),
-                // Unknown paths fall through to the SPA so client-side routes
-                // survive a hard refresh.
-                None => match lookup("/index.html", gzip) {
-                    Some((content_type, body, coding)) => (200, content_type, body, false, coding),
-                    None => (404, "text/plain; charset=utf-8", b"not found", false, ""),
-                },
-            }
+/// The page and its assets; anything but a read is refused.
+fn http_reply(head: &str) -> Reply {
+    if !(head.starts_with("GET ") || head.starts_with("HEAD ")) {
+        return Reply::text(405, b"method not allowed");
+    }
+    if assets::ASSETS.is_empty() {
+        return Reply {
+            content_type: "text/html; charset=utf-8",
+            ..Reply::text(200, MISSING_FRONTEND.as_bytes())
         };
-
-    let response = response_head(status, content_type, body.len(), immutable, coding);
-    write_and_close(&mut socket, response.as_bytes(), body).await
-}
-
-/// Embedded assets are written from the binary, not copied.
-async fn write_and_close(socket: &mut TcpStream, head: &[u8], body: &[u8]) -> io::Result<()> {
-    timeout(WRITE_TIMEOUT, async {
-        socket.write_all(head).await?;
-        socket.write_all(body).await?;
-        socket.flush().await?;
-        socket.shutdown().await
-    })
-    .await
-    .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "http response"))?
+    }
+    let path = request_path(head);
+    let gzip = accepts_gzip(head);
+    match lookup(path, gzip) {
+        // Hashed filenames cache forever; the entry document must not, or a redeploy is never
+        // picked up.
+        Some(found) => Reply {
+            immutable: path.starts_with("/assets/"),
+            ..found
+        },
+        // Unknown paths fall through to the SPA so client-side routes survive a hard refresh.
+        None => lookup("/index.html", gzip).unwrap_or(Reply::text(404, b"not found")),
+    }
 }
 
 /// Takes the gzip copy when `gzip` and the asset has one; such an asset sends `vary` either way.
-fn lookup(path: &str, gzip: bool) -> Option<(&'static str, &'static [u8], &'static str)> {
+fn lookup(path: &str, gzip: bool) -> Option<Reply> {
     let path = if path == "/" { "/index.html" } else { path };
-    assets::ASSETS
-        .iter()
-        .find(|(route, ..)| *route == path)
-        .map(|&(_, content_type, raw, packed)| match packed {
-            Some(packed) if gzip => (content_type, packed, GZIP_HEADERS),
-            Some(_) => (content_type, raw, VARY_HEADER),
-            None => (content_type, raw, ""),
-        })
+    let &(_, content_type, raw, packed) =
+        assets::ASSETS.iter().find(|(route, ..)| *route == path)?;
+    let (body, coding) = match packed {
+        Some(packed) if gzip => (packed, GZIP_HEADERS),
+        Some(_) => (raw, VARY_HEADER),
+        None => (raw, ""),
+    };
+    Some(Reply {
+        content_type,
+        coding,
+        ..Reply::text(200, body)
+    })
 }
 
 const VARY_HEADER: &str = "vary: accept-encoding\r\n";
@@ -414,77 +420,60 @@ const SECURITY_HEADERS: &str = concat!(
     "referrer-policy: no-referrer\r\n",
 );
 
-/// `coding` holds the content-encoding and vary lines, empty for a body with one form.
-fn response_head(
-    status: u16,
-    content_type: &str,
-    len: usize,
-    immutable: bool,
-    coding: &str,
-) -> String {
-    let reason = match status {
-        403 => "Forbidden",
-        404 => "Not Found",
-        405 => "Method Not Allowed",
-        421 => "Misdirected Request",
-        503 => "Service Unavailable",
-        _ => "OK",
-    };
-    let cache = if immutable {
+/// The length is the body's, also for a HEAD request, which is sent no body.
+fn response_head(reply: &Reply) -> String {
+    let Reply {
+        status,
+        content_type,
+        body,
+        immutable,
+        coding,
+    } = reply;
+    let reason = http::StatusCode::from_u16(*status)
+        .ok()
+        .and_then(|code| code.canonical_reason())
+        .unwrap_or_default();
+    let cache = if *immutable {
         "public, max-age=31536000, immutable"
     } else {
         "no-cache"
     };
+    let len = body.len();
     format!(
         "HTTP/1.1 {status} {reason}\r\ncontent-type: {content_type}\r\ncontent-length: \
          {len}\r\ncache-control: {cache}\r\n{coding}{SECURITY_HEADERS}connection: close\r\n\r\n"
     )
 }
 
-async fn send_frame(
-    sender: &mut soketto::Sender<Compat<TcpStream>>,
-    message: &Message,
-    deflate: bool,
-) -> Result<(), soketto::connection::Error> {
-    match message.frame(deflate) {
-        Frame::Text(text) => sender.send_text(text).await,
-        Frame::Binary(bytes) => sender.send_binary(bytes).await,
-    }
-}
-
-fn needs_deflating_ahead(message: &Message) -> bool {
-    message.text().len() >= DEFLATE_AHEAD_FROM && message.deflate_pending()
-}
-
-/// Deflates the long messages on the blocking pool, so the send that follows only copies bytes;
-/// if this cannot run, `send_frame` deflates inline.
-async fn deflate_ahead(messages: &[Message], deflate: bool) {
-    if !deflate || !messages.iter().any(needs_deflating_ahead) {
-        return;
-    }
-    let Ok(_permit) = DEFLATES.acquire().await else {
-        return;
-    };
-    // Another connection may have deflated the same messages while this one waited.
-    let pending: Vec<Message> = messages
-        .iter()
-        .filter(|message| needs_deflating_ahead(message))
-        .cloned()
-        .collect();
-    if pending.is_empty() {
-        return;
-    }
-    let _ = spawn_blocking(move || pending.iter().for_each(Message::deflate_now)).await;
-}
-
-/// Fails the connection if a send cannot complete promptly. Cancelling a
-/// partly written frame leaves the stream indeterminate, so a timeout is fatal.
-async fn send_within(
-    send: impl Future<Output = Result<(), soketto::connection::Error>>,
-) -> Result<(), ConnectionError> {
-    timeout(WRITE_TIMEOUT, send)
+async fn within<T>(
+    limit: Duration,
+    what: &'static str,
+    future: impl Future<Output = T>,
+) -> io::Result<T> {
+    timeout(limit, future)
         .await
-        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "websocket send"))??;
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, what))
+}
+
+/// Sends each message, deflated for a client that takes it, then flushes. Taken by value, so each
+/// message is released once sent. Cancelling a partly written frame leaves the stream
+/// indeterminate, so a timeout is fatal.
+async fn send_all(
+    sender: &mut soketto::Sender<Compat<TcpStream>>,
+    messages: impl IntoIterator<Item = Message>,
+    deflate: bool,
+    what: &'static str,
+) -> Result<(), ConnectionError> {
+    for message in messages {
+        let send = async {
+            match message.frame(deflate) {
+                Frame::Text(text) => sender.send_text(text).await,
+                Frame::Binary(bytes) => sender.send_binary(bytes).await,
+            }
+        };
+        within(WRITE_TIMEOUT, what, send).await??;
+    }
+    within(WRITE_TIMEOUT, what, sender.flush()).await??;
     Ok(())
 }
 
@@ -508,16 +497,15 @@ async fn serve_websocket(
     let mut server = Server::new(socket.compat());
     // Only a protocol the server lists is reported back from the request.
     server.add_protocol(DEFLATE_PROTOCOL);
-    // Bounded like the peek: a head cut off at its limit leaves soketto waiting for the rest.
-    let (key, deflate) = timeout(REQUEST_TIMEOUT, async {
+    // Bounded like the peek.
+    let (key, deflate) = within(REQUEST_TIMEOUT, "websocket request", async {
         let request = server.receive_request().await?;
         let deflate = request
             .protocols()
             .any(|protocol| protocol == DEFLATE_PROTOCOL);
         Ok::<_, soketto::handshake::Error>((request.key(), deflate))
     })
-    .await
-    .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "websocket request"))??;
+    .await??;
 
     let response = if path == WEBSOCKET_PATH {
         server::Response::Accept {
@@ -527,9 +515,12 @@ async fn serve_websocket(
     } else {
         server::Response::Reject { status_code: 404 }
     };
-    timeout(WRITE_TIMEOUT, server.send_response(&response))
-        .await
-        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "websocket response"))??;
+    within(
+        WRITE_TIMEOUT,
+        "websocket response",
+        server.send_response(&response),
+    )
+    .await??;
     if path != WEBSOCKET_PATH {
         return Ok(());
     }
@@ -546,31 +537,12 @@ async fn serve_websocket(
     builder.set_max_frame_size(MAX_CLIENT_MESSAGE);
     let (mut sender, mut receiver) = builder.finish();
 
-    deflate_ahead(&snapshot, deflate).await;
-    let count = snapshot.len();
-    let total = snapshot.iter().fold(0usize, |sum, message| {
-        sum.saturating_add(message.wire_len(deflate))
-    });
-    // Taken by value: each message is released once sent, not when the connection closes.
-    for (index, message) in snapshot.into_iter().enumerate() {
-        let sent = timeout(WRITE_TIMEOUT, send_frame(&mut sender, &message, deflate))
-            .await
-            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "snapshot send"))?;
-        if let Err(err) = sent {
-            log::warn!(
-                "dashboard: snapshot send failed on message {} of {count} ({} bytes, {total} \
-                 bytes total, starts {:.120}): {err}",
-                index.saturating_add(1),
-                message.wire_len(deflate),
-                message.text(),
-            );
-            return Err(err.into());
-        }
-        send_within(sender.flush()).await?;
-    }
+    send_all(&mut sender, snapshot, deflate, "snapshot send")
+        .await
+        .inspect_err(|err| log::warn!("dashboard: snapshot send failed: {err}"))?;
 
     let mut incoming = Vec::new();
-    let mut pace = ReplyPace::new(Instant::now());
+    let pace = TokenBucket::new(REPLY_BURST, REPLY_BURST, REPLIES_PER_SECOND);
     loop {
         // soketto's `receive` is not cancel safe, so it is polled to
         // completion in an inner loop rather than dropped by `select!`.
@@ -605,12 +577,8 @@ async fn serve_websocket(
                                     }
                                 }
                             }
-                            let burst = coalesce(burst);
-                            deflate_ahead(&burst, deflate).await;
-                            for message in burst {
-                                send_within(send_frame(&mut sender, &message, deflate)).await?;
-                            }
-                            send_within(sender.flush()).await?;
+                            send_all(&mut sender, coalesce(burst), deflate, "websocket send")
+                                .await?;
                         }
                         Err(RecvError::Lagged(_)) => return Err(ConnectionError::Lagged),
                         Err(RecvError::Closed) => return Ok(()),
@@ -627,56 +595,14 @@ async fn serve_websocket(
         if !complete {
             continue;
         }
-        let wait = pace.take(Instant::now());
-        if !wait.is_zero() {
-            sleep(wait).await;
+        while pace.consume_tokens(1).is_err() {
+            let wait = pace.us_to_have_tokens(1).unwrap_or_default();
+            sleep(Duration::from_micros(wait)).await;
         }
-        let reply = match search_request(&incoming) {
-            Some((scan, id, params)) => Some(answer_search(scan, id, params, &handles).await),
-            None => respond(&incoming, &handles),
-        };
-        if let Some(reply) = reply {
-            deflate_ahead(std::slice::from_ref(&reply), deflate).await;
-            send_within(send_frame(&mut sender, &reply, deflate)).await?;
-            send_within(sender.flush()).await?;
+        if let Some(reply) = respond(&incoming, &handles).await {
+            send_all(&mut sender, [reply], deflate, "websocket send").await?;
         }
         incoming.clear();
-    }
-}
-
-struct ReplyPace {
-    tokens: u32,
-    refilled: Instant,
-}
-
-impl ReplyPace {
-    fn new(now: Instant) -> Self {
-        Self {
-            tokens: REPLY_BURST,
-            refilled: now,
-        }
-    }
-
-    fn take(&mut self, now: Instant) -> Duration {
-        let elapsed = now.saturating_duration_since(self.refilled).as_millis();
-        let earned = elapsed
-            .checked_div(REPLY_SPACING.as_millis())
-            .and_then(|earned| u32::try_from(earned).ok())
-            .unwrap_or(u32::MAX);
-        if earned > 0 {
-            self.tokens = self.tokens.saturating_add(earned).min(REPLY_BURST);
-            self.refilled = self
-                .refilled
-                .checked_add(REPLY_SPACING.saturating_mul(earned))
-                .unwrap_or(now);
-        }
-        if let Some(left) = self.tokens.checked_sub(1) {
-            self.tokens = left;
-            return Duration::ZERO;
-        }
-        let due = self.refilled.checked_add(REPLY_SPACING).unwrap_or(now);
-        self.refilled = due;
-        due.saturating_duration_since(now)
     }
 }
 
@@ -730,60 +656,80 @@ struct SlotRangeParams {
 }
 
 /// The requests that scan: a page of turns, the matches summed up, or a page of the turns to come.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy)]
 enum Scan {
     Search,
     Summary,
     Future,
 }
 
-impl Scan {
-    fn key(self) -> &'static str {
-        match self {
-            Self::Search => "search",
-            Self::Summary => "summary",
-            Self::Future => "future",
-        }
+/// Why a request is answered without its value.
+enum Unanswered {
+    /// What was wrong with the request, sent back as `{"error": ...}`.
+    Bad(&'static str),
+    /// Not readable or not gathered yet; sent as null.
+    Missing,
+    /// Sent as null, and logged.
+    Unencodable(serde_json::Error),
+}
+
+impl<T> From<PoisonError<T>> for Unanswered {
+    fn from(_: PoisonError<T>) -> Self {
+        Self::Missing
     }
 }
 
-/// A scanning request's kind, id and parameters; `None` inside for parameters that do not parse,
-/// which are still answered.
-fn search_request(payload: &[u8]) -> Option<(Scan, Option<u64>, Option<SearchParams>)> {
-    let request: Request = serde_json::from_slice(payload).ok()?;
-    let scan = match (request.topic.as_str(), request.key.as_str()) {
-        ("slot", "search") => Scan::Search,
-        ("slot", "summary") => Scan::Summary,
-        ("slot", "future") => Scan::Future,
-        _ => return None,
+impl From<serde_json::Error> for Unanswered {
+    fn from(err: serde_json::Error) -> Self {
+        Self::Unencodable(err)
+    }
+}
+
+fn parse<T: DeserializeOwned>(
+    params: serde_json::Value,
+    error: &'static str,
+) -> Result<T, Unanswered> {
+    serde_json::from_value(params).map_err(|_| Unanswered::Bad(error))
+}
+
+fn json(value: &impl Serialize) -> serde_json::Result<Arc<str>> {
+    serde_json::to_string(value).map(Arc::from)
+}
+
+/// Even unknown requests get an answer, so no client waits on an id that never comes back.
+async fn respond(payload: &[u8], handles: &Handles) -> Option<Message> {
+    let Request {
+        topic,
+        key,
+        id,
+        params,
+    } = serde_json::from_slice(payload).ok()?;
+    let answered = match (topic.as_str(), key.as_str()) {
+        ("slot", "search") => answer_scan(Scan::Search, params, handles).await,
+        ("slot", "summary") => answer_scan(Scan::Summary, params, handles).await,
+        ("slot", "future") => answer_scan(Scan::Future, params, handles).await,
+        (topic, key) => answer(topic, key, params, handles),
     };
-    Some((
-        scan,
-        request.id,
-        serde_json::from_value(request.params).ok(),
-    ))
+    let value = answered.unwrap_or_else(|unanswered| match unanswered {
+        Unanswered::Bad(error) => serde_json::json!({ "error": error }).to_string().into(),
+        Unanswered::Missing => "null".into(),
+        Unanswered::Unencodable(err) => {
+            log::error!("dashboard: failed to encode {topic}.{key}: {err}");
+            "null".into()
+        }
+    });
+    Some(encode_json_with_id(&topic, &key, id, &value))
 }
 
 /// Run on the blocking pool and one at a time, so a scan of the history holds up no other
 /// client's updates and at most one core.
-async fn answer_search(
+async fn answer_scan(
     scan: Scan,
-    id: Option<u64>,
-    params: Option<SearchParams>,
+    params: serde_json::Value,
     handles: &Handles,
-) -> Message {
-    let key = scan.key();
-    let Some(params) = params else {
-        return encode_with_id(
-            "slot",
-            key,
-            id,
-            &serde_json::json!({ "error": "a scan needs a before slot" }),
-        );
-    };
-    let Ok(_permit) = SEARCHES.acquire().await else {
-        return encode_with_id("slot", key, id, &());
-    };
+) -> Result<Arc<str>, Unanswered> {
+    let params: SearchParams = parse(params, "a scan needs a before slot")?;
+    let _permit = SEARCHES.acquire().await.map_err(|_| Unanswered::Missing)?;
     let Handles {
         history,
         info_cache: info,
@@ -791,56 +737,26 @@ async fn answer_search(
         replies,
         ..
     } = handles.clone();
-    let found = spawn_blocking(move || {
-        // Held for the scan; the collector writes the epoch records once an epoch.
-        let epochs = epochs.read().ok()?;
+    spawn_blocking(move || {
+        // Held for the scan; the slot feed writes the epoch records once an epoch.
+        let epochs = epochs.read()?;
         let leaders = &replies.leader_traits;
-        Some(match scan {
-            Scan::Search => encode_with_id(
-                "slot",
-                key,
-                id,
-                &search(&history, &info, leaders, &epochs, &params),
-            ),
-            Scan::Summary => encode_with_id(
-                "slot",
-                key,
-                id,
-                &summarize(&history, &info, leaders, &epochs, &params),
-            ),
-            Scan::Future => encode_with_id(
-                "slot",
-                key,
-                id,
-                &future(&history, &info, leaders, &epochs, &params),
-            ),
-        })
+        Ok(match scan {
+            Scan::Search => json(&search(&history, &info, leaders, &epochs, &params)),
+            Scan::Summary => json(&summarize(&history, &info, leaders, &epochs, &params)),
+            Scan::Future => json(&future(&history, &info, leaders, &epochs, &params)),
+        }?)
     })
-    .await;
-    match found {
-        Ok(Some(reply)) => reply,
-        _ => encode_with_id("slot", key, id, &()),
-    }
+    .await
+    .map_err(|_| Unanswered::Missing)?
 }
 
-/// Even unknown requests get an answer, so no client waits on an id that never comes back.
-fn respond(payload: &[u8], handles: &Handles) -> Option<Message> {
-    let request: Request = serde_json::from_slice(payload).ok()?;
-    let (topic, key, id) = (request.topic.as_str(), request.key.as_str(), request.id);
-    let reply = answer(topic, key, id, request.params, handles).unwrap_or_else(|error| {
-        encode_with_id(topic, key, id, &serde_json::json!({ "error": error }))
-    });
-    Some(reply)
-}
-
-/// The reply, or what was wrong with the request.
 fn answer(
     topic: &str,
     key: &str,
-    id: Option<u64>,
     params: serde_json::Value,
     handles: &Handles,
-) -> Result<Message, &'static str> {
+) -> Result<Arc<str>, Unanswered> {
     let Handles {
         history,
         info_cache,
@@ -849,87 +765,47 @@ fn answer(
         ..
     } = handles;
     Ok(match (topic, key) {
-        ("summary", "ping") => encode_with_id("summary", "ping", id, &()),
-        ("summary", "displays") => {
-            let json = match info_cache.read() {
-                Ok(info) => info.displays_json(),
-                Err(_) => return Ok(encode_with_id("summary", "displays", id, &())),
-            };
-            encode_json_with_id("summary", "displays", id, &json)
-        }
+        ("summary", "displays") => info_cache.read()?.displays_json(),
         ("summary", key @ ("misses" | "written")) => {
-            replies.misses_wanted.store(timestamp(), Ordering::Relaxed);
-            let json = match replies.misses.read() {
-                Ok(held) if key == "misses" => held.misses.clone(),
-                Ok(held) => held.written.clone(),
-                Err(_) => return Ok(encode_with_id("summary", key, id, &())),
-            };
-            encode_json_with_id("summary", key, id, &json)
+            replies.misses.ask(timestamp());
+            let held = replies.misses.held.read()?;
+            if key == "misses" {
+                held.misses.clone()
+            } else {
+                held.written.clone()
+            }
         }
         ("peers", "gossip") => {
-            replies
-                .gossip_peers_wanted
-                .store(timestamp(), Ordering::Relaxed);
-            let json = match replies.gossip_peers.read() {
-                Ok(peers) => peers.clone(),
-                Err(_) => return Ok(encode_with_id("peers", "gossip", id, &())),
-            };
-            encode_json_with_id("peers", "gossip", id, &json)
+            replies.gossip_peers.ask(timestamp());
+            replies.gossip_peers.held.read()?.0.clone()
         }
-        ("peers", "leaders") => {
-            let Ok(leaders) = replies.leader_traits.read() else {
-                return Ok(encode_with_id("peers", "leaders", id, &()));
-            };
-            encode_with_id("peers", "leaders", id, &leader_rows(&leaders))
-        }
-        ("cluster", "charts") => {
-            let Some(json) = replies.ask_cluster_charts(timestamp()) else {
-                return Ok(encode_with_id("cluster", "charts", id, &()));
-            };
-            encode_json_with_id("cluster", "charts", id, &json)
-        }
+        ("peers", "leaders") => json(&leader_rows(&*replies.leader_traits.read()?))?,
+        ("cluster", "charts") => replies
+            .ask_cluster_charts(timestamp())
+            .ok_or(Unanswered::Missing)?,
         ("epoch", "query") => {
-            let params: EpochParams =
-                serde_json::from_value(params).map_err(|_| "query needs an epoch")?;
-            let found = match epochs.read() {
-                Ok(epochs) => epochs
-                    .iter()
-                    .find(|held| held.epoch == params.epoch)
-                    .cloned(),
-                Err(_) => None,
-            };
-            encode_with_id("epoch", "query", id, &found)
+            let params: EpochParams = parse(params, "query needs an epoch")?;
+            let epochs = epochs.read()?;
+            json(&epochs.iter().find(|held| held.epoch == params.epoch))?
         }
         ("produced", "figures") => {
-            let params: FiguresParams = serde_json::from_value(params)
-                .map_err(|_| "figures takes an optional before slot")?;
-            let page = match replies.produced.read() {
-                Ok(store) => store.figures(params.before),
-                Err(_) => return Ok(encode_with_id("produced", "figures", id, &())),
-            };
-            encode_with_id("produced", "figures", id, &page)
+            let params: FiguresParams = parse(params, "figures takes an optional before slot")?;
+            let page = replies.produced.read()?.figures(params.before);
+            json(&page)?
         }
         ("produced", "detail") => {
-            let params: DetailParams = serde_json::from_value(params)
-                .map_err(|_| "detail needs a first and a last slot")?;
-            let detail = replies.produced_detail(params.first, params.last);
-            encode_with_id("produced", "detail", id, &detail)
+            let params: DetailParams = parse(params, "detail needs a first and a last slot")?;
+            json(&replies.produced_detail(params.first, params.last))?
         }
         ("handoff", "bin") => {
-            let params: HandoffBinParams =
-                serde_json::from_value(params).map_err(|_| "bin takes an optional from and to")?;
-            let leaders = replies.handoff_leaders_between(params.from, params.to);
-            encode_with_id("handoff", "bin", id, &leaders)
+            let params: HandoffBinParams = parse(params, "bin takes an optional from and to")?;
+            json(&replies.handoff_leaders_between(params.from, params.to))?
         }
         ("slot", "range") => {
             // A client waiting on an id cannot tell silence from slowness.
-            let params: SlotRangeParams = serde_json::from_value(params)
-                .map_err(|_| "range needs a first_slot and a count")?;
-            let range = match history.read() {
-                Ok(history) => history.range(params.first_slot, params.count),
-                Err(_) => return Ok(encode_with_id("slot", "range", id, &())),
-            };
-            encode_with_id("slot", "range", id, &range)
+            let params: SlotRangeParams = parse(params, "range needs a first_slot and a count")?;
+            let range = history.read()?.range(params.first_slot, params.count);
+            json(&range)?
         }
         (topic, key) => {
             log::debug!(
@@ -937,7 +813,7 @@ fn answer(
                 for_logging(topic),
                 for_logging(key)
             );
-            return Err("unsupported request");
+            return Err(Unanswered::Bad("unsupported request"));
         }
     })
 }
@@ -947,7 +823,8 @@ mod tests {
     use {
         super::*,
         crate::{
-            proto::{DEFLATE_FROM, TOPIC_SLOT},
+            collect::Encoded,
+            proto::{encode, encode_with_id},
             search::LeaderTraits,
         },
         flate2::read::{GzDecoder, ZlibDecoder},
@@ -980,93 +857,57 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_held_epoch_is_answered_with_its_arrays() {
+    /// The reply to a request of `topic.key` with `params`, which carries the request's id.
+    async fn ask(handles: &Handles, (topic, key): (&str, &str), params: &str) -> String {
+        let request = format!(r#"{{"topic":"{topic}","key":"{key}","id":7,"params":{params}}}"#);
+        let reply = respond(request.as_bytes(), handles).await.unwrap();
+        assert!(reply.contains(r#""id":7,"#), "{reply}");
+        reply.to_string()
+    }
+
+    #[track_caller]
+    fn just_asked(asked: u64) {
+        assert!(
+            timestamp().saturating_sub(asked) < 5_000,
+            "asked at {asked}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_an_epoch_held_is_answered_with_its_arrays_and_one_dropped_with_nothing() {
         let handles = Handles {
             epochs: Arc::new(RwLock::new(vec![epoch_record(841), epoch_record(842)])),
             ..handles()
         };
-        let reply = respond(
-            br#"{"topic":"epoch","key":"query","id":11,"params":{"epoch":841}}"#,
-            &handles,
-        )
-        .unwrap();
-        assert!(reply.contains(r#""id":11"#), "{reply}");
-        assert!(reply.contains(r#""epoch":841"#), "{reply}");
-        assert!(reply.contains(r#""LEADER""#), "{reply}");
-    }
-
-    #[test]
-    fn test_dropped_epoch_is_answered_with_nothing() {
+        let held = ask(&handles, ("epoch", "query"), r#"{"epoch":841}"#).await;
+        assert!(held.contains(r#""epoch":841"#), "{held}");
+        assert!(held.contains(r#""LEADER""#), "{held}");
         // A validator that has not been up that long has no schedule for it.
-        let handles = Handles {
-            epochs: Arc::new(RwLock::new(vec![epoch_record(842)])),
-            ..handles()
-        };
-        let reply = respond(
-            br#"{"topic":"epoch","key":"query","id":12,"params":{"epoch":700}}"#,
-            &handles,
-        )
-        .unwrap();
-        assert!(reply.contains(r#""id":12"#), "{reply}");
-        assert!(reply.contains(r#""value":null"#), "{reply}");
+        let dropped = ask(&handles, ("epoch", "query"), r#"{"epoch":700}"#).await;
+        assert!(dropped.contains(r#""value":null"#), "{dropped}");
     }
 
-    #[test]
-    fn test_the_display_table_carries_what_a_validator_calls_itself() {
+    #[tokio::test]
+    async fn test_the_display_reply_is_what_encoding_the_table_gives() {
         use crate::validator_info::ValidatorInfo;
         let handles = handles();
-        handles.info_cache.write().unwrap().insert(
-            solana_pubkey::Pubkey::new_from_array([7; 32]),
-            0,
-            ValidatorInfo {
-                name: Some("Lantern".to_string()),
-                icon_url: Some("https://l/i.png".to_string()),
-            },
-        );
-
-        let reply = respond(br#"{"topic":"summary","key":"displays","id":4}"#, &handles).unwrap();
-        assert!(reply.contains(r#""id":4"#), "{reply}");
-        assert!(reply.contains(r#""Lantern""#), "{reply}");
-        assert!(reply.contains(r#""https://l/i.png""#), "{reply}");
-    }
-
-    #[test]
-    fn test_unnamed_validator_takes_no_room() {
-        use crate::validator_info::ValidatorInfo;
-        let handles = handles();
-        handles.info_cache.write().unwrap().insert(
-            solana_pubkey::Pubkey::new_from_array([9; 32]),
-            0,
-            ValidatorInfo::default(),
-        );
-
-        let reply = respond(br#"{"topic":"summary","key":"displays","id":5}"#, &handles).unwrap();
-        assert!(reply.contains(r#""keys":[]"#), "{reply}");
-    }
-
-    #[test]
-    fn test_the_display_reply_is_what_encoding_the_table_gives() {
-        use crate::validator_info::ValidatorInfo;
-        let handles = handles();
-        {
-            let mut cache = handles.info_cache.write().unwrap();
-            for (byte, name, icon) in [
-                (1u8, Some("Lantern"), Some("https://l/i.png")),
-                (2, Some("a \"quoted\" name"), None),
-                (3, None, Some("https://i/only.png")),
-                (4, None, None),
-            ] {
-                cache.insert(
-                    solana_pubkey::Pubkey::new_from_array([byte; 32]),
-                    0,
-                    ValidatorInfo {
-                        name: name.map(str::to_string),
-                        icon_url: icon.map(str::to_string),
-                    },
-                );
-            }
-        }
+        let table = [
+            (1u8, Some("Lantern"), Some("https://l/i.png")),
+            (2, Some("a \"quoted\" name"), None),
+            (3, None, Some("https://i/only.png")),
+            (4, None, None),
+        ]
+        .map(|(byte, name, icon)| {
+            (
+                Pubkey::new_from_array([byte; 32]),
+                ValidatorInfo {
+                    name: name.map(str::to_string),
+                    icon_url: icon.map(str::to_string),
+                },
+            )
+        });
+        handles.info_cache.write().unwrap().replace(table.into());
+        let unnamed = Pubkey::new_from_array([4; 32]).to_string();
         for (request, id) in [
             (
                 &br#"{"topic":"summary","key":"displays","id":4}"#[..],
@@ -1074,32 +915,32 @@ mod tests {
             ),
             (&br#"{"topic":"summary","key":"displays"}"#[..], None),
         ] {
-            let reply = respond(request, &handles).unwrap();
+            let reply = respond(request, &handles).await.unwrap();
             let expected = encode_with_id(
                 "summary",
                 "displays",
                 id,
                 &handles.info_cache.read().unwrap().displays(),
             );
-            assert_eq!(reply.text(), expected.text());
+            assert_eq!(&*reply, &*expected);
+            assert!(reply.contains(r#""Lantern""#), "{reply}");
+            assert!(reply.contains(r#""https://l/i.png""#), "{reply}");
+            assert!(!reply.contains(&unnamed), "{reply}");
         }
     }
 
-    #[test]
-    fn test_a_range_request_is_answered_with_its_own_id() {
+    #[tokio::test]
+    async fn test_a_range_request_is_answered_and_a_bad_one_told_why() {
         let handles = handles();
-        let reply = respond(
-            br#"{"topic":"slot","key":"range","id":9,"params":{"first_slot":4,"count":2}}"#,
-            &handles,
-        )
-        .unwrap();
-        assert!(reply.contains(r#""id":9"#), "{reply}");
+        let reply = ask(&handles, ("slot", "range"), r#"{"first_slot":4,"count":2}"#).await;
         assert!(reply.contains(r#""first_slot":4"#), "{reply}");
         assert!(reply.contains(r#""rows":[null,null]"#), "{reply}");
+        let bad = ask(&handles, ("slot", "range"), r#"{"first_slot":"soon"}"#).await;
+        assert!(bad.contains("error"), "{bad}");
     }
 
-    #[test]
-    fn test_a_bin_lists_the_leaders_whose_median_falls_in_it() {
+    #[tokio::test]
+    async fn test_a_bin_lists_the_leaders_whose_median_falls_in_it() {
         let handles = handles();
         let leader = |name: &str, p50: i32| crate::collect::LeaderFigures {
             leader: name.to_string(),
@@ -1117,27 +958,29 @@ mod tests {
             leader("d", 48),
             leader("e", 400),
         ];
-        let ask = |params: &str| {
-            respond(
-                format!(r#"{{"topic":"handoff","key":"bin","id":3,"params":{params}}}"#).as_bytes(),
-                &handles,
-            )
-            .unwrap()
-        };
-        let middle = ask(r#"{"from":42,"to":48}"#);
+        let bin = async |params: &str| ask(&handles, ("handoff", "bin"), params).await;
+        let middle = bin(r#"{"from":42,"to":48}"#).await;
         assert!(
             middle.contains(r#""leader":"b""#) && middle.contains(r#""leader":"c""#),
             "{middle}"
         );
         assert!(!middle.contains(r#""leader":"d""#), "{middle}");
         // The first bin takes everything below it, the last everything above.
-        assert!(ask(r#"{"from":null,"to":6}"#).contains(r#""leader":"a""#));
-        assert!(ask(r#"{"from":294,"to":null}"#).contains(r#""leader":"e""#));
-        assert!(ask(r#"{"to":"x"}"#).contains("error"));
+        assert!(
+            bin(r#"{"from":null,"to":6}"#)
+                .await
+                .contains(r#""leader":"a""#)
+        );
+        assert!(
+            bin(r#"{"from":294,"to":null}"#)
+                .await
+                .contains(r#""leader":"e""#)
+        );
+        assert!(bin(r#"{"to":"x"}"#).await.contains("error"));
     }
 
-    #[test]
-    fn test_figures_are_paged_newest_first() {
+    #[tokio::test]
+    async fn test_figures_are_paged_newest_first() {
         let handles = handles();
         for slot in [40, 41, 42] {
             handles
@@ -1147,26 +990,17 @@ mod tests {
                 .unwrap()
                 .insert(crate::produced::sample_block(slot));
         }
-        let reply = respond(
-            br#"{"topic":"produced","key":"figures","id":6,"params":{"before":42}}"#,
-            &handles,
-        )
-        .unwrap();
-        assert!(reply.contains(r#""id":6"#), "{reply}");
+        let reply = ask(&handles, ("produced", "figures"), r#"{"before":42}"#).await;
         assert!(reply.contains(r#""figures":[[41,"#), "{reply}");
         assert!(reply.contains(r#""held":3"#), "{reply}");
         assert!(reply.contains(r#""next":null"#), "{reply}");
 
-        let newest = respond(
-            br#"{"topic":"produced","key":"figures","id":7,"params":{}}"#,
-            &handles,
-        )
-        .unwrap();
+        let newest = ask(&handles, ("produced", "figures"), "{}").await;
         assert!(newest.contains(r#""figures":[[42,"#), "{newest}");
     }
 
-    #[test]
-    fn test_detail_carries_the_blocks_asked_for() {
+    #[tokio::test]
+    async fn test_detail_carries_the_blocks_asked_for() {
         let handles = handles();
         handles
             .replies
@@ -1174,31 +1008,12 @@ mod tests {
             .write()
             .unwrap()
             .insert(crate::produced::sample_block(40));
-        let reply = respond(
-            br#"{"topic":"produced","key":"detail","id":2,"params":{"first":40,"last":40}}"#,
-            &handles,
-        )
-        .unwrap();
-        assert!(reply.contains(r#""id":2"#), "{reply}");
+        let detail = ("produced", "detail");
+        let reply = ask(&handles, detail, r#"{"first":40,"last":40}"#).await;
         assert!(reply.contains(r#""blockhash":"hash40""#), "{reply}");
 
-        let bad = respond(
-            br#"{"topic":"produced","key":"detail","id":3,"params":{"first":40}}"#,
-            &handles,
-        )
-        .unwrap();
+        let bad = ask(&handles, detail, r#"{"first":40}"#).await;
         assert!(bad.contains("error"), "{bad}");
-    }
-
-    #[test]
-    fn test_bad_range_parameters_are_answered() {
-        let reply = respond(
-            br#"{"topic":"slot","key":"range","id":3,"params":{"first_slot":"soon"}}"#,
-            &handles(),
-        )
-        .unwrap();
-        assert!(reply.contains(r#""id":3"#), "{reply}");
-        assert!(reply.contains("error"), "{reply}");
     }
 
     #[test]
@@ -1334,31 +1149,35 @@ mod tests {
         assert_eq!(request_path("garbage"), "/");
     }
 
-    async fn request_with_no_permits_left(request: &[u8]) -> String {
+    /// The reply with the connection cap full, or else the websocket cap.
+    async fn request_at_cap(request: &[u8], connections: bool) -> String {
         let limits = Limits {
             connections: Arc::new(Semaphore::new(1)),
             websockets: Arc::new(Semaphore::new(1)),
         };
-        let _held = limits.websockets.clone().try_acquire_owned().unwrap();
-        // These fixtures use `Host: x`, so the host policy is widened; the cap is under test.
-        request_with(request, limits, vec!["x".to_string()]).await
+        let full = if connections {
+            &limits.connections
+        } else {
+            &limits.websockets
+        };
+        let _held = full.clone().try_acquire_owned().unwrap();
+        request_with(request, limits).await
     }
 
-    async fn request_with_hosts(request: &[u8], allowed_hosts: Vec<String>) -> String {
-        request_with(request, Limits::new(), allowed_hosts).await
+    #[track_caller]
+    fn assert_status(reply: &str, status: &str) {
+        assert_eq!(
+            reply.lines().next(),
+            Some(format!("HTTP/1.1 {status}").as_str()),
+            "{:?}",
+            &reply[..reply.len().min(80)]
+        );
     }
 
     #[tokio::test]
     async fn test_unrecognised_host_is_turned_away() {
-        let reply = request_with_hosts(
-            b"GET / HTTP/1.1\r\nHost: rebind.evil\r\n\r\n",
-            vec!["dash.example.com".to_string()],
-        )
-        .await;
-        assert!(
-            reply.starts_with("HTTP/1.1 421 Misdirected Request"),
-            "expected a refusal, got {reply:?}"
-        );
+        let reply = request(b"GET / HTTP/1.1\r\nHost: rebind.evil\r\n\r\n").await;
+        assert_status(&reply, "421 Misdirected Request");
         // The page itself must not have gone out: serving it would make the
         // attacker's origin same-origin with the dashboard.
         assert!(!reply.contains("<!doctype"), "document was served anyway");
@@ -1366,55 +1185,36 @@ mod tests {
 
     #[tokio::test]
     async fn test_websocket_from_another_origin_is_refused() {
-        let reply = request_with_hosts(
-            b"GET /websocket HTTP/1.1\r\nHost: dash.example.com\r\nUpgrade: websocket\r\nOrigin: https://evil.example\r\n\r\n",
-            vec!["dash.example.com".to_string()],
+        let reply = request(
+            b"GET /websocket HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nOrigin: https://evil.example\r\n\r\n",
         )
         .await;
-        assert!(
-            reply.starts_with("HTTP/1.1 403 Forbidden"),
-            "expected a refusal, got {reply:?}"
-        );
+        assert_status(&reply, "403 Forbidden");
     }
 
     #[tokio::test]
     async fn test_websocket_over_the_cap_is_refused_with_a_status() {
-        let reply = request_with_no_permits_left(
+        let reply = request_at_cap(
             b"GET /websocket HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\n\r\n",
+            false,
         )
         .await;
-        assert!(
-            reply.starts_with("HTTP/1.1 503 Service Unavailable"),
-            "expected a refusal, got {reply:?}"
-        );
+        assert_status(&reply, "503 Service Unavailable");
     }
 
     #[tokio::test]
     async fn test_http_is_still_served_when_the_websocket_cap_is_full() {
         // The point of capping websockets alone: a full pool must not stop the
         // page itself from loading.
-        let reply = request_with_no_permits_left(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n").await;
-        assert!(
-            reply.starts_with("HTTP/1.1 200 OK"),
-            "expected the page, got {:?}",
-            &reply[..reply.len().min(80)]
-        );
-    }
-
-    async fn request_with_no_connections_left(request: &[u8]) -> String {
-        let limits = Limits {
-            connections: Arc::new(Semaphore::new(1)),
-            websockets: Arc::new(Semaphore::new(MAX_WEBSOCKET_CLIENTS)),
-        };
-        let _held = limits.connections.clone().try_acquire_owned().unwrap();
-        request_with(request, limits, vec!["x".to_string()]).await
+        let reply = request_at_cap(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n", false).await;
+        assert_status(&reply, "200 OK");
     }
 
     #[tokio::test]
     async fn test_full_connection_cap_closes_without_reading() {
         // Over the cap the request is never read: reading it is the cost the
         // cap exists to bound.
-        let reply = request_with_no_connections_left(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n").await;
+        let reply = request_at_cap(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n", true).await;
         assert!(reply.is_empty(), "expected a closed socket, got {reply:?}");
     }
 
@@ -1422,8 +1222,9 @@ mod tests {
     async fn test_connection_cap_covers_websockets_too() {
         // A websocket is a connection. If it were exempt, the cheapest way past
         // the cap would be to open the long-lived kind.
-        let reply = request_with_no_connections_left(
+        let reply = request_at_cap(
             b"GET /websocket HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\n\r\n",
+            true,
         )
         .await;
         assert!(reply.is_empty(), "expected a closed socket, got {reply:?}");
@@ -1439,51 +1240,21 @@ mod tests {
         let mut reply = String::new();
         client.read_to_string(&mut reply).await.unwrap();
         server.await.unwrap().unwrap();
-        assert!(
-            reply.starts_with("HTTP/1.1 200 OK"),
-            "expected the page, got {:?}",
-            &reply[..reply.len().min(80)]
-        );
-    }
-
-    fn status_line(status: u16, immutable: bool) -> String {
-        let out = response_head(status, "text/plain", 0, immutable, "");
-        out.lines().next().unwrap().to_string()
-    }
-
-    #[test]
-    fn test_every_status_the_server_sends_has_its_reason_phrase() {
-        assert_eq!(status_line(200, false), "HTTP/1.1 200 OK");
-        assert_eq!(status_line(403, false), "HTTP/1.1 403 Forbidden");
-        assert_eq!(status_line(404, false), "HTTP/1.1 404 Not Found");
-        assert_eq!(status_line(405, false), "HTTP/1.1 405 Method Not Allowed");
-        assert_eq!(status_line(421, false), "HTTP/1.1 421 Misdirected Request");
-        assert_eq!(status_line(503, false), "HTTP/1.1 503 Service Unavailable");
+        assert_status(&reply, "200 OK");
     }
 
     #[test]
     fn test_only_hashed_assets_are_cached() {
         // Asset filenames carry a content hash; index.html does not, and caching it
         // would hide a redeploy.
+        let asset = Reply {
+            immutable: true,
+            ..Reply::text(200, b"x")
+        };
         assert!(
-            response_head(200, "text/javascript", 1, true, "")
-                .contains("cache-control: public, max-age=31536000, immutable")
+            response_head(&asset).contains("cache-control: public, max-age=31536000, immutable")
         );
-        assert!(response_head(200, "text/html", 1, false, "").contains("cache-control: no-cache"));
-    }
-
-    #[test]
-    fn test_the_content_length_counts_the_body_that_follows() {
-        // A length that disagrees with the body leaves the client waiting, or reading
-        // the next response as this one's tail.
-        for body in [b"".as_slice(), b"x".as_slice(), b"hello world".as_slice()] {
-            let head = response_head(200, "text/plain", body.len(), false, "");
-            assert!(
-                head.contains(&format!("content-length: {}\r\n", body.len())),
-                "missing or wrong length for {body:?}"
-            );
-            assert!(head.ends_with("\r\n\r\n"), "no header terminator");
-        }
+        assert!(response_head(&Reply::text(200, b"x")).contains("cache-control: no-cache"));
     }
 
     #[test]
@@ -1495,7 +1266,10 @@ mod tests {
     #[test]
     fn test_header_block_is_well_formed() {
         for coding in ["", VARY_HEADER, GZIP_HEADERS] {
-            let out = response_head(200, "text/plain", 4, false, coding);
+            let out = response_head(&Reply {
+                coding,
+                ..Reply::text(200, b"body")
+            });
             let head = out.strip_suffix("\r\n\r\n").expect("no header terminator");
             assert!(!head.contains("\r\n\r\n"), "blank line inside the headers");
             for line in head.split("\r\n").skip(1) {
@@ -1505,93 +1279,49 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_a_search_is_answered_with_its_id() {
-        let (scan, id, params) = search_request(
-            br#"{"topic":"slot","key":"search","id":7,"params":{"query":"x","before":64}}"#,
-        )
-        .expect("a search");
-        let reply = answer_search(scan, id, params, &handles()).await;
-        assert!(reply.contains(r#""id":7"#), "{reply}");
-        assert!(reply.contains(r#""turns":[]"#), "{reply}");
-    }
-
-    #[tokio::test]
-    async fn test_a_search_without_a_before_slot_is_told_so() {
-        let (scan, id, params) =
-            search_request(br#"{"topic":"slot","key":"search","id":8,"params":{"query":"x"}}"#)
-                .expect("a search");
-        assert!(params.is_none());
-        let reply = answer_search(scan, id, params, &handles()).await;
-        assert!(
-            reply.contains(r#""id":8"#) && reply.contains("error"),
-            "{reply}"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_a_page_of_turns_to_come_is_answered_with_its_id() {
-        let (scan, id, params) =
-            search_request(br#"{"topic":"slot","key":"future","id":13,"params":{"before":64}}"#)
-                .expect("turns to come");
-        assert_eq!(scan, Scan::Future);
-        let reply = answer_search(scan, id, params, &handles()).await;
-        assert!(reply.contains(r#""id":13"#), "{reply}");
-        assert!(reply.contains(r#""turns":[]"#), "{reply}");
-    }
-
-    #[tokio::test]
-    async fn test_a_summary_is_answered_with_its_id() {
-        let (scan, id, params) = search_request(
-            br#"{"topic":"slot","key":"summary","id":12,"params":{"before":64,"where":[{"field":"base_fee","op":"gt","value":5000}]}}"#,
-        )
-        .expect("a summary");
-        assert_eq!(scan, Scan::Summary);
-        let reply = answer_search(scan, id, params, &handles()).await;
-        assert!(reply.contains(r#""id":12"#), "{reply}");
-        assert!(reply.contains(r#""clients":[]"#), "{reply}");
-    }
-
-    #[test]
-    fn test_other_requests_are_not_searches() {
-        assert!(search_request(br#"{"topic":"slot","key":"range","id":1}"#).is_none());
-        assert!(search_request(b"not json").is_none());
-    }
-
-    #[test]
-    fn test_the_miss_list_is_answered_and_the_ask_remembered() {
+    async fn test_each_scan_is_answered_and_no_other_request_scans() {
         let handles = handles();
-        let reply = respond(br#"{"topic":"summary","key":"misses","id":9}"#, &handles).unwrap();
-        assert!(reply.contains(r#""id":9"#), "{reply}");
+        let scan = async |key: &str, params: &str| ask(&handles, ("slot", key), params).await;
+        let search = scan("search", r#"{"query":"x","before":64}"#).await;
+        assert!(search.contains(r#""turns":[],"next":"#), "{search}");
+        assert!(scan("search", r#"{"query":"x"}"#).await.contains("error"));
+        let future = scan("future", r#"{"before":64}"#).await;
+        assert!(future.contains(r#""turns":[],"leaders":[]"#), "{future}");
+        let summary = scan(
+            "summary",
+            r#"{"before":64,"where":[{"field":"base_fee","op":"gt","value":5000}]}"#,
+        )
+        .await;
+        assert!(summary.contains(r#""clients":[]"#), "{summary}");
+        let other = ask(&handles, ("summary", "search"), r#"{"before":64}"#).await;
+        assert!(other.contains("unsupported request"), "{other}");
+    }
+
+    #[tokio::test]
+    async fn test_the_miss_list_is_answered_and_the_ask_remembered() {
+        let handles = handles();
+        let reply = ask(&handles, ("summary", "misses"), "null").await;
         assert!(reply.contains(r#""rows":[]"#), "{reply}");
         assert!(
             !reply.contains("written"),
             "served on its own route: {reply}"
         );
-        let asked = handles.replies.misses_wanted.load(Ordering::Relaxed);
-        assert!(
-            timestamp().saturating_sub(asked) < 5_000,
-            "asked at {asked}"
-        );
+        just_asked(handles.replies.misses.asked_at());
     }
 
-    #[test]
-    fn test_the_gossip_peers_are_answered_and_the_ask_remembered() {
+    #[tokio::test]
+    async fn test_the_gossip_peers_are_answered_and_the_ask_remembered() {
         let handles = handles();
-        let reply = respond(br#"{"topic":"peers","key":"gossip","id":11}"#, &handles).unwrap();
-        assert!(reply.contains(r#""id":11"#), "{reply}");
+        let reply = ask(&handles, ("peers", "gossip"), "null").await;
         assert!(
             reply.contains(r#""value":null"#),
             "not gathered yet: {reply}"
         );
-        let asked = handles.replies.gossip_peers_wanted.load(Ordering::Relaxed);
-        assert!(
-            timestamp().saturating_sub(asked) < 5_000,
-            "asked at {asked}"
-        );
+        just_asked(handles.replies.gossip_peers.asked_at());
     }
 
-    #[test]
-    fn test_every_leader_is_answered_with_what_a_turn_shows() {
+    #[tokio::test]
+    async fn test_every_leader_is_answered_with_what_a_turn_shows() {
         let handles = handles();
         let identity = Pubkey::new_unique();
         handles.replies.leader_traits.write().unwrap().insert(
@@ -1606,8 +1336,7 @@ mod tests {
                 last_vote: None,
             },
         );
-        let reply = respond(br#"{"topic":"peers","key":"leaders","id":14}"#, &handles).unwrap();
-        assert!(reply.contains(r#""id":14"#), "{reply}");
+        let reply = ask(&handles, ("peers", "leaders"), "null").await;
         assert!(reply.contains(&identity.to_string()), "{reply}");
         for field in [
             r#""client":"Agave""#,
@@ -1620,80 +1349,47 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_the_cluster_charts_are_answered_and_the_ask_remembered() {
+    #[tokio::test]
+    async fn test_the_cluster_charts_are_answered_and_the_ask_remembered() {
         let handles = handles();
-        let reply = respond(br#"{"topic":"cluster","key":"charts","id":12}"#, &handles).unwrap();
-        assert!(reply.contains(r#""id":12"#), "{reply}");
+        let reply = ask(&handles, ("cluster", "charts"), "null").await;
         assert!(
             reply.contains(r#""value":null"#),
             "not gathered yet: {reply}"
         );
-        let asked = handles
-            .replies
-            .cluster_charts_wanted
-            .load(Ordering::Relaxed);
-        assert!(
-            timestamp().saturating_sub(asked) < 5_000,
-            "asked at {asked}"
-        );
+        just_asked(handles.replies.cluster_charts.asked_at());
     }
 
-    #[test]
-    fn test_cluster_charts_held_from_an_earlier_viewing_are_not_served() {
+    #[tokio::test]
+    async fn test_cluster_charts_held_from_an_earlier_viewing_are_not_served() {
         let handles = handles();
-        *handles.replies.cluster_charts.write().unwrap() = Arc::from(r#"{"epoch":7}"#);
-        let ask = || respond(br#"{"topic":"cluster","key":"charts","id":3}"#, &handles).unwrap();
-        assert!(ask().contains(r#""value":null"#));
-        *handles.replies.cluster_charts.write().unwrap() = Arc::from(r#"{"epoch":8}"#);
-        assert!(ask().contains(r#""value":{"epoch":8}"#));
+        *handles.replies.cluster_charts.held.write().unwrap() =
+            Encoded(Arc::from(r#"{"epoch":7}"#));
+        let charts = async || ask(&handles, ("cluster", "charts"), "null").await;
+        assert!(charts().await.contains(r#""value":null"#));
+        *handles.replies.cluster_charts.held.write().unwrap() =
+            Encoded(Arc::from(r#"{"epoch":8}"#));
+        assert!(charts().await.contains(r#""value":{"epoch":8}"#));
     }
 
-    #[test]
-    fn test_the_written_list_is_answered_and_the_ask_remembered() {
+    #[tokio::test]
+    async fn test_the_written_list_is_answered_and_the_ask_remembered() {
         let handles = handles();
-        let reply = respond(br#"{"topic":"summary","key":"written","id":10}"#, &handles).unwrap();
-        assert!(reply.contains(r#""id":10"#), "{reply}");
+        let reply = ask(&handles, ("summary", "written"), "null").await;
         assert!(reply.contains(r#""certificates":0"#), "{reply}");
         assert!(reply.contains(r#""rows":[]"#), "{reply}");
-        let asked = handles.replies.misses_wanted.load(Ordering::Relaxed);
-        assert!(
-            timestamp().saturating_sub(asked) < 5_000,
-            "asked at {asked}"
-        );
+        just_asked(handles.replies.misses.asked_at());
     }
 
-    #[test]
-    fn test_a_burst_of_requests_is_answered_at_once_and_the_rest_spaced() {
-        let start = Instant::now();
-        let mut pace = ReplyPace::new(start);
-        for _ in 0..REPLY_BURST {
-            assert_eq!(pace.take(start), Duration::ZERO);
-        }
-        assert_eq!(pace.take(start), REPLY_SPACING);
-        assert_eq!(pace.take(start), REPLY_SPACING.saturating_mul(2));
-        let later = start.checked_add(Duration::from_secs(60)).unwrap();
-        for _ in 0..REPLY_BURST {
-            assert_eq!(pace.take(later), Duration::ZERO);
-        }
-        assert_eq!(pace.take(later), REPLY_SPACING);
-    }
-
-    #[test]
-    fn test_ping_is_answered_with_its_id() {
-        let reply = respond(br#"{"topic":"summary","key":"ping","id":7}"#, &handles()).unwrap();
-        assert!(reply.contains(r#""id":7"#));
-    }
-
-    #[test]
-    fn test_unknown_requests_still_get_a_reply() {
-        let reply = respond(br#"{"topic":"nope","key":"nope","id":1}"#, &handles()).unwrap();
+    #[tokio::test]
+    async fn test_unknown_requests_still_get_a_reply() {
+        let reply = ask(&handles(), ("nope", "nope"), "null").await;
         assert!(reply.contains("unsupported request"));
     }
 
-    #[test]
-    fn test_malformed_requests_are_ignored() {
-        assert!(respond(b"not json", &handles()).is_none());
+    #[tokio::test]
+    async fn test_malformed_requests_are_ignored() {
+        assert!(respond(b"not json", &handles()).await.is_none());
     }
 
     #[test]
@@ -1726,33 +1422,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_a_get_over_a_socket_serves_the_page() {
-        // Closing on unread bytes sends a reset that discards the response.
-        let reply = request_with_hosts(
-            b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n",
-            vec!["localhost".to_string()],
-        )
-        .await;
-        assert!(
-            reply.starts_with("HTTP/1.1 200 OK"),
-            "expected the page, got {:?}",
-            &reply[..reply.len().min(80)]
-        );
-        assert!(reply.contains("content-type: text/html"));
-        assert!(
-            reply.contains("\r\n\r\n"),
-            "a response with no body terminator"
-        );
-    }
-
-    #[tokio::test]
     async fn test_an_unknown_path_falls_through_to_the_app() {
-        let reply = request_with_hosts(
-            b"GET /some/client/route HTTP/1.1\r\nHost: localhost\r\n\r\n",
-            vec!["localhost".to_string()],
-        )
-        .await;
-        assert!(reply.starts_with("HTTP/1.1 200 OK"));
+        let reply = request(b"GET /some/client/route HTTP/1.1\r\nHost: x\r\n\r\n").await;
+        assert_status(&reply, "200 OK");
         assert!(reply.contains("content-type: text/html"));
     }
 
@@ -1761,11 +1433,7 @@ mod tests {
         if assets::ASSETS.is_empty() {
             return;
         }
-        let reply = request_with_hosts(
-            b"GET /robots.txt HTTP/1.1\r\nHost: localhost\r\n\r\n",
-            vec!["localhost".to_string()],
-        )
-        .await;
+        let reply = request(b"GET /robots.txt HTTP/1.1\r\nHost: x\r\n\r\n").await;
         assert!(reply.contains("content-type: text/plain"));
         assert!(reply.contains("Disallow: /*?"));
     }
@@ -1774,12 +1442,27 @@ mod tests {
     async fn test_a_method_that_would_write_is_refused() {
         // Nothing here accepts input over HTTP, and a server that quietly
         // ignores a POST reads as one that took it.
-        let reply = request_with_hosts(
-            b"POST / HTTP/1.1\r\nHost: localhost\r\n\r\n",
-            vec!["localhost".to_string()],
-        )
-        .await;
-        assert!(reply.starts_with("HTTP/1.1 405 Method Not Allowed"));
+        let reply = request(b"POST / HTTP/1.1\r\nHost: x\r\n\r\n").await;
+        assert_status(&reply, "405 Method Not Allowed");
+    }
+
+    #[tokio::test]
+    async fn test_a_head_request_is_sent_the_headers_alone() {
+        let (get_head, get_body) = get_split(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n").await;
+        let (head, body) = get_split(b"HEAD / HTTP/1.1\r\nHost: x\r\n\r\n").await;
+        assert_status(&head, "200 OK");
+        assert_eq!(head, get_head, "the same status and headers as a GET");
+        assert!(!get_body.is_empty());
+        assert!(body.is_empty(), "{} bytes of body", body.len());
+    }
+
+    #[tokio::test]
+    async fn test_a_head_that_fills_the_peek_is_refused_as_too_large() {
+        let mut head = b"GET / HTTP/1.1\r\nHost: x\r\nX-Padding: ".to_vec();
+        head.resize(MAX_REQUEST_HEAD, b'a');
+        let reply = request(&head).await;
+        assert_status(&reply, "431 Request Header Fields Too Large");
+        assert!(!reply.contains("<!doctype"), "the page was served anyway");
     }
 
     type Served = (
@@ -1787,11 +1470,8 @@ mod tests {
         tokio::task::JoinHandle<Result<(), ConnectionError>>,
     );
 
-    async fn serve_one_with(
-        publisher: Arc<Publisher>,
-        limits: Limits,
-        allowed_hosts: Vec<String>,
-    ) -> Served {
+    /// One connection served, answering the host `x` the requests here name.
+    async fn serve_one_with(publisher: Arc<Publisher>, limits: Limits) -> Served {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
@@ -1800,19 +1480,18 @@ mod tests {
                 publisher,
                 ..handles()
             };
-            handle(socket, handles, limits, &allowed_hosts).await
+            handle(socket, handles, limits, &["x".to_string()]).await
         });
         (addr, server)
     }
 
     async fn serve_one(publisher: Arc<Publisher>) -> Served {
-        serve_one_with(publisher, Limits::new(), vec!["x".to_string()]).await
+        serve_one_with(publisher, Limits::new()).await
     }
 
     /// The reply read to the end; a reset reads as an empty reply.
-    async fn request_with(request: &[u8], limits: Limits, allowed_hosts: Vec<String>) -> String {
-        let publisher = Arc::new(Publisher::new());
-        let (addr, server) = serve_one_with(publisher, limits, allowed_hosts).await;
+    async fn request_with(request: &[u8], limits: Limits) -> String {
+        let (addr, server) = serve_one_with(Arc::new(Publisher::new()), limits).await;
         let mut client = TcpStream::connect(addr).await.unwrap();
         client.write_all(request).await.unwrap();
         let mut reply = String::new();
@@ -1821,27 +1500,41 @@ mod tests {
         reply
     }
 
-    async fn connect(addr: std::net::SocketAddr) -> Client<'static, Compat<TcpStream>> {
+    async fn request(request: &[u8]) -> String {
+        request_with(request, Limits::new()).await
+    }
+
+    async fn connect(
+        addr: std::net::SocketAddr,
+        deflate: bool,
+    ) -> Client<'static, Compat<TcpStream>> {
         let stream = TcpStream::connect(addr).await.unwrap();
         let mut client = Client::new(stream.compat(), "x", WEBSOCKET_PATH);
-        match client.handshake().await.unwrap() {
-            ServerResponse::Accepted { protocol: None } => {}
-            _ => panic!("the server refused a well-formed handshake"),
+        if deflate {
+            client.add_protocol(DEFLATE_PROTOCOL);
         }
+        let ServerResponse::Accepted { protocol } = client.handshake().await.unwrap() else {
+            panic!("the server refused a well-formed handshake");
+        };
+        assert_eq!(protocol.as_deref(), deflate.then_some(DEFLATE_PROTOCOL));
         client
     }
 
-    async fn connect_deflating(addr: std::net::SocketAddr) -> Client<'static, Compat<TcpStream>> {
-        let stream = TcpStream::connect(addr).await.unwrap();
-        let mut client = Client::new(stream.compat(), "x", WEBSOCKET_PATH);
-        client.add_protocol(DEFLATE_PROTOCOL);
-        match client.handshake().await.unwrap() {
-            ServerResponse::Accepted {
-                protocol: Some(protocol),
-            } => assert_eq!(protocol, DEFLATE_PROTOCOL),
-            _ => panic!("the server should accept the subprotocol it knows"),
+    /// The next message's text, and whether it came deflated.
+    async fn receive(receiver: &mut soketto::Receiver<Compat<TcpStream>>) -> (bool, String) {
+        let mut data = Vec::new();
+        if receiver.receive_data(&mut data).await.unwrap().is_text() {
+            return (false, String::from_utf8(data).unwrap());
         }
-        client
+        let mut text = String::new();
+        ZlibDecoder::new(&data[..])
+            .read_to_string(&mut text)
+            .unwrap();
+        assert!(
+            data.len() < text.len(),
+            "deflated, so shorter than its text"
+        );
+        (true, text)
     }
 
     #[tokio::test]
@@ -1850,26 +1543,9 @@ mod tests {
         publisher.publish("summary", "cluster", &"testnet");
         publisher.publish("summary", "host", &vec!["a host row"; 200]);
         let (addr, server) = serve_one(publisher.clone()).await;
-        let (mut sender, mut receiver) = connect_deflating(addr).await.into_builder().finish();
+        let (mut sender, mut receiver) = connect(addr, true).await.into_builder().finish();
 
-        let mut texts = Vec::new();
-        for _ in 0..2 {
-            let mut data = Vec::new();
-            let kind = receiver.receive_data(&mut data).await.unwrap();
-            if kind.is_binary() {
-                assert!(
-                    data.len() < DEFLATE_FROM,
-                    "deflated, so shorter than the cut-off"
-                );
-                let mut text = String::new();
-                ZlibDecoder::new(&data[..])
-                    .read_to_string(&mut text)
-                    .unwrap();
-                texts.push((true, text));
-            } else {
-                texts.push((false, String::from_utf8(data).unwrap()));
-            }
-        }
+        let texts = [receive(&mut receiver).await, receive(&mut receiver).await];
         assert!(
             texts
                 .iter()
@@ -1891,78 +1567,21 @@ mod tests {
         vec!["a host row"; 8_000]
     }
 
-    async fn receive_inflated(receiver: &mut soketto::Receiver<Compat<TcpStream>>) -> String {
-        let mut data = Vec::new();
-        let kind = receiver.receive_data(&mut data).await.unwrap();
-        assert!(kind.is_binary(), "a long message should arrive deflated");
-        let mut text = String::new();
-        ZlibDecoder::new(&data[..])
-            .read_to_string(&mut text)
-            .unwrap();
-        text
-    }
-
-    #[tokio::test]
-    async fn test_long_messages_are_deflated_ahead_only_for_a_deflating_client() {
-        let long = encode_with_id("summary", "host", None, &long_rows());
-        let short = encode_with_id("summary", "host", None, &vec!["a host row"; 400]);
-        assert!(long.text().len() >= DEFLATE_AHEAD_FROM);
-        assert!(long.text().len() < crate::proto::MAX_MESSAGE);
-        assert!(short.text().len() < DEFLATE_AHEAD_FROM);
-        let messages = [long.clone(), short.clone()];
-        deflate_ahead(&messages, false).await;
-        assert!(long.deflate_pending());
-        deflate_ahead(&messages, true).await;
-        assert!(!long.deflate_pending());
-        assert!(short.deflate_pending(), "a short one is left to the send");
-        let inline = encode_with_id("summary", "host", None, &long_rows());
-        let (Frame::Binary(early), Frame::Binary(late)) = (long.frame(true), inline.frame(true))
-        else {
-            panic!("a long message should deflate");
-        };
-        assert_eq!(early, late);
-    }
-
     #[tokio::test]
     async fn test_long_snapshot_and_update_messages_arrive_as_their_text() {
         let publisher = Arc::new(Publisher::new());
         publisher.publish("summary", "host", &long_rows());
         let (addr, server) = serve_one(publisher.clone()).await;
-        let (mut sender, mut receiver) = connect_deflating(addr).await.into_builder().finish();
+        let (mut sender, mut receiver) = connect(addr, true).await.into_builder().finish();
 
         assert_eq!(
-            receive_inflated(&mut receiver).await,
-            encode_with_id("summary", "host", None, &long_rows()).text()
+            receive(&mut receiver).await,
+            (true, encode("summary", "host", &long_rows()).to_string())
         );
         publisher.publish("summary", "rows", &long_rows());
         assert_eq!(
-            receive_inflated(&mut receiver).await,
-            encode_with_id("summary", "rows", None, &long_rows()).text()
-        );
-
-        sender.close().await.unwrap();
-        server.await.unwrap().unwrap();
-    }
-
-    #[tokio::test]
-    async fn test_a_value_changing_reaches_a_connected_client() {
-        // The update arm of the select loop, which a server that only ever sent the
-        // snapshot would have passed every other test without.
-        let publisher = Arc::new(Publisher::new());
-        publisher.publish("summary", "cluster", &"testnet");
-        let (addr, server) = serve_one(publisher.clone()).await;
-        let (mut sender, mut receiver) = connect(addr).await.into_builder().finish();
-
-        let mut first = Vec::new();
-        receiver.receive_data(&mut first).await.unwrap();
-
-        publisher.publish("summary", "root_slot", &42u64);
-        let mut update = Vec::new();
-        receiver.receive_data(&mut update).await.unwrap();
-        let update = String::from_utf8(update).unwrap();
-        assert!(
-            update.contains(r#""key":"root_slot""#) && update.contains(r#""value":42"#),
-            "expected the update, got {update}"
+            receive(&mut receiver).await,
+            (true, encode("summary", "rows", &long_rows()).to_string())
         );
 
         sender.close().await.unwrap();
@@ -1974,20 +1593,16 @@ mod tests {
         let publisher = Arc::new(Publisher::new());
         publisher.publish("summary", "cluster", &"testnet");
         let (addr, server) = serve_one(publisher.clone()).await;
-        let (mut sender, mut receiver) = connect(addr).await.into_builder().finish();
-
-        let mut snapshot = Vec::new();
-        receiver.receive_data(&mut snapshot).await.unwrap();
+        let (mut sender, mut receiver) = connect(addr, false).await.into_builder().finish();
+        receive(&mut receiver).await;
 
         sender
-            .send_text(r#"{"topic":"summary","key":"ping","id":7}"#)
+            .send_text(r#"{"topic":"summary","key":"displays","id":7}"#)
             .await
             .unwrap();
         sender.flush().await.unwrap();
 
-        let mut reply = Vec::new();
-        receiver.receive_data(&mut reply).await.unwrap();
-        let reply = String::from_utf8(reply).unwrap();
+        let (_, reply) = receive(&mut receiver).await;
         assert!(
             reply.contains(r#""id":7"#),
             "the reply did not carry the request's id: {reply}"
@@ -2003,10 +1618,8 @@ mod tests {
         let publisher = Arc::new(Publisher::new());
         publisher.publish("summary", "cluster", &"testnet");
         let (addr, server) = serve_one(publisher.clone()).await;
-        let (mut sender, mut receiver) = connect(addr).await.into_builder().finish();
-
-        let mut snapshot = Vec::new();
-        receiver.receive_data(&mut snapshot).await.unwrap();
+        let (mut sender, mut receiver) = connect(addr, false).await.into_builder().finish();
+        receive(&mut receiver).await;
 
         let oversized = "x".repeat(MAX_CLIENT_MESSAGE + 1);
         sender.send_text(&oversized).await.unwrap();
@@ -2025,7 +1638,7 @@ mod tests {
         let publisher = Arc::new(Publisher::new());
         publisher.publish("summary", "cluster", &"testnet");
         let (addr, server) = serve_one(publisher.clone()).await;
-        let mut stream = connect(addr).await.into_inner().into_inner();
+        let mut stream = connect(addr, false).await.into_inner().into_inner();
 
         // An unfinished text frame of 4,000 bytes, then an empty pong, both masked with a zero key.
         let mut fragment = vec![0x01, 0x80 | 126, 0x0f, 0xa0, 0, 0, 0, 0];
@@ -2045,54 +1658,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_a_websocket_client_is_sent_the_retained_snapshot() {
-        let publisher = Arc::new(Publisher::new());
-        publisher.publish("summary", "cluster", &"testnet");
-        publisher.publish("summary", "root_slot", &7u64);
-        let (addr, server) = serve_one(publisher.clone()).await;
-
-        let (mut sender, mut receiver) = connect(addr).await.into_builder().finish();
-        let mut frames = Vec::new();
-        for _ in 0..2 {
-            let mut data = Vec::new();
-            receiver.receive_data(&mut data).await.unwrap();
-            frames.push(String::from_utf8(data).unwrap());
-        }
-
-        assert!(
-            frames
-                .iter()
-                .any(|frame| frame.contains(r#""key":"cluster""#)),
-            "the snapshot was missing a retained key: {frames:?}"
-        );
-        assert!(
-            frames
-                .iter()
-                .any(|frame| frame.contains(r#""key":"root_slot""#)),
-            "the snapshot was missing a retained key: {frames:?}"
-        );
-
-        sender.close().await.unwrap();
-        server.await.unwrap().unwrap();
-    }
-
-    #[tokio::test]
     async fn test_a_connected_client_does_not_hold_a_replaced_snapshot_value() {
         let publisher = Arc::new(Publisher::new());
         publisher.retain_only("summary", "history", &[1u64, 2]);
         let held = publisher.snapshot();
         let (addr, server) = serve_one(publisher.clone()).await;
-        let (mut sender, mut receiver) = connect(addr).await.into_builder().finish();
-        let mut snapshot = Vec::new();
-        receiver.receive_data(&mut snapshot).await.unwrap();
-        assert_eq!(snapshot, held[0].text().as_bytes());
+        let (mut sender, mut receiver) = connect(addr, false).await.into_builder().finish();
+        assert_eq!(receive(&mut receiver).await, (false, held[0].to_string()));
 
         publisher.retain_only("summary", "history", &[3u64]);
         // Sent from the update loop, so the snapshot loop has finished.
         publisher.publish("summary", "done", &true);
-        let mut done = Vec::new();
-        receiver.receive_data(&mut done).await.unwrap();
-        assert!(String::from_utf8(done).unwrap().contains(r#""key":"done""#));
+        assert!(receive(&mut receiver).await.1.contains(r#""key":"done""#));
         assert_eq!(
             held[0].copies(),
             1,
@@ -2118,6 +1695,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn test_a_client_that_stops_reading_gets_each_slot_once_it_resumes() {
         const FILLER: u64 = 128;
@@ -2126,28 +1704,31 @@ mod tests {
         let publisher = Arc::new(Publisher::new());
         publisher.publish("summary", "cluster", &"testnet");
         let (addr, server) = serve_one(publisher.clone()).await;
-        let (mut sender, mut receiver) = connect(addr).await.into_builder().finish();
-        let mut snapshot = Vec::new();
-        receiver.receive_data(&mut snapshot).await.unwrap();
+        let (mut sender, mut receiver) = connect(addr, false).await.into_builder().finish();
+        receive(&mut receiver).await;
 
         // More than the socket buffers hold while the client is not reading, so the server's
         // sends stall and later updates queue behind them.
         let pad = "x".repeat(4096);
         for slot in 0..FILLER {
-            publisher.publish_update(TOPIC_SLOT, "update", slot, &(slot, &pad));
+            publisher.publish_update(crate::proto::TOPIC_SLOT, "update", slot, &(slot, &pad));
             sleep(Duration::from_millis(1)).await;
         }
         for revision in 0..REVISIONS {
-            publisher.publish_update(TOPIC_SLOT, "update", WATCHED, &(WATCHED, revision));
+            publisher.publish_update(
+                crate::proto::TOPIC_SLOT,
+                "update",
+                WATCHED,
+                &(WATCHED, revision),
+            );
             sleep(Duration::from_millis(1)).await;
         }
         publisher.publish("summary", "done", &true);
 
         let mut revisions = Vec::new();
         loop {
-            let mut data = Vec::new();
-            receiver.receive_data(&mut data).await.unwrap();
-            let frame: serde_json::Value = serde_json::from_slice(&data).unwrap();
+            let frame: serde_json::Value =
+                serde_json::from_str(&receive(&mut receiver).await.1).unwrap();
             if frame["key"] == "done" {
                 break;
             }
@@ -2175,7 +1756,7 @@ mod tests {
     #[test]
     fn test_a_head_with_one_form_of_body_is_unchanged() {
         assert_eq!(
-            response_head(404, "text/plain; charset=utf-8", 9, false, ""),
+            response_head(&Reply::text(404, b"not found")),
             format!(
                 "HTTP/1.1 404 Not Found\r\ncontent-type: text/plain; \
                  charset=utf-8\r\ncontent-length: 9\r\ncache-control: \
@@ -2222,6 +1803,7 @@ mod tests {
         let (addr, server) = serve_one(Arc::new(Publisher::new())).await;
         let mut client = TcpStream::connect(addr).await.unwrap();
         client.write_all(request).await.unwrap();
+        // Closing on unread bytes sends a reset that discards the response.
         let mut reply = Vec::new();
         client.read_to_end(&mut reply).await.unwrap();
         server.await.unwrap().unwrap();
@@ -2235,7 +1817,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_the_entry_document_is_gzipped_only_for_a_client_that_asks() {
-        let Some((_, raw, _)) = lookup("/", false) else {
+        let Some(Reply { body: raw, .. }) = lookup("/", false) else {
             return;
         };
 

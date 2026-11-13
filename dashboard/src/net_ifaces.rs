@@ -17,7 +17,7 @@ pub enum InterfaceKind {
     Virtual,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct InterfaceReading {
     pub name: String,
     pub kind: InterfaceKind,
@@ -32,13 +32,10 @@ pub struct InterfaceReading {
 
 /// Link types the kernel gives tunnels: IPIP, IPv6-in-IPv6, SIT, GRE, IPv6 GRE, and none, which
 /// TUN devices and WireGuard report.
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 const TUNNEL_TYPES: [u32; 6] = [768, 769, 776, 778, 823, 65534];
 
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 const IFF_UP: u32 = 0x1;
 
-#[cfg(target_os = "linux")]
 pub fn read() -> io::Result<Vec<InterfaceReading>> {
     let counters = parse_counters(&std::fs::read_to_string("/proc/net/dev")?);
     // A host without IPv4 routes has no file; every interface then carries none.
@@ -63,13 +60,7 @@ pub fn read() -> io::Result<Vec<InterfaceReading>> {
     Ok(readings)
 }
 
-#[cfg(not(target_os = "linux"))]
-pub fn read() -> io::Result<Vec<InterfaceReading>> {
-    Err(io::ErrorKind::Unsupported.into())
-}
-
 /// Each interface but loopback, with its received and sent bytes.
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub(crate) fn parse_counters(contents: &str) -> Vec<(String, u64, u64)> {
     contents
         .lines()
@@ -88,7 +79,6 @@ pub(crate) fn parse_counters(contents: &str) -> Vec<(String, u64, u64)> {
 }
 
 /// Routes per interface in the main IPv4 table, after the heading line.
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn parse_routes(contents: &str) -> HashMap<String, u32> {
     let mut routes = HashMap::new();
     for line in contents.lines().skip(1) {
@@ -100,8 +90,6 @@ fn parse_routes(contents: &str) -> HashMap<String, u32> {
     routes
 }
 
-/// Names, on each tunnel, the interface holding the default route, which carries its packets.
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn place_tunnels(readings: &mut [InterfaceReading], route_table: &str) {
     let carrier = default_route(route_table, |name| {
         readings
@@ -117,7 +105,6 @@ fn place_tunnels(readings: &mut [InterfaceReading], route_table: &str) {
 }
 
 /// The interface of the lowest-metric IPv4 default route that `eligible` accepts.
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn default_route(route_table: &str, eligible: impl Fn(&str) -> bool) -> Option<String> {
     route_table
         .lines()
@@ -136,20 +123,16 @@ fn default_route(route_table: &str, eligible: impl Fn(&str) -> bool) -> Option<S
         .map(|(_, name)| name.to_string())
 }
 
-/// The interface it is a port of, from its `master` link, such as a bond, bridge or team.
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn master_of(sys: &Path) -> Option<String> {
     let target = std::fs::read_link(sys.join("master")).ok()?;
     target.file_name()?.to_str().map(str::to_string)
 }
 
 /// Backed by a device, and not a port of an interface that is, whose counters already hold its own.
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub(crate) fn counts_toward_host_total(sys: &Path) -> bool {
     sys.join("device").exists() && !sys.join("master").join("device").exists()
 }
 
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn kind_of(sys: &Path) -> InterfaceKind {
     let devtype = read_trimmed(&sys.join("uevent")).and_then(|uevent| {
         uevent
@@ -175,7 +158,6 @@ fn kind_of(sys: &Path) -> InterfaceKind {
 }
 
 /// Administratively up and not reported down. Tunnels report their state as unknown while working.
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn is_up(sys: &Path) -> bool {
     let flagged = read_trimmed(&sys.join("flags"))
         .and_then(|flags| u32::from_str_radix(flags.trim_start_matches("0x"), 16).ok())
@@ -184,7 +166,6 @@ fn is_up(sys: &Path) -> bool {
     flagged && !matches!(operstate.as_str(), "down" | "lowerlayerdown" | "notpresent")
 }
 
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn read_trimmed(path: &Path) -> Option<String> {
     std::fs::read_to_string(path)
         .ok()

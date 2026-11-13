@@ -44,7 +44,7 @@ pub struct Written {
 }
 
 /// A `None` interval is disabled.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct Snapshots {
     pub full: Option<Archive>,
     pub incremental: Option<Archive>,
@@ -117,11 +117,6 @@ impl SnapshotTracker {
             .copied()
             .chain(self.writing.map(|(_, _, from)| Span { from, to: None }))
     }
-
-    pub fn forget_before(&mut self, slot: Slot) {
-        self.spans
-            .retain(|span| span.to.is_none_or(|to| to >= slot));
-    }
 }
 
 pub fn read(config: &SnapshotConfig) -> Option<Snapshots> {
@@ -179,12 +174,11 @@ fn sizes<T: SnapshotArchiveInfoGetter>(archives: impl Iterator<Item = T>) -> u64
 fn archive(info: &impl SnapshotArchiveInfoGetter) -> Archive {
     Archive {
         slot: info.slot(),
-        written_millis: written(info.path()),
+        written_millis: fs::metadata(info.path())
+            .and_then(|meta| meta.modified())
+            .ok()
+            .and_then(millis),
     }
-}
-
-fn written(path: &Path) -> Option<u64> {
-    millis(fs::metadata(path).ok()?.modified().ok()?)
 }
 
 fn millis(time: SystemTime) -> Option<u64> {
@@ -260,12 +254,16 @@ mod tests {
 
     fn staged(writing: Option<Writing>) -> Option<Snapshots> {
         Some(Snapshots {
-            full: None,
-            incremental: None,
-            full_interval: None,
-            incremental_interval: None,
             writing,
-            last_written: None,
+            ..Snapshots::default()
+        })
+    }
+
+    fn written(slot: Slot, took_millis: u64, fell_behind_slots: u64) -> Option<Written> {
+        Some(Written {
+            slot,
+            took_millis,
+            fell_behind_slots,
         })
     }
 
@@ -288,14 +286,7 @@ mod tests {
         tracker.note_behind(3);
         tracker.observe(staged(Some(WRITE)), 40, 2_000);
         let shown = tracker.observe(staged(None), 90, 91_000).unwrap();
-        assert_eq!(
-            shown.last_written,
-            Some(Written {
-                slot: 300,
-                took_millis: 90_000,
-                fell_behind_slots: 7,
-            })
-        );
+        assert_eq!(shown.last_written, written(300, 90_000, 7));
         assert_eq!(
             tracker.spans().collect::<Vec<_>>(),
             [Span {
@@ -324,24 +315,10 @@ mod tests {
             since_millis: 9_000,
         };
         let shown = tracker.observe(staged(Some(next)), 60, 10_000).unwrap();
-        assert_eq!(
-            shown.last_written,
-            Some(Written {
-                slot: 300,
-                took_millis: 8_000,
-                fell_behind_slots: 5,
-            })
-        );
+        assert_eq!(shown.last_written, written(300, 8_000, 5));
 
         let shown = tracker.observe(staged(None), 70, 12_000).unwrap();
-        assert_eq!(
-            shown.last_written,
-            Some(Written {
-                slot: 500,
-                took_millis: 3_000,
-                fell_behind_slots: 0,
-            })
-        );
+        assert_eq!(shown.last_written, written(500, 3_000, 0));
         assert_eq!(
             tracker.spans().collect::<Vec<_>>(),
             [
@@ -353,27 +330,6 @@ mod tests {
                     from: 60,
                     to: Some(70),
                 },
-            ]
-        );
-    }
-
-    #[test]
-    fn test_spans_ended_before_an_epoch_are_forgotten_and_an_open_one_kept() {
-        let mut tracker = SnapshotTracker::default();
-        tracker.observe(staged(Some(WRITE)), 10, 0);
-        tracker.observe(staged(None), 20, 0);
-        tracker.observe(staged(Some(WRITE)), 30, 0);
-        tracker.observe(staged(None), 40, 0);
-        tracker.observe(staged(Some(WRITE)), 50, 0);
-        tracker.forget_before(35);
-        assert_eq!(
-            tracker.spans().collect::<Vec<_>>(),
-            [
-                Span {
-                    from: 30,
-                    to: Some(40),
-                },
-                Span { from: 50, to: None },
             ]
         );
     }
@@ -440,12 +396,6 @@ mod tests {
                 incremental: 30,
             })
         );
-    }
-
-    #[test]
-    fn test_a_node_that_generates_none_reads_no_archive_bytes() {
-        let dir = TempDir::new().unwrap();
-        assert_eq!(archive_bytes(&config(&dir, SnapshotUsage::LoadOnly)), None);
     }
 
     #[test]
@@ -521,6 +471,8 @@ mod tests {
     fn test_a_node_that_generates_none_reads_as_nothing() {
         let dir = TempDir::new().unwrap();
         touch(&dir, &format!("snapshot-100-{HASH}.tar.zst"));
-        assert_eq!(read(&config(&dir, SnapshotUsage::LoadOnly)), None);
+        let load_only = config(&dir, SnapshotUsage::LoadOnly);
+        assert_eq!(read(&load_only), None);
+        assert_eq!(archive_bytes(&load_only), None);
     }
 }

@@ -11,20 +11,15 @@ import {
   FIRST_SORT,
   gossipPeers,
   gossipVerdict,
-  ledgerParts,
   matchesSearch,
   nextSort,
   rate,
-  snapshotParts,
   sortPeers,
-  spanParts,
   stakeText,
   timeParts,
   type PeerColumn,
 } from "./gossip";
 import type { Gossip, GossipPeers } from "./types";
-
-const NOW = 1_790_000_000_000;
 
 const LIST: GossipPeers = {
   root: 10_000,
@@ -40,11 +35,6 @@ const LIST: GossipPeers = {
   ip: ["189.1.171.215", "67.202.63.79", "198.51.100.7", null],
   country: ["BR", "US", null, null],
   rpc: [null, null, 8899, null],
-  heard_ago: [1_000, 2_000, 3_000, 74_000],
-  started: [NOW - 6 * 86_400_000, NOW - 3_600_000, NOW - 840_000, 0],
-  snapshot_full: [6_188, 6_188, null, 0],
-  snapshot_incremental: [9_958, null, null, null],
-  lowest: [9_000, 9_900, 9_990, null],
   finalization: [0.98, 0.25, null, 0.93],
   vote_arrival_epoch: 1_048,
   vote_arrival: [
@@ -60,7 +50,7 @@ const LIST: GossipPeers = {
 const PEERS = gossipPeers(LIST);
 
 function order(column: PeerColumn, reversed = false): string[] {
-  return sortPeers(PEERS, { column, reversed }, NOW).map((peer) => peer.identity);
+  return sortPeers(PEERS, { column, reversed }).map((peer) => peer.identity);
 }
 
 describe("gossipPeers", () => {
@@ -68,12 +58,9 @@ describe("gossipPeers", () => {
     expect(PEERS[0]).toMatchObject({
       identity: "Big1111",
       client: "Agave v4.3.0",
-      full: 3_812,
-      incremental: 42,
-      ledger: 1_000,
     });
     expect(PEERS[1].client).toBe("JitoLabs v4.3.0");
-    expect(PEERS[2]).toMatchObject({ full: null, incremental: null, rpc: 8899 });
+    expect(PEERS[2]).toMatchObject({ rpc: 8899 });
   });
 
   it("carries each address's country and finds a peer by it", () => {
@@ -113,7 +100,7 @@ describe("finalize arrival", () => {
     expect(arrivalText(PEERS[1].voteArrival!, "finalize")).toBe("—");
     expect(arrivalMedian(PEERS, "finalize")).toBe(203_000);
     expect(
-      sortPeers(PEERS, { column: "arrival", reversed: false }, NOW, "finalize").map((peer) => peer.identity),
+      sortPeers(PEERS, { column: "arrival", reversed: false }, "finalize").map((peer) => peer.identity),
     ).toEqual(["Big1111", "Old4444", "Mid2222", "Rpc3333"]);
   });
 
@@ -129,7 +116,7 @@ describe("finalize arrival", () => {
 
 describe("filters and search", () => {
   it("counts every filter over the same rows", () => {
-    expect(filterCounts(PEERS, NOW)).toEqual({ staked: 3, rpc: 1, silent: 1, restarted: 2, delinquent: 1 });
+    expect(filterCounts(PEERS)).toEqual({ staked: 3, rpc: 1, delinquent: 1 });
   });
 
   it("reads delinquency, and how far the last vote is behind our root", () => {
@@ -153,7 +140,6 @@ describe("sortPeers", () => {
   it("orders numbers high to low and text A to Z first", () => {
     expect(order("stake")).toEqual(["Big1111", "Mid2222", "Old4444", "Rpc3333"]);
     expect(order("name")).toEqual(["Mid2222", "Big1111", "Old4444", "Rpc3333"]);
-    expect(order("heard")).toEqual(["Old4444", "Rpc3333", "Mid2222", "Big1111"]);
   });
 
   it("reverses on the same heading and keeps missing values last", () => {
@@ -172,9 +158,8 @@ describe("sortPeers", () => {
     expect(order("arrival", true)).toEqual(["Mid2222", "Old4444", "Big1111", "Rpc3333"]);
   });
 
-  it("sorts addresses by value and no snapshot as the oldest", () => {
+  it("sorts addresses by value", () => {
     expect(order("ip")).toEqual(["Mid2222", "Big1111", "Rpc3333", "Old4444"]);
-    expect(order("snapshot")).toEqual(["Rpc3333", "Old4444", "Mid2222", "Big1111"]);
   });
 
   it("steps through a heading's two orders and names them for ARIA", () => {
@@ -188,31 +173,6 @@ describe("sortPeers", () => {
 });
 
 describe("text", () => {
-  it("keeps a span to two units", () => {
-    const text = (millis: number | undefined) => spanParts(millis)?.map((part) => `${part.value}${part.unit}`).join(" ");
-    expect(text(74_000)).toBe("74s");
-    expect(text(840_000)).toBe("14min");
-    expect(text(19 * 3_600_000)).toBe("19h");
-    expect(text((6 * 24 + 3) * 3_600_000)).toBe("6d 3h");
-    expect(text(41 * 86_400_000)).toBe("41d");
-    expect(spanParts(undefined)).toBeNull();
-  });
-
-  it("describes snapshots and ledger depth", () => {
-    expect(snapshotParts(PEERS[0])).toEqual([
-      { label: "full", value: "3,812" },
-      { label: "inc", value: "42" },
-    ]);
-    expect(snapshotParts(PEERS[1])).toEqual([
-      { label: "full", value: "3,812" },
-      { label: "inc", value: null },
-    ]);
-    expect(snapshotParts(PEERS[2])).toBeNull();
-    expect(ledgerParts(1_000, 400)).toEqual([{ value: "6", unit: "min" }]);
-    expect(ledgerParts(1_000, null)).toEqual([{ value: "1,000", unit: " slots" }]);
-    expect(ledgerParts(null, 400)).toBeNull();
-  });
-
   it("keeps two decimals of stake under one SOL", () => {
     expect(stakeText(17_840_232_000_000_000)).toBe("17,840,232");
     expect(stakeText(500_000_000)).toBe("0.50");

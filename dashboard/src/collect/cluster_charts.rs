@@ -2,10 +2,7 @@
 //! skips from the root bank's slot history, and the cluster's stake by client and by country.
 
 use {
-    super::{
-        Collector, EpochInfo, Replies, WANTED_FOR_MILLIS, country_of, json_or_null,
-        strip_prerelease, tally_bank_stake,
-    },
+    super::{Encoded, EpochInfo, Replies, by_stake},
     crate::{
         geoip,
         history::{
@@ -13,21 +10,16 @@ use {
             SlotHistory,
         },
         search::leader_index,
+        validator_info::ValidatorInfoCache,
     },
     serde::Serialize,
     solana_clock::{Epoch, Slot},
-    solana_gossip::contact_info::ContactInfo,
     solana_pubkey::Pubkey,
-    solana_runtime::bank::Bank,
     solana_slot_history::Check,
-    std::{
-        collections::HashMap,
-        str::FromStr,
-        sync::{Arc, atomic::Ordering},
-    },
+    std::{str::FromStr, sync::Arc},
 };
 
-const GATHER_EVERY_MILLIS: u64 = 15_000;
+pub const GATHER_EVERY_MILLIS: u64 = 15_000;
 
 /// Named clients and countries shown before the rest are folded.
 const CLIENTS_SHOWN: usize = 8;
@@ -183,7 +175,6 @@ pub struct ContinentShare {
     pub stake: u64,
 }
 
-/// Readings taken under the history lock, each with the unix milliseconds it belongs to.
 /// A run of [`RUN_SLOTS`] slots being read; slots are paired with their first shred's time.
 struct Run {
     first: (Slot, u64),
@@ -205,6 +196,7 @@ impl Run {
     }
 }
 
+/// Readings taken under the history lock, each with the unix milliseconds it belongs to.
 #[derive(Debug, Default)]
 pub(super) struct Readings {
     /// The first held row's time at or after the start asked for.
@@ -313,7 +305,6 @@ enum Axis {
 }
 
 impl Readings {
-    /// The window's median slot time.
     pub(super) fn median_slot_millis(&self) -> Option<f64> {
         let mut millis: Vec<f32> = self.slot_millis.iter().map(|(_, millis)| *millis).collect();
         millis.sort_unstable_by(f32::total_cmp);
@@ -384,15 +375,63 @@ impl Bins {
     }
 
     fn of(&self, at: u64) -> usize {
-        let offset = u128::from(at.saturating_sub(self.from));
-        let bin = offset
-            .saturating_mul(self.count as u128)
-            .checked_div(u128::from(self.span))
-            .unwrap_or(0);
-        usize::try_from(bin)
-            .unwrap_or(usize::MAX)
-            .min(self.count.saturating_sub(1))
+        bin_of(at.saturating_sub(self.from), self.span, self.count)
     }
+}
+
+/// The bin of `count` across `span` that `offset` falls in; past the end is the last.
+pub(crate) fn bin_of(offset: u64, span: u64, count: usize) -> usize {
+    let bin = u128::from(offset)
+        .saturating_mul(count as u128)
+        .checked_div(u128::from(span))
+        .unwrap_or(0);
+    usize::try_from(bin)
+        .unwrap_or(usize::MAX)
+        .min(count.saturating_sub(1))
+}
+
+/// Hits against readings: per bin, over all, and over the recent part.
+struct Binned {
+    bins: Vec<(u64, u64)>,
+    all: (u64, u64),
+    recent: (u64, u64),
+}
+
+impl Binned {
+    fn new(count: usize) -> Self {
+        Self {
+            bins: vec![(0, 0); count],
+            all: (0, 0),
+            recent: (0, 0),
+        }
+    }
+
+    fn note(&mut self, bin: usize, recent: bool, hit: bool) {
+        let recent = recent.then_some(&mut self.recent);
+        for (hits, total) in [self.bins.get_mut(bin), Some(&mut self.all), recent]
+            .into_iter()
+            .flatten()
+        {
+            *total = total.saturating_add(1);
+            *hits = hits.saturating_add(u64::from(hit));
+        }
+    }
+
+    /// Each bin's percent, where it holds at least `min` readings.
+    fn shares(&self, min: u64) -> Vec<Option<f32>> {
+        self.bins
+            .iter()
+            .map(|(hits, total)| {
+                percent(*hits, *total)
+                    .filter(|_| *total >= min)
+                    .map(|share| share as f32)
+            })
+            .collect()
+    }
+}
+
+fn percent(part: u64, whole: u64) -> Option<f64> {
+    (whole > 0).then(|| part as f64 * 100.0 / whole as f64)
 }
 
 fn series(bins: &Bins, readings: Vec<(u64, f32)>, axis: Axis) -> Option<Series> {
@@ -466,38 +505,19 @@ fn shares(bins: &Bins, paths: &[(u64, bool)]) -> Option<Shares> {
     if paths.len() < MIN_READINGS {
         return None;
     }
-    let mut binned = vec![(0u64, 0u64); bins.count];
-    let (mut count, mut recent, mut recent_total) = (0u64, 0u64, 0u64);
+    let mut binned = Binned::new(bins.count);
     for (at, fast) in paths {
-        if let Some((fast_in, total)) = binned.get_mut(bins.of(*at)) {
-            *total = total.saturating_add(1);
-            if *fast {
-                *fast_in = fast_in.saturating_add(1);
-            }
-        }
-        if *fast {
-            count = count.saturating_add(1);
-        }
-        if *at >= bins.recent_from {
-            recent_total = recent_total.saturating_add(1);
-            if *fast {
-                recent = recent.saturating_add(1);
-            }
-        }
+        binned.note(bins.of(*at), *at >= bins.recent_from, *fast);
     }
-    let percent = |part: u64, whole: u64| part as f64 * 100.0 / whole as f64;
-    let shares: Vec<Option<f32>> = binned
-        .iter()
-        .map(|(fast, total)| (*total >= MIN_PER_BIN as u64).then(|| percent(*fast, *total) as f32))
-        .collect();
+    let shares = binned.shares(MIN_PER_BIN as u64);
     let lowest = shares.iter().flatten().copied().fold(100.0f32, f32::min);
-    let total = paths.len() as u64;
+    let (count, total) = binned.all;
     Some(Shares {
         shares,
         count,
         total,
-        share: percent(count, total),
-        recent: (recent_total > 0).then(|| percent(recent, recent_total)),
+        share: percent(count, total).unwrap_or(0.0),
+        recent: percent(binned.recent.0, binned.recent.1),
         floor: floor_below(lowest),
     })
 }
@@ -547,7 +567,7 @@ fn histogram(sorted: &[f32], floor: f64, top: f64) -> Vec<u32> {
 }
 
 /// Percent of the settled slots in `first..=last` skipped.
-pub(super) fn skip_share(first: Slot, last: Slot, check: impl Fn(Slot) -> Check) -> Option<f64> {
+pub fn skip_share(first: Slot, last: Slot, check: impl Fn(Slot) -> Check) -> Option<f64> {
     let (mut held, mut missed) = (0u64, 0u64);
     for slot in first..=last {
         match check(slot) {
@@ -587,38 +607,16 @@ pub(super) fn skip_chart(
     let span = to_slot.saturating_sub(epoch.start_slot).saturating_add(1);
     let recent_slots = (RECENT_MILLIS as f64 / slot_millis.max(1.0)) as u64;
     let recent_from = to_slot.saturating_sub(recent_slots);
-    let mut binned = vec![(0u64, 0u64); BINS];
+    let mut binned = Binned::new(BINS);
     let mut tallies = vec![(0u32, 0u32); epoch.leaders.len()];
-    let (mut skipped, mut slots, mut recent_skipped, mut recent_slots_held) =
-        (0u64, 0u64, 0u64, 0u64);
     for slot in epoch.start_slot..=to_slot {
         let made = match check(slot) {
             Check::Found => true,
             Check::NotFound => false,
             Check::TooOld | Check::Future => continue,
         };
-        let offset = slot.saturating_sub(epoch.start_slot);
-        let bin = u128::from(offset)
-            .saturating_mul(BINS as u128)
-            .checked_div(u128::from(span))
-            .and_then(|bin| usize::try_from(bin).ok())
-            .unwrap_or(0);
-        if let Some((bin_skipped, bin_slots)) = binned.get_mut(bin) {
-            *bin_slots = bin_slots.saturating_add(1);
-            if !made {
-                *bin_skipped = bin_skipped.saturating_add(1);
-            }
-        }
-        slots = slots.saturating_add(1);
-        if !made {
-            skipped = skipped.saturating_add(1);
-        }
-        if slot >= recent_from {
-            recent_slots_held = recent_slots_held.saturating_add(1);
-            if !made {
-                recent_skipped = recent_skipped.saturating_add(1);
-            }
-        }
+        let bin = bin_of(slot.saturating_sub(epoch.start_slot), span, BINS);
+        binned.note(bin, slot >= recent_from, !made);
         let leader = leader_index(epoch, slot).map(usize::from);
         if let Some((leader_slots, leader_skipped)) = leader.and_then(|at| tallies.get_mut(at)) {
             *leader_slots = leader_slots.saturating_add(1);
@@ -627,7 +625,6 @@ pub(super) fn skip_chart(
             }
         }
     }
-    let percent = |part: u64, whole: u64| (whole > 0).then(|| part as f64 * 100.0 / whole as f64);
     let mut rates: Vec<u32> = tallies
         .iter()
         .filter(|(slots, _)| *slots >= LEADER_SLOTS)
@@ -658,18 +655,16 @@ pub(super) fn skip_chart(
     });
     ranked.truncate(SKIP_LEADERS);
     let back = |slots: u64| (slots as f64 * slot_millis) as u64;
+    let (skipped, slots) = binned.all;
     Some((
         SkipChart {
             to_slot,
             from_millis: now_millis.saturating_sub(back(span)),
             to_millis: now_millis,
-            shares: binned
-                .iter()
-                .map(|(skipped, slots)| percent(*skipped, *slots).map(|share| share as f32))
-                .collect(),
+            shares: binned.shares(1),
             skipped,
             slots,
-            recent: percent(recent_skipped, recent_slots_held),
+            recent: percent(binned.recent.0, binned.recent.1),
             previous,
             per_leader,
             leaders: Vec::new(),
@@ -680,187 +675,115 @@ pub(super) fn skip_chart(
 
 impl Replies {
     /// Notes the ask and returns the held charts. After a lapse they are stale, so null is held
-    /// until the collector's next tick gathers them afresh. `None` on a poisoned lock.
+    /// until the slot feed's next tick gathers them afresh. `None` on a poisoned lock.
     pub fn ask_cluster_charts(&self, now_millis: u64) -> Option<Arc<str>> {
-        let before = self
-            .cluster_charts_wanted
-            .swap(now_millis, Ordering::Relaxed);
-        let mut held = self.cluster_charts.write().ok()?;
-        if now_millis.saturating_sub(before) > WANTED_FOR_MILLIS {
-            *held = Arc::from("null");
+        let lapsed = self.cluster_charts.ask(now_millis);
+        let mut held = self.cluster_charts.held.write().ok()?;
+        if lapsed {
+            *held = Encoded::default();
         }
-        Some(held.clone())
+        Some(held.0.clone())
     }
 }
 
-impl Collector {
-    /// While a page asks: at once after a lapse, then every fifteen seconds.
-    pub(super) fn cluster_charts_due(&self, now_millis: u64) -> bool {
-        let wanted = self.replies.cluster_charts_wanted.load(Ordering::Relaxed);
-        now_millis.saturating_sub(wanted) <= WANTED_FOR_MILLIS
-            && now_millis.saturating_sub(self.cluster_charts_made) >= GATHER_EVERY_MILLIS
-    }
-
-    pub(super) fn collect_cluster_charts(
-        &mut self,
-        root_bank: &Bank,
-        bank: &Bank,
-        peers: &[(ContactInfo, u64)],
-        now_millis: u64,
-    ) {
-        let epoch = root_bank.epoch();
-        let epochs = self.epochs.read().unwrap();
-        let Some(info) = epochs
-            .iter()
-            .find(|info| info.epoch == epoch && !info.turns.is_empty())
-        else {
-            return;
-        };
-        let asked_from = self.caught_up_millis.unwrap_or(0);
-        let held = readings(
-            &self.history.read().unwrap(),
+/// The charts, from any source of the epoch, the slot history and gossip: `rooted` checks a slot
+/// against the SlotHistory sysvar, `described` is each staked identity's gossip by its stake, and
+/// `country_of` a leader's country.
+#[allow(clippy::too_many_arguments)]
+pub fn cluster_charts(
+    info: &EpochInfo,
+    history: &SlotHistory,
+    newest_arrival: Slot,
+    asked_from: u64,
+    root: Slot,
+    now_millis: u64,
+    previous_skips: Option<f64>,
+    rooted: Option<&dyn Fn(Slot) -> Check>,
+    names: &ValidatorInfoCache,
+    country_of: impl Fn(&Pubkey) -> Option<&'static str>,
+    described: &[(u64, Option<Described>)],
+    ours_country: Option<&'static str>,
+) -> ClusterCharts {
+    let held = readings(history, info, newest_arrival, asked_from);
+    let from_millis = held.first_at.unwrap_or(now_millis).max(asked_from);
+    let slot_millis = held.median_slot_millis();
+    let mut charts = held.charts(info.epoch, from_millis, now_millis, slot_millis);
+    if let Some(rooted) = rooted
+        && let Some((mut chart, ranked)) = skip_chart(
             info,
-            self.newest_arrival,
-            asked_from,
-        );
-        let from_millis = held.first_at.unwrap_or(now_millis).max(asked_from);
-        let slot_millis = held.median_slot_millis();
-        let mut charts = held.charts(epoch, from_millis, now_millis, slot_millis);
-        let schedule = root_bank.epoch_schedule();
-        let slot_history = root_bank.get_slot_history();
-        // Settled once that epoch is rooted, so read once per epoch.
-        if self.previous_skips.is_none_or(|(held, _)| held != epoch)
-            && let Some(slot_history) = &slot_history
-        {
-            let share = epoch.checked_sub(1).and_then(|previous| {
-                let first = schedule.get_first_slot_in_epoch(previous);
-                let last = schedule.get_last_slot_in_epoch(previous);
-                skip_share(first, last, |slot| slot_history.check(slot))
-            });
-            self.previous_skips = Some((epoch, share));
-        }
-        let previous = self.previous_skips.and_then(|(_, share)| share);
-        if let Some(slot_history) = slot_history
-            && let Some((mut chart, ranked)) = skip_chart(
-                info,
-                previous,
-                root_bank.slot(),
-                now_millis,
-                slot_millis.unwrap_or(400.0),
-                |slot| slot_history.check(slot),
-            )
-        {
-            let names = self.info_cache.read().unwrap();
-            chart.leaders = ranked
-                .into_iter()
-                .filter_map(|LeaderSkips { at, slots, skipped }| {
-                    let identity = info.leaders.get(at)?;
-                    let key = Pubkey::from_str(identity).ok();
-                    Some(SkipLeader {
-                        identity: identity.clone(),
-                        name: key
-                            .and_then(|key| names.get(&key).and_then(|info| info.name.clone())),
-                        country: key.and_then(|key| country_of(&self.ctx.cluster_info, &key)),
-                        slots,
-                        skipped,
-                    })
+            previous_skips,
+            root,
+            now_millis,
+            slot_millis.unwrap_or(400.0),
+            rooted,
+        )
+    {
+        chart.leaders = ranked
+            .into_iter()
+            .filter_map(|LeaderSkips { at, slots, skipped }| {
+                let identity = info.leaders.get(at)?;
+                let key = Pubkey::from_str(identity).ok();
+                Some(SkipLeader {
+                    identity: identity.clone(),
+                    name: key.and_then(|key| names.get(&key).and_then(|info| info.name.clone())),
+                    country: key.and_then(|key| country_of(&key)),
+                    slots,
+                    skipped,
                 })
-                .collect();
-            charts.skips = Some(chart);
-        }
-        drop(epochs);
-        let staked = tally_bank_stake(bank).staked;
-        let ours_country = self
-            .ctx
-            .cluster_info
-            .my_contact_info()
-            .gossip()
-            .and_then(|addr| geoip::country(addr.ip()));
-        let contacts: HashMap<Pubkey, &ContactInfo> = peers
-            .iter()
-            .map(|(contact, _)| (*contact.pubkey(), contact))
-            .collect();
-        let me = self.ctx.cluster_info.my_contact_info();
-        let lookup = |key: &Pubkey| -> Option<Described> {
-            let contact = if *key == *me.pubkey() {
-                &me
-            } else {
-                *contacts.get(key)?
-            };
-            Some(Described {
-                client: contact.version().client().to_string(),
-                release: strip_prerelease(&contact.version().to_string()).to_string(),
-                country: contact.gossip().and_then(|addr| geoip::country(addr.ip())),
             })
-        };
-        let described: Vec<(u64, Option<Described>)> = staked
-            .iter()
-            .map(|(key, stake)| (*stake, lookup(key)))
             .collect();
-        charts.clients = client_shares(&described);
-        charts.countries = country_shares(&described, ours_country);
-        if let Ok(mut held) = self.replies.cluster_charts.write() {
-            *held = json_or_null(&charts);
-        }
+        charts.skips = Some(chart);
     }
+    charts.clients = client_shares(described);
+    charts.countries = country_shares(described, ours_country);
+    charts
 }
 
 /// What gossip says of one staked identity.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct Described {
-    client: String,
-    release: String,
-    country: Option<&'static str>,
+pub struct Described {
+    pub client: String,
+    pub release: String,
+    pub country: Option<&'static str>,
 }
 
 /// Clients gossip names by number only, and identities gossip does not hold, are folded with the
 /// tail.
 fn client_shares(described: &[(u64, Option<Described>)]) -> Vec<ClientShare> {
-    let mut clients: HashMap<&str, (usize, u64, HashMap<&str, u64>)> = HashMap::new();
-    let mut folded = (0usize, 0u64);
-    for (stake, described) in described {
-        match described {
-            Some(described) if !described.client.starts_with("Unknown") => {
-                let entry = clients.entry(described.client.as_str()).or_default();
-                entry.0 = entry.0.saturating_add(1);
-                entry.1 = entry.1.saturating_add(*stake);
-                let release = entry.2.entry(described.release.as_str()).or_insert(0);
-                *release = release.saturating_add(*stake);
-            }
-            _ => {
-                folded.0 = folded.0.saturating_add(1);
-                folded.1 = folded.1.saturating_add(*stake);
-            }
-        }
+    fn named(described: &Option<Described>) -> Option<&Described> {
+        described
+            .as_ref()
+            .filter(|described| !described.client.starts_with("Unknown"))
     }
-    let mut shares: Vec<ClientShare> = clients
+    let clients = described
+        .iter()
+        .map(|(stake, described)| (named(described).map(|named| named.client.as_str()), *stake));
+    let (rows, (_, folded, folded_stake)) = by_stake(clients, CLIENTS_SHOWN, |a, b| a.0.cmp(b.0));
+    let mut shares: Vec<ClientShare> = rows
         .into_iter()
-        .map(|(client, (validators, stake, releases))| {
-            let mut releases: Vec<(&str, u64)> = releases.into_iter().collect();
-            releases.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
+        .map(|(client, validators, stake)| {
+            let releases = described.iter().filter_map(|(stake, described)| {
+                let described = named(described).filter(|described| described.client == client)?;
+                Some((Some(described.release.as_str()), *stake))
+            });
+            let (releases, _) = by_stake(releases, 2, |a, b| a.0.cmp(b.0));
             ClientShare {
                 client: client.to_string(),
                 validators,
                 stake,
                 releases: releases
                     .into_iter()
-                    .take(2)
-                    .map(|(release, _)| release.to_string())
+                    .map(|(release, ..)| release.to_string())
                     .collect(),
                 other: false,
             }
         })
         .collect();
-    shares.sort_by(|a, b| b.stake.cmp(&a.stake).then_with(|| a.client.cmp(&b.client)));
-    for tail in shares.split_off(CLIENTS_SHOWN.min(shares.len())) {
-        folded.0 = folded.0.saturating_add(tail.validators);
-        folded.1 = folded.1.saturating_add(tail.stake);
-    }
-    if folded.0 > 0 {
+    if folded > 0 {
         shares.push(ClientShare {
             client: "other".to_string(),
-            validators: folded.0,
-            stake: folded.1,
+            validators: folded,
+            stake: folded_stake,
             releases: Vec::new(),
             other: true,
         });
@@ -872,62 +795,50 @@ fn country_shares(
     described: &[(u64, Option<Described>)],
     ours: Option<&'static str>,
 ) -> Option<StakeByCountry> {
-    let mut countries: HashMap<Option<&'static str>, (usize, u64)> = HashMap::new();
-    let mut continents: HashMap<Option<&'static str>, u64> = HashMap::new();
-    let mut stake_total = 0u64;
-    for (stake, described) in described {
-        let country = described.as_ref().and_then(|described| described.country);
-        let entry = countries.entry(country).or_default();
-        entry.0 = entry.0.saturating_add(1);
-        entry.1 = entry.1.saturating_add(*stake);
-        let continent = continents
-            .entry(country.and_then(geoip::continent))
-            .or_insert(0);
-        *continent = continent.saturating_add(*stake);
-        stake_total = stake_total.saturating_add(*stake);
-    }
+    let country = |described: &Option<Described>| described.as_ref()?.country;
+    let stake_total = described
+        .iter()
+        .fold(0u64, |sum, (stake, _)| sum.saturating_add(*stake));
     if stake_total == 0 {
         return None;
     }
-    let mut known: Vec<CountryShare> = countries
+    let countries = described
         .iter()
-        .filter_map(|(code, (validators, stake))| {
-            Some(CountryShare {
-                code: Some((*code)?),
-                stake: *stake,
-                validators: *validators,
-                others: None,
-            })
+        .map(|(stake, described)| (country(described), *stake));
+    let (rows, (tail_countries, folded, folded_stake)) =
+        by_stake(countries, COUNTRIES_SHOWN, |a, b| a.0.cmp(b.0));
+    let mut rows: Vec<CountryShare> = rows
+        .into_iter()
+        .map(|(code, validators, stake)| CountryShare {
+            code: Some(code),
+            stake,
+            validators,
+            others: None,
         })
         .collect();
-    known.sort_by(|a, b| b.stake.cmp(&a.stake).then_with(|| a.code.cmp(&b.code)));
-    let named = known.len();
-    let tail = known.split_off(COUNTRIES_SHOWN.min(known.len()));
-    let unknown = countries.get(&None).copied().unwrap_or_default();
-    if !tail.is_empty() || unknown.0 > 0 {
-        known.push(CountryShare {
+    let named = rows.len().saturating_add(tail_countries);
+    if folded > 0 {
+        rows.push(CountryShare {
             code: None,
-            stake: tail
-                .iter()
-                .fold(unknown.1, |sum, row| sum.saturating_add(row.stake)),
-            validators: tail
-                .iter()
-                .fold(unknown.0, |sum, row| sum.saturating_add(row.validators)),
-            others: Some(tail.len()),
+            stake: folded_stake,
+            validators: folded,
+            others: Some(tail_countries),
         });
     }
-    let mut continents: Vec<ContinentShare> = continents
-        .into_iter()
-        .map(|(code, stake)| ContinentShare { code, stake })
-        .collect();
-    continents.sort_by(|a, b| b.stake.cmp(&a.stake).then_with(|| a.code.cmp(&b.code)));
+    let continents = described
+        .iter()
+        .map(|(stake, described)| (Some(country(described).and_then(geoip::continent)), *stake));
+    let (continents, _) = by_stake(continents, usize::MAX, |a, b| a.0.cmp(&b.0));
     Some(StakeByCountry {
         stake: stake_total,
         countries: named,
         ours,
         ours_continent: ours.and_then(geoip::continent),
-        rows: known,
-        continents,
+        rows,
+        continents: continents
+            .into_iter()
+            .map(|(code, _, stake)| ContinentShare { code, stake })
+            .collect(),
     })
 }
 
@@ -973,14 +884,16 @@ mod tests {
         history
     }
 
+    fn whole_epoch(history: &SlotHistory, epoch: &EpochInfo) -> ClusterCharts {
+        let from = epoch.start_slot.saturating_mul(400);
+        let to = epoch.end_slot.saturating_mul(400);
+        readings(history, epoch, epoch.end_slot, from).charts(7, from, to, Some(400.0))
+    }
+
     #[test]
     fn test_charts_bin_every_reading() {
         let epoch = epoch();
-        let history = filled(&epoch);
-        let from = epoch.start_slot.saturating_mul(400);
-        let to = epoch.end_slot.saturating_mul(400);
-        let charts =
-            readings(&history, &epoch, epoch.end_slot, from).charts(7, from, to, Some(400.0));
+        let charts = whole_epoch(&filled(&epoch), &epoch);
         let cu = charts.cu.unwrap();
         assert_eq!(cu.spread.p50, 50.0);
         assert_eq!((cu.floor, cu.top), (0.0, 100.0));
@@ -1010,11 +923,7 @@ mod tests {
         for slot in 2_000..2_040 {
             history.record_notarized(slot, 4_250);
         }
-        let from = epoch.start_slot.saturating_mul(400);
-        let to = epoch.end_slot.saturating_mul(400);
-        let charts =
-            readings(&history, &epoch, epoch.end_slot, from).charts(7, from, to, Some(400.0));
-        let notarized = charts.notarized.unwrap();
+        let notarized = whole_epoch(&history, &epoch).notarized.unwrap();
         assert_eq!(
             notarized
                 .p05
@@ -1060,14 +969,8 @@ mod tests {
     #[test]
     fn test_a_thin_bin_keeps_its_median_without_bands() {
         let epoch = epoch();
-        let history = filled(&epoch);
-        let from = epoch.start_slot.saturating_mul(400);
-        let to = epoch.end_slot.saturating_mul(400);
         // The last of 66 bins holds two closed runs, the third still open.
-        let tps = readings(&history, &epoch, epoch.end_slot, from)
-            .charts(7, from, to, Some(400.0))
-            .tps
-            .unwrap();
+        let tps = whole_epoch(&filled(&epoch), &epoch).tps.unwrap();
         assert_eq!(tps.p50.len(), 66);
         assert!(tps.p50.iter().all(Option::is_some));
         let (last, rest) = tps.p05.split_last().unwrap();
@@ -1245,7 +1148,6 @@ mod tests {
             .sum();
         assert_eq!(total, countries.stake);
     }
-
     #[test]
     fn test_nice_tops() {
         assert_eq!(nice_top(2_991.0), 3_000.0);

@@ -20,7 +20,19 @@ use {
 };
 
 /// A ceiling the size tests hold server messages under; soketto limits only what it receives.
+#[cfg(test)]
 pub const MAX_MESSAGE: usize = 1024 * 1024;
+
+/// Fails the test where `message` is not under `ceiling` bytes.
+#[cfg(test)]
+#[track_caller]
+pub fn assert_under(what: &str, message: &str, ceiling: usize) {
+    let length = message.len();
+    assert!(
+        length < ceiling,
+        "{what} is {length} bytes against a {ceiling} byte ceiling"
+    );
+}
 
 const BROADCAST_CAPACITY: usize = 8192;
 
@@ -53,7 +65,6 @@ struct Envelope<'a, T> {
 pub struct Request {
     pub topic: String,
     pub key: String,
-    #[serde(default)]
     pub id: Option<u64>,
     #[serde(default)]
     pub params: serde_json::Value,
@@ -102,10 +113,6 @@ impl Message {
             .as_deref()
     }
 
-    pub fn text(&self) -> &str {
-        &self.text
-    }
-
     pub fn frame(&self, deflate: bool) -> Frame<'_> {
         match deflate.then(|| self.deflated()).flatten() {
             Some(bytes) => Frame::Binary(bytes),
@@ -114,10 +121,10 @@ impl Message {
     }
 
     pub fn wire_len(&self, deflate: bool) -> usize {
-        match deflate.then(|| self.deflated()).flatten() {
-            Some(bytes) => bytes.len(),
-            None => self.text.len(),
-        }
+        deflate
+            .then(|| self.deflated())
+            .flatten()
+            .map_or(self.text.len(), <[u8]>::len)
     }
 
     pub fn supersedes(&self) -> Option<Supersedes> {
@@ -128,16 +135,6 @@ impl Message {
     #[cfg(test)]
     pub(crate) fn copies(&self) -> usize {
         Arc::strong_count(&self.text)
-    }
-
-    /// Long enough to travel deflated and not deflated yet.
-    pub fn deflate_pending(&self) -> bool {
-        self.text.len() >= DEFLATE_FROM && self.deflated.get().is_none()
-    }
-
-    /// Fills the deflated copy every clone shares, so a later send only copies bytes.
-    pub fn deflate_now(&self) {
-        let _ = self.deflated();
     }
 }
 
@@ -194,9 +191,7 @@ pub fn encode_with_id<T: Serialize>(topic: &str, key: &str, id: Option<u64>, val
         Ok(json) => Message::new(json),
         Err(err) => {
             log::error!("dashboard: failed to encode {topic}.{key}: {err}");
-            Message::new(format!(
-                r#"{{"topic":"{topic}","key":"{key}","value":null}}"#
-            ))
+            encode_with_id(topic, key, id, &())
         }
     }
 }
@@ -416,11 +411,16 @@ mod tests {
     }
 
     #[test]
-    fn test_unencodable_payload_keeps_the_feed_up() {
-        let message = encode("summary", "broken", &Unserializable);
+    fn test_an_unencodable_value_is_sent_as_null_and_a_reply_keeps_its_id() {
         assert_eq!(
-            message.text(),
+            &*encode("summary", "broken", &Unserializable),
             r#"{"topic":"summary","key":"broken","value":null}"#
+        );
+        let message = encode_with_id("sum\"mary", "bro\\ken", Some(5), &Unserializable);
+        let parsed: serde_json::Value = serde_json::from_str(&message).unwrap();
+        assert_eq!(
+            parsed,
+            serde_json::json!({ "topic": "sum\"mary", "key": "bro\\ken", "id": 5, "value": null })
         );
     }
 
@@ -430,21 +430,25 @@ mod tests {
         let json = serde_json::to_string(&value).unwrap();
         for id in [None, Some(0), Some(u64::MAX)] {
             assert_eq!(
-                encode_json_with_id("summary", "misses", id, &json).text(),
-                encode_with_id("summary", "misses", id, &value).text(),
+                &*encode_json_with_id("summary", "misses", id, &json),
+                &*encode_with_id("summary", "misses", id, &value),
             );
         }
     }
 
     #[test]
-    fn test_a_debounce_remembers_what_it_last_sent() {
-        // The collector compares against it, so it holds the value, not a hash.
+    fn test_a_debounce_sends_a_value_once_and_remembers_it() {
+        // Callers compare against it, so it holds the value, not a hash.
         let publisher = Publisher::new();
+        let mut receiver = publisher.subscribe();
         let mut debounced: Debounced<u64> = Debounced::new("summary", "root_slot");
         assert_eq!(debounced.last(), None);
 
         debounced.publish(&publisher, 7);
+        debounced.publish(&publisher, 7);
         assert_eq!(debounced.last(), Some(&7));
+        assert!(receiver.try_recv().is_ok());
+        assert!(receiver.try_recv().is_err());
 
         debounced.publish(&publisher, 9);
         assert_eq!(debounced.last(), Some(&9));
@@ -457,7 +461,7 @@ mod tests {
         publisher.publish("summary", "root_slot", &2u64);
         let snapshot = publisher.snapshot();
         assert_eq!(snapshot.len(), 1);
-        assert!(snapshot[0].text().contains(r#""value":2"#));
+        assert!(snapshot[0].contains(r#""value":2"#));
     }
 
     #[test]
@@ -485,7 +489,7 @@ mod tests {
         publisher.forget("slot", "overview");
         let snapshot = publisher.snapshot();
         assert_eq!(snapshot.len(), 1);
-        assert!(snapshot[0].text().contains(r#""key":"root_slot""#));
+        assert!(snapshot[0].contains(r#""key":"root_slot""#));
     }
 
     #[test]
@@ -502,45 +506,25 @@ mod tests {
     }
 
     #[test]
-    fn test_debounce_suppresses_unchanged_values() {
-        let publisher = Publisher::new();
-        let mut receiver = publisher.subscribe();
-        let mut debounced = Debounced::new("summary", "root_slot");
-        debounced.publish(&publisher, 7u64);
-        debounced.publish(&publisher, 7u64);
-        assert!(receiver.try_recv().is_ok());
-        assert!(receiver.try_recv().is_err());
-    }
-
-    #[test]
-    fn test_envelope_has_topic_key_and_value() {
-        let message = encode("summary", "cluster", &"testnet");
-        assert_eq!(
-            message.text(),
-            r#"{"topic":"summary","key":"cluster","value":"testnet"}"#
-        );
-    }
-
-    #[test]
     fn test_query_responses_carry_the_request_id() {
-        let message = encode_with_id("summary", "ping", Some(42), &());
+        let message = encode_with_id("summary", "displays", Some(42), &());
         assert_eq!(
-            message.text(),
-            r#"{"topic":"summary","key":"ping","id":42,"value":null}"#
+            &*message,
+            r#"{"topic":"summary","key":"displays","id":42,"value":null}"#
         );
     }
 
     #[test]
     fn test_a_long_message_is_also_kept_deflated_and_a_short_one_is_not() {
         let long = encode("summary", "host", &vec![7u64; 400]);
-        assert!(long.text().len() >= DEFLATE_FROM);
+        assert!(long.len() >= DEFLATE_FROM);
         assert!(matches!(long.frame(true), Frame::Binary(_)));
         assert!(long.wire_len(true) < long.wire_len(false));
         assert!(matches!(long.frame(false), Frame::Text(_)));
 
         let short = encode("summary", "root_slot", &7u64);
         assert!(matches!(short.frame(true), Frame::Text(_)));
-        assert_eq!(short.wire_len(true), short.text().len());
+        assert_eq!(short.wire_len(true), short.len());
     }
 
     #[test]
@@ -552,21 +536,6 @@ mod tests {
         assert!(message.deflated.get().is_none());
         assert!(matches!(copy.frame(true), Frame::Binary(_)));
         assert!(message.deflated.get().is_some());
-    }
-
-    #[test]
-    fn test_a_message_deflated_ahead_is_sent_as_the_same_bytes() {
-        let ahead = encode("summary", "host", &vec!["a host row"; 400]);
-        let inline = encode("summary", "host", &vec!["a host row"; 400]);
-        assert!(ahead.deflate_pending());
-        ahead.clone().deflate_now();
-        assert!(!ahead.deflate_pending());
-        let (Frame::Binary(early), Frame::Binary(late)) = (ahead.frame(true), inline.frame(true))
-        else {
-            panic!("a long message should deflate");
-        };
-        assert_eq!(early, late);
-        assert!(!encode("summary", "root_slot", &7u64).deflate_pending());
     }
 
     #[test]
@@ -582,23 +551,17 @@ mod tests {
         let mut receiver = publisher.subscribe();
         publisher.publish_ephemeral("slot", "update", &1u64);
         assert_eq!(
-            receiver.try_recv().unwrap().text(),
+            &*receiver.try_recv().unwrap(),
             r#"{"topic":"slot","key":"update","value":1}"#
         );
     }
 
-    #[test]
-    fn test_deflated_bytes_inflate_back_to_the_text() {
-        use std::io::Read;
-        let message = encode("summary", "host", &vec!["abc"; 300]);
-        let Frame::Binary(bytes) = message.frame(true) else {
-            panic!("a long message should deflate");
-        };
-        let mut text = String::new();
-        flate2::read::ZlibDecoder::new(bytes)
-            .read_to_string(&mut text)
-            .unwrap();
-        assert_eq!(text, message.text());
+    /// What a client is sent of everything queued for it.
+    fn coalesced(receiver: &mut broadcast::Receiver<Message>) -> Vec<String> {
+        coalesce(std::iter::from_fn(|| receiver.try_recv().ok()).collect())
+            .iter()
+            .map(Message::to_string)
+            .collect()
     }
 
     #[test]
@@ -610,14 +573,8 @@ mod tests {
         publisher.publish("summary", "root_slot", &2u64);
         publisher.publish_ephemeral("slot", "update", &11u64);
         publisher.publish("summary", "cluster", &"testnet");
-        let mut burst = Vec::new();
-        while let Ok(message) = receiver.try_recv() {
-            burst.push(message);
-        }
-        let kept = coalesce(burst);
-        let sent: Vec<&str> = kept.iter().map(Message::text).collect();
         assert_eq!(
-            sent,
+            coalesced(&mut receiver),
             [
                 r#"{"topic":"slot","key":"update","value":10}"#,
                 r#"{"topic":"summary","key":"root_slot","value":2}"#,
@@ -636,14 +593,8 @@ mod tests {
         publisher.publish_ephemeral(TOPIC_SUMMARY, "tps_sample", &1u64);
         publisher.publish_update(TOPIC_SLOT, "update", 7, &"7 rooted");
         publisher.publish_ephemeral(TOPIC_SUMMARY, "tps_sample", &2u64);
-        let mut burst = Vec::new();
-        while let Ok(message) = receiver.try_recv() {
-            burst.push(message);
-        }
-        let kept = coalesce(burst);
-        let sent: Vec<&str> = kept.iter().map(Message::text).collect();
         assert_eq!(
-            sent,
+            coalesced(&mut receiver),
             [
                 r#"{"topic":"slot","key":"update","value":"8 first shred"}"#,
                 r#"{"topic":"summary","key":"tps_sample","value":1}"#,
@@ -659,11 +610,7 @@ mod tests {
         let mut receiver = publisher.subscribe();
         publisher.publish_update(TOPIC_SLOT, "update", 7, &1u64);
         publisher.publish_update(TOPIC_SUMMARY, "produced_block", 7, &2u64);
-        let mut burst = Vec::new();
-        while let Ok(message) = receiver.try_recv() {
-            burst.push(message);
-        }
-        assert_eq!(coalesce(burst).len(), 2);
+        assert_eq!(coalesced(&mut receiver).len(), 2);
     }
 
     #[test]

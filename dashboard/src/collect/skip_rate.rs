@@ -20,17 +20,17 @@ pub struct LeaderSlotCounts {
 }
 
 #[derive(Debug, Default)]
-pub(super) struct SkipRateWalk {
+pub struct SkipRateWalk {
     /// The epoch and identity the walk is for; a swapped identity starts it again.
-    pub(super) epoch: Option<(Epoch, Pubkey)>,
+    pub epoch: Option<(Epoch, Pubkey)>,
     leader_slots: Vec<Slot>,
-    pub(super) next_index: usize,
+    pub next_index: usize,
     produced: usize,
     skipped: usize,
 }
 
 impl SkipRateWalk {
-    pub(super) fn new(epoch: Epoch, identity: Pubkey, leader_slots: Vec<Slot>) -> Self {
+    pub fn new(epoch: Epoch, identity: Pubkey, leader_slots: Vec<Slot>) -> Self {
         Self {
             epoch: Some((epoch, identity)),
             leader_slots,
@@ -39,7 +39,7 @@ impl SkipRateWalk {
     }
 
     /// Whether a leader slot the root has passed is still to be counted.
-    pub(super) fn due(&self, root: Slot) -> bool {
+    pub fn due(&self, root: Slot) -> bool {
         self.leader_slots
             .get(self.next_index)
             .is_some_and(|slot| *slot <= root)
@@ -47,7 +47,7 @@ impl SkipRateWalk {
 
     /// Only slots the root has passed are settled. `check` answers from the root bank's slot
     /// history, which a restart does not lose; a slot too old for it is passed but not counted.
-    pub(super) fn advance(&mut self, root: Slot, check: impl Fn(Slot) -> Check) {
+    pub fn advance(&mut self, root: Slot, check: impl Fn(Slot) -> Check) {
         while let Some(slot) = self.leader_slots.get(self.next_index).copied() {
             if slot > root {
                 break;
@@ -63,7 +63,7 @@ impl SkipRateWalk {
         }
     }
 
-    pub(super) fn counts(&self) -> Option<LeaderSlotCounts> {
+    pub fn counts(&self) -> Option<LeaderSlotCounts> {
         let (epoch, _) = self.epoch?;
         Some(LeaderSlotCounts {
             epoch,
@@ -74,7 +74,7 @@ impl SkipRateWalk {
         })
     }
 
-    pub(super) fn rate(&self) -> Option<f64> {
+    pub fn rate(&self) -> Option<f64> {
         let elapsed = self.produced.saturating_add(self.skipped);
         (elapsed > 0).then(|| self.skipped as f64 / elapsed as f64)
     }

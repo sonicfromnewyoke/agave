@@ -294,11 +294,12 @@ function TheirsSide({
   const [filter, setFilter] = useState<WriterKind | null>(null);
   const [hint, setHint] = useState<string | null>(null);
   // Unknown until the peer list is in, so nobody is called gone from gossip before it is read.
+  // The list says who is in the table, not when each was heard: one in it reads as heard now.
   const heard = useMemo(() => {
     if (!peers) return () => undefined;
     const at = Date.now();
-    const byIdentity = new Map(peers.identity.map((identity, index) => [identity, at - (peers.heard_ago[index] ?? 0)]));
-    return (identity: string) => byIdentity.get(identity) ?? null;
+    const listed = new Set(peers.identity);
+    return (identity: string) => (listed.has(identity) ? at : null);
   }, [peers]);
   const figures = useMemo(() => (list ? writerFigures(list, heard, Date.now()) : []), [list, heard]);
   const average = list ? averageLeftOut(list) : null;

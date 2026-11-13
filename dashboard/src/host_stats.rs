@@ -4,11 +4,25 @@
 
 use {
     serde::Serialize,
-    std::{collections::BTreeMap, io, path::Path},
+    std::{
+        collections::{BTreeMap, HashMap},
+        io,
+        os::unix::fs::MetadataExt,
+        path::Path,
+    },
 };
 
 /// Always 512, whatever the device's own sector size.
 const SECTOR_BYTES: u64 = 512;
+
+/// Each field's growth since `$before`; `None` where any went backwards.
+macro_rules! checked_since {
+    ($now:expr, $before:expr; $($field:ident)+) => {
+        Some(Self {
+            $($field: $now.$field.checked_sub($before.$field)?,)+
+        })
+    };
+}
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct LoadAverage {
@@ -24,8 +38,10 @@ pub struct Memory {
     pub total: u64,
     /// Not free: it includes most of the page cache.
     pub available: u64,
+    /// What the kernel could take back beyond the free memory: `available - free`, so what is
+    /// spoken for, `total - free - reclaimable`, is `total - available` as agave reports it. Page
+    /// cache that holds tmpfs files, accounts on a RAM disk among them, is not reclaimable.
     pub reclaimable: u64,
-    /// What is spoken for is `total - free - reclaimable`.
     pub free: u64,
     pub swap_total: u64,
     pub swap_free: u64,
@@ -56,16 +72,7 @@ pub struct CpuUse {
 
 impl CpuCounters {
     pub fn since(&self, previous: &Self) -> Option<Self> {
-        Some(Self {
-            user: self.user.checked_sub(previous.user)?,
-            nice: self.nice.checked_sub(previous.nice)?,
-            system: self.system.checked_sub(previous.system)?,
-            idle: self.idle.checked_sub(previous.idle)?,
-            iowait: self.iowait.checked_sub(previous.iowait)?,
-            irq: self.irq.checked_sub(previous.irq)?,
-            softirq: self.softirq.checked_sub(previous.softirq)?,
-            steal: self.steal.checked_sub(previous.steal)?,
-        })
+        checked_since!(self, previous; user nice system idle iowait irq softirq steal)
     }
 
     /// `None` where no time passed, since nought of nothing is not idle.
@@ -115,15 +122,8 @@ pub struct DiskCounters {
 impl DiskCounters {
     /// `None` if a counter went backwards, as when a device is re-added.
     pub fn since(&self, previous: &Self) -> Option<Self> {
-        Some(Self {
-            reads: self.reads.checked_sub(previous.reads)?,
-            read_sectors: self.read_sectors.checked_sub(previous.read_sectors)?,
-            read_ms: self.read_ms.checked_sub(previous.read_ms)?,
-            writes: self.writes.checked_sub(previous.writes)?,
-            write_sectors: self.write_sectors.checked_sub(previous.write_sectors)?,
-            write_ms: self.write_ms.checked_sub(previous.write_ms)?,
-            busy_ms: self.busy_ms.checked_sub(previous.busy_ms)?,
-        })
+        checked_since!(self, previous;
+            reads read_sectors read_ms writes write_sectors write_ms busy_ms)
     }
 
     pub fn read_bytes(&self) -> u64 {
@@ -157,7 +157,7 @@ impl DiskCounters {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct Filesystem {
     pub total: u64,
     /// Root's reserve is deliberately not counted.
@@ -174,7 +174,6 @@ pub struct HostSnapshot {
     pub disks: BTreeMap<String, DiskCounters>,
 }
 
-#[cfg(target_os = "linux")]
 pub fn read() -> io::Result<HostSnapshot> {
     let load = parse_load(&std::fs::read_to_string("/proc/loadavg")?)
         .ok_or_else(|| invalid("unrecognised /proc/loadavg"))?;
@@ -192,26 +191,14 @@ pub fn read() -> io::Result<HostSnapshot> {
     })
 }
 
-#[cfg(not(target_os = "linux"))]
-pub fn read() -> io::Result<HostSnapshot> {
-    Err(io::ErrorKind::Unsupported.into())
-}
-
 /// The first core's frequency governor; `None` where the kernel exposes no cpufreq, as on most
 /// virtual machines.
-#[cfg(target_os = "linux")]
 pub fn cpu_governor() -> Option<String> {
     let governor =
         std::fs::read_to_string("/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor").ok()?;
     Some(governor.trim().to_string()).filter(|governor| !governor.is_empty())
 }
 
-#[cfg(not(target_os = "linux"))]
-pub fn cpu_governor() -> Option<String> {
-    None
-}
-
-#[cfg(target_os = "linux")]
 pub fn filesystem(path: &Path) -> io::Result<Filesystem> {
     let stat = nix::sys::statvfs::statvfs(path)?;
     // `fragment_size` rather than `block_size`: the block counts are in fragments, and on
@@ -225,11 +212,6 @@ pub fn filesystem(path: &Path) -> io::Result<Filesystem> {
             .saturating_sub(available)
             .saturating_mul(block),
     })
-}
-
-#[cfg(not(target_os = "linux"))]
-pub fn filesystem(_path: &Path) -> io::Result<Filesystem> {
-    Err(io::ErrorKind::Unsupported.into())
 }
 
 /// The process's resident memory, and how much of it is heap, mapped files and shared memory.
@@ -248,25 +230,28 @@ pub struct ResidentKinds {
     pub shared: u64,
 }
 
-#[cfg(target_os = "linux")]
-pub fn process_memory() -> io::Result<ProcessMemory> {
-    let status = std::fs::read_to_string("/proc/self/status")?;
+/// The resident memory of the process `pid`.
+pub fn process_memory_of(pid: u32) -> io::Result<ProcessMemory> {
+    let status = std::fs::read_to_string(format!("/proc/{pid}/status"))?;
     parse_process_memory(&status).ok_or_else(|| invalid("status has no VmRSS line"))
 }
 
-#[cfg(not(target_os = "linux"))]
-pub fn process_memory() -> io::Result<ProcessMemory> {
-    Err(io::ErrorKind::Unsupported.into())
+/// The `Key:  1234 kB` lines of a `/proc` file, in bytes; a line with no number is left out.
+fn kib_lines(contents: &str) -> HashMap<&str, u64> {
+    contents
+        .lines()
+        .filter_map(|line| {
+            let (key, rest) = line.split_once(':')?;
+            let kib: u64 = rest.split_whitespace().next()?.parse().ok()?;
+            Some((key, kib.saturating_mul(1024)))
+        })
+        .collect()
 }
 
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn parse_process_memory(status: &str) -> Option<ProcessMemory> {
-    let bytes = |key: &str| {
-        let line = status.lines().find_map(|line| line.strip_prefix(key))?;
-        let kib: u64 = line.split_whitespace().next()?.parse().ok()?;
-        Some(kib.saturating_mul(1024))
-    };
-    let kinds = match (bytes("RssAnon:"), bytes("RssFile:"), bytes("RssShmem:")) {
+    let lines = kib_lines(status);
+    let bytes = |key: &str| lines.get(key).copied();
+    let kinds = match (bytes("RssAnon"), bytes("RssFile"), bytes("RssShmem")) {
         (Some(anonymous), Some(file), Some(shared)) => Some(ResidentKinds {
             anonymous,
             file,
@@ -275,21 +260,14 @@ fn parse_process_memory(status: &str) -> Option<ProcessMemory> {
         _ => None,
     };
     Some(ProcessMemory {
-        resident: bytes("VmRSS:")?,
+        resident: bytes("VmRSS")?,
         kinds,
     })
 }
 
 /// Four accounts directories under one mount are one filesystem, not four.
-#[cfg(target_os = "linux")]
 pub fn filesystem_id(path: &Path) -> io::Result<u64> {
-    use std::os::linux::fs::MetadataExt;
-    Ok(std::fs::metadata(path)?.st_dev())
-}
-
-#[cfg(not(target_os = "linux"))]
-pub fn filesystem_id(_path: &Path) -> io::Result<u64> {
-    Err(io::ErrorKind::Unsupported.into())
+    Ok(std::fs::metadata(path)?.dev())
 }
 
 /// A partition is folded up to its disk, since they share a queue.
@@ -324,12 +302,10 @@ pub fn device_for(_path: &Path) -> io::Result<Option<String>> {
     Err(io::ErrorKind::Unsupported.into())
 }
 
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn invalid(message: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
 }
 
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn parse_load(contents: &str) -> Option<LoadAverage> {
     let mut fields = contents.split_whitespace();
     let one = fields.next()?.parse().ok()?;
@@ -353,7 +329,6 @@ fn parse_load(contents: &str) -> Option<LoadAverage> {
 
 /// `cpu  1234 5 678 90000 12 0 34 0 0 0`: user, nice, system, idle, then iowait, irq, softirq and
 /// steal, which older kernels leave off.
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn parse_stat(contents: &str) -> Option<CpuCounters> {
     let line = contents.lines().find(|line| line.starts_with("cpu "))?;
     let fields: Vec<u64> = line
@@ -377,49 +352,26 @@ fn parse_stat(contents: &str) -> Option<CpuCounters> {
     })
 }
 
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn parse_memory(contents: &str) -> Option<Memory> {
-    let mut memory = Memory::default();
-    let mut seen_total = false;
-    let mut buffers = 0u64;
-    let mut cached = 0u64;
-
-    for line in contents.lines() {
-        let Some((key, rest)) = line.split_once(':') else {
-            continue;
-        };
-        let Some(kibibytes) = rest
-            .split_whitespace()
-            .next()
-            .and_then(|value| value.parse::<u64>().ok())
-        else {
-            continue;
-        };
-        let bytes = kibibytes.saturating_mul(1024);
-        match key {
-            "MemTotal" => {
-                memory.total = bytes;
-                seen_total = true;
-            }
-            "MemAvailable" => memory.available = bytes,
-            "MemFree" => memory.free = bytes,
-            "Buffers" => buffers = bytes,
-            // Prefix matched exactly: `SwapCached` is a different figure and
-            // must not land here.
-            "Cached" => cached = bytes,
-            "SwapTotal" => memory.swap_total = bytes,
-            "SwapFree" => memory.swap_free = bytes,
-            _ => {}
-        }
-    }
-
-    memory.reclaimable = buffers.saturating_add(cached);
-    seen_total.then_some(memory)
+    let lines = kib_lines(contents);
+    let bytes = |key: &str| lines.get(key).copied().unwrap_or(0);
+    let free = bytes("MemFree");
+    Some(Memory {
+        total: *lines.get("MemTotal")?,
+        available: bytes("MemAvailable"),
+        // Kernels before 3.14 give no estimate: the page cache stands for it.
+        reclaimable: match lines.get("MemAvailable") {
+            Some(available) => available.saturating_sub(free),
+            None => bytes("Buffers").saturating_add(bytes("Cached")),
+        },
+        free,
+        swap_total: bytes("SwapTotal"),
+        swap_free: bytes("SwapFree"),
+    })
 }
 
 /// `259 0 nvme0n1 12345 0 987654 3210 ...`: reads, merged, sectors, milliseconds, the same four for
 /// writes, requests in flight, then milliseconds doing any I/O.
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn parse_diskstats(contents: &str) -> BTreeMap<String, DiskCounters> {
     let mut disks = BTreeMap::new();
     for line in contents.lines() {
@@ -573,12 +525,12 @@ ctxt 6789
     }
 
     #[test]
-    fn test_reads_memory_in_bytes_and_adds_the_reclaimable_parts() {
+    fn test_reads_memory_in_bytes_and_takes_the_kernels_reclaimable_estimate() {
         let memory = parse_memory(MEMINFO).unwrap();
         assert_eq!(memory.total, 402_653_184 * 1024);
         assert_eq!(memory.available, 92_274_688 * 1024);
         assert_eq!(memory.free, 25_165_824 * 1024);
-        assert_eq!(memory.reclaimable, (2_097_152 + 65_011_712) * 1024);
+        assert_eq!(memory.reclaimable, (92_274_688 - 25_165_824) * 1024);
         assert_eq!(memory.swap_total, 8_388_608 * 1024);
         assert_eq!(memory.swap_free, 8_388_608 * 1024);
     }
@@ -693,21 +645,9 @@ Threads:\t48
         let delta = current.since(&previous).unwrap();
         assert_eq!(delta.reads, 15);
         assert_eq!(delta.busy_ms, 240);
-    }
-
-    #[test]
-    fn test_discards_a_sample_where_a_counter_went_backwards() {
-        // A device removed and re-added restarts at nought, and an unsigned
-        // wrap would read as an enormous burst of work.
-        let previous = DiskCounters {
-            reads: 100,
-            ..DiskCounters::default()
-        };
-        let current = DiskCounters {
-            reads: 5,
-            ..DiskCounters::default()
-        };
-        assert!(current.since(&previous).is_none());
+        // A device removed and re-added restarts at nought, and an unsigned wrap would read as an
+        // enormous burst of work.
+        assert!(previous.since(&current).is_none());
     }
 
     #[test]

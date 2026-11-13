@@ -4,7 +4,8 @@
 
 use {
     crate::{
-        metrics_tap::{LeaderTiming, Recurrence, SlotCost, SlotWaterfall, StageTimes},
+        metrics_tap::{Bundles, LeaderTiming, Recurrence, SlotCost, SlotWaterfall, StageTimes},
+        slots::BlockDetail,
         turns::LeaderTurn,
         versions::TxVersions,
     },
@@ -16,12 +17,6 @@ use {
         net::IpAddr,
     },
 };
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-pub struct Bundles {
-    pub sanitized: u64,
-    pub executed: u64,
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct Execution {
@@ -41,20 +36,8 @@ pub struct ProducedBlock {
     pub slot_time_millis: Option<u64>,
     pub blockhash: String,
     pub duration_nanos: Option<u64>,
-
-    pub transactions: u64,
-    pub non_vote_transactions: u64,
-    pub failed_transactions: u64,
-    pub entries: u64,
-
-    pub block_cost: u64,
-    pub block_cost_limit: u64,
-    pub account_cost_limit: u64,
-
-    /// Base and priority together: `total_transaction_fee` adds the two despite its name.
-    pub total_fees: u64,
-    pub priority_fees: u64,
-    pub tips: Option<u64>,
+    #[serde(flatten)]
+    pub detail: BlockDetail,
     /// Absent on a stock validator or under BAM.
     pub bundles: Option<Bundles>,
     pub versions: Option<TxVersions>,
@@ -79,16 +62,26 @@ pub struct BlockCertificate {
     pub skip: u32,
     pub ours_in: bool,
     pub usual: Option<u32>,
-    pub left_out: Vec<CertificateValidator>,
+    pub left_out: Vec<Validator>,
 }
 
+/// A validator as a list shows it, by its name and gossip. `release` is left out of the lists
+/// that show no client.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct CertificateValidator {
+pub struct Validator {
     #[serde(serialize_with = "base58")]
     pub identity: Pubkey,
     pub name: Option<String>,
+    #[serde(flatten)]
+    pub release: Option<Release>,
     pub ip: Option<IpAddr>,
     pub country: Option<&'static str>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Release {
+    pub client: Option<String>,
+    pub version: Option<String>,
 }
 
 /// Base58 text, as `to_string` gives, written straight into the encoder.
@@ -155,12 +148,12 @@ impl From<&ProducedBlock> for BlockFigures {
         Self(
             block.slot,
             block.slot_time_millis,
-            block.transactions,
-            block.block_cost,
-            block.block_cost_limit,
-            block.total_fees,
-            block.priority_fees,
-            block.tips,
+            block.detail.transactions,
+            block.detail.block_cost,
+            block.detail.block_cost_limit,
+            block.detail.total_fees,
+            block.detail.priority_fees,
+            block.detail.tips,
             block.duration_nanos,
         )
     }
@@ -284,11 +277,10 @@ impl ProducedStore {
             return false;
         }
         self.changed.insert(block.slot);
-        self.blocks.insert(block.slot, block);
-        while self.blocks.len() > MAX_HELD_BLOCKS {
-            if let Some((slot, _)) = self.blocks.pop_first() {
-                self.fees.remove(&slot);
-            }
+        crate::metrics_tap::insert_capped(&mut self.blocks, block.slot, block, MAX_HELD_BLOCKS);
+        // Fees are held only beside a held block.
+        if let Some(oldest) = self.blocks.keys().next() {
+            self.fees = self.fees.split_off(oldest);
         }
         true
     }
@@ -394,6 +386,24 @@ impl ProducedStore {
             .collect()
     }
 
+    pub fn without_versions(&self) -> Vec<Slot> {
+        self.blocks
+            .values()
+            .filter(|block| block.versions.is_none())
+            .map(|block| block.slot)
+            .collect()
+    }
+
+    /// A held block's tips, measured again.
+    pub fn set_tips(&mut self, slot: Slot, tips: u64) {
+        if let Some(block) = self.blocks.get_mut(&slot)
+            && block.detail.tips != Some(tips)
+        {
+            block.detail.tips = Some(tips);
+            self.changed.insert(slot);
+        }
+    }
+
     pub fn set_versions(&mut self, slot: Slot, versions: TxVersions) -> bool {
         self.set_once(slot, versions, |block| &mut block.versions)
     }
@@ -425,6 +435,11 @@ impl ProducedStore {
     /// How many of `first..=last` produced a block.
     pub fn produced_in(&self, first: Slot, last: Slot) -> u64 {
         self.blocks.range(first..=last).count() as u64
+    }
+
+    /// The slots of `first..=last` held with a block, in order.
+    pub fn slots_in(&self, first: Slot, last: Slot) -> impl Iterator<Item = Slot> + '_ {
+        self.blocks.range(first..=last).map(|(slot, _)| *slot)
     }
 
     pub fn add_turn(&mut self, turn: LeaderTurn) {
@@ -506,16 +521,7 @@ pub(crate) fn sample_block(slot: Slot) -> ProducedBlock {
         slot_time_millis: None,
         blockhash: format!("hash{slot}"),
         duration_nanos: None,
-        transactions: 0,
-        non_vote_transactions: 0,
-        failed_transactions: 0,
-        entries: 0,
-        block_cost: 0,
-        block_cost_limit: 0,
-        account_cost_limit: 0,
-        total_fees: 0,
-        priority_fees: 0,
-        tips: None,
+        detail: BlockDetail::default(),
         bundles: None,
         versions: None,
         execution: None,
@@ -534,10 +540,6 @@ mod tests {
         },
         std::net::{Ipv4Addr, Ipv6Addr},
     };
-
-    fn block(slot: Slot) -> ProducedBlock {
-        sample_block(slot)
-    }
 
     fn certificate(rewards: Slot) -> BlockCertificate {
         BlockCertificate {
@@ -587,15 +589,15 @@ mod tests {
         }
     }
 
-    fn slots(blocks: &[ProducedBlock]) -> Vec<Slot> {
-        blocks.iter().map(|block| block.slot).collect()
+    fn slots<'a>(blocks: impl IntoIterator<Item = &'a ProducedBlock>) -> Vec<Slot> {
+        blocks.into_iter().map(|block| block.slot).collect()
     }
 
     #[test]
     fn test_each_block_added_or_filled_in_is_taken_once() {
         let mut ring = ProducedStore::default();
-        ring.insert(block(11));
-        ring.insert(block(10));
+        ring.insert(sample_block(11));
+        ring.insert(sample_block(10));
         assert_eq!(slots(&ring.take_changed()), [10, 11]);
         assert!(ring.take_changed().is_empty());
 
@@ -607,19 +609,30 @@ mod tests {
     }
 
     #[test]
-    fn test_a_certificate_is_recorded_once() {
+    fn test_versions_a_certificate_and_execution_are_set_once_and_only_on_a_held_block() {
         let mut ring = ProducedStore::default();
-        ring.insert(block(10));
-        assert!(ring.set_certificate(10, certificate(2)));
-        assert!(!ring.set_certificate(10, certificate(2)));
+        ring.insert(sample_block(10));
+        let tally = TxVersions {
+            legacy: 312,
+            v0: 41,
+            v1: 0,
+        };
+        assert!(!ring.set_versions(11, tally), "not a block we hold");
         assert!(!ring.set_certificate(11, certificate(3)));
-        assert_eq!(
-            ring.recent_refs(usize::MAX)[0]
-                .certificate
-                .as_ref()
-                .map(|c| c.rewards),
-            Some(2)
+        assert!(!ring.set_execution(11, execution()), "not a block we hold");
+        assert!(ring.set_versions(10, tally));
+        assert!(ring.set_certificate(10, certificate(2)));
+        assert!(ring.set_execution(10, execution()));
+        assert!(
+            !ring.set_versions(10, TxVersions::default()),
+            "already read"
         );
+        assert!(!ring.set_certificate(10, certificate(2)));
+        assert!(!ring.set_execution(10, execution()), "already set");
+        let held = ring.recent_refs(usize::MAX)[0];
+        assert_eq!(held.versions, Some(tally));
+        assert_eq!(held.certificate.as_ref().map(|c| c.rewards), Some(2));
+        assert_eq!(held.execution, Some(execution()));
     }
 
     #[test]
@@ -628,21 +641,24 @@ mod tests {
         let led = BlockCertificate {
             leader: Some(leader),
             left_out: vec![
-                CertificateValidator {
+                Validator {
                     identity: missing,
                     name: Some("Lantern".to_string()),
+                    release: None,
                     ip: Some(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10))),
                     country: Some("NL"),
                 },
-                CertificateValidator {
+                Validator {
                     identity: missing,
                     name: None,
+                    release: None,
                     ip: Some(IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1))),
                     country: None,
                 },
-                CertificateValidator {
+                Validator {
                     identity: missing,
                     name: None,
+                    release: None,
                     ip: None,
                     country: None,
                 },
@@ -662,8 +678,8 @@ mod tests {
     #[test]
     fn test_bundles_are_filled_in_once_the_stage_reports() {
         let mut ring = ProducedStore::default();
-        ring.insert(block(10));
-        ring.insert(block(11));
+        ring.insert(sample_block(10));
+        ring.insert(sample_block(11));
         let landed = |slot: Slot| {
             (slot == 11).then_some(Bundles {
                 sanitized: 17,
@@ -685,7 +701,7 @@ mod tests {
     #[test]
     fn test_a_blocks_leader_timing_is_replaced_as_its_parts_land() {
         let mut ring = ProducedStore::default();
-        ring.insert(block(10));
+        ring.insert(sample_block(10));
         let part = LeaderTiming {
             open_millis: Some(400),
             ..LeaderTiming::default()
@@ -727,8 +743,8 @@ mod tests {
             }],
         };
         let mut ring = ProducedStore::default();
-        ring.insert(block(10));
-        ring.insert(block(20));
+        ring.insert(sample_block(10));
+        ring.insert(sample_block(20));
         ring.set_fees(fees(10));
         ring.set_fees(fees(20));
         ring.set_fees(fees(30));
@@ -746,41 +762,11 @@ mod tests {
     }
 
     #[test]
-    fn test_versions_are_set_once_and_only_on_a_held_block() {
-        let mut ring = ProducedStore::default();
-        ring.insert(block(10));
-        let tally = TxVersions {
-            legacy: 312,
-            v0: 41,
-            v1: 0,
-        };
-        assert!(!ring.set_versions(11, tally), "not a block we hold");
-        assert!(ring.set_versions(10, tally));
-        assert_eq!(ring.recent_refs(usize::MAX)[0].versions, Some(tally));
-        assert!(
-            !ring.set_versions(10, TxVersions::default()),
-            "already read"
-        );
-        assert_eq!(ring.recent_refs(usize::MAX)[0].versions, Some(tally));
-    }
-
-    #[test]
-    fn test_execution_is_set_once_and_only_on_a_held_block() {
-        let mut ring = ProducedStore::default();
-        ring.insert(block(10));
-        let execution = execution();
-        assert!(!ring.set_execution(11, execution), "not a block we hold");
-        assert!(ring.set_execution(10, execution));
-        assert_eq!(ring.recent_refs(usize::MAX)[0].execution, Some(execution));
-        assert!(!ring.set_execution(10, execution), "already set");
-    }
-
-    #[test]
     fn test_slot_is_recorded_once() {
         let mut ring = ProducedStore::default();
-        assert!(ring.insert(block(10)));
+        assert!(ring.insert(sample_block(10)));
         // Only the first sighting of a frozen bank holds the block's own figures.
-        assert!(!ring.insert(block(10)));
+        assert!(!ring.insert(sample_block(10)));
         assert_eq!(ring.recent_refs(usize::MAX).len(), 1);
     }
 
@@ -788,14 +774,9 @@ mod tests {
     fn test_blocks_are_held_oldest_first_however_they_arrive() {
         let mut ring = ProducedStore::default();
         for slot in [12, 10, 13, 11] {
-            ring.insert(block(slot));
+            ring.insert(sample_block(slot));
         }
-        let slots: Vec<Slot> = ring
-            .recent_refs(usize::MAX)
-            .iter()
-            .map(|block| block.slot)
-            .collect();
-        assert_eq!(slots, vec![10, 11, 12, 13]);
+        assert_eq!(slots(ring.recent_refs(usize::MAX)), vec![10, 11, 12, 13]);
     }
 
     #[test]
@@ -813,7 +794,7 @@ mod tests {
     fn test_a_block_that_did_not_root_is_dropped_and_its_turn_recounted() {
         let mut store = ProducedStore::default();
         for slot in 100..104 {
-            assert!(store.insert(block(slot)));
+            assert!(store.insert(sample_block(slot)));
         }
         store.set_fees(BlockFees {
             slot: 102,
@@ -837,24 +818,20 @@ mod tests {
     fn test_a_floor_drops_older_blocks_and_turns_and_refuses_them() {
         let mut ring = ProducedStore::default();
         for slot in [8, 9, 12, 13] {
-            ring.insert(block(slot));
+            ring.insert(sample_block(slot));
         }
         ring.add_turn(turn(8, 9));
         ring.add_turn(turn(12, 13));
         ring.take_changed();
         ring.set_versions(9, TxVersions::default());
         ring.hold_from(12);
-        let held = ring.recent_refs(usize::MAX);
-        assert_eq!(
-            held.iter().map(|block| block.slot).collect::<Vec<_>>(),
-            [12, 13]
-        );
+        assert_eq!(slots(ring.recent_refs(usize::MAX)), [12, 13]);
         assert!(
             ring.take_changed().is_empty(),
             "the change to 9 went with it"
         );
         assert_eq!(ring.recent_turns(8).len(), 1);
-        assert!(!ring.insert(block(10)), "below the floor");
+        assert!(!ring.insert(sample_block(10)), "below the floor");
         ring.add_turn(turn(10, 11));
         assert_eq!(ring.recent_turns(8).len(), 1);
     }
@@ -864,7 +841,7 @@ mod tests {
         let mut ring = ProducedStore::default();
         let count = FIGURES_PAGE as u64 + 3;
         for slot in 0..count {
-            ring.insert(block(slot));
+            ring.insert(sample_block(slot));
         }
         ring.add_turn(turn(0, 3));
         ring.add_turn(turn(count - 4, count - 1));
@@ -894,7 +871,7 @@ mod tests {
     fn test_a_full_last_page_has_no_next() {
         let mut ring = ProducedStore::default();
         for slot in 0..FIGURES_PAGE as u64 {
-            ring.insert(block(slot));
+            ring.insert(sample_block(slot));
         }
         assert_eq!(ring.figures(None).next, None);
     }
@@ -903,7 +880,7 @@ mod tests {
     fn test_detail_is_clamped_and_carries_the_turns_it_touches() {
         let mut ring = ProducedStore::default();
         for slot in 0..200 {
-            ring.insert(block(slot));
+            ring.insert(sample_block(slot));
         }
         ring.add_turn(turn(4, 7));
         ring.add_turn(turn(8, 11));
@@ -917,7 +894,7 @@ mod tests {
     fn test_bundles_reach_only_the_newest_blocks() {
         let mut ring = ProducedStore::default();
         for slot in 0..(BUNDLE_REACH as u64 + 1) {
-            ring.insert(block(slot));
+            ring.insert(sample_block(slot));
         }
         let landed = |_slot: Slot| {
             Some(Bundles {

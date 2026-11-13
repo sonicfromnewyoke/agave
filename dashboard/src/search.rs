@@ -19,6 +19,7 @@ use {
     solana_leader_schedule::NUM_CONSECUTIVE_LEADER_SLOTS,
     solana_pubkey::Pubkey,
     std::{
+        cmp::Reverse,
         collections::{BTreeSet, HashMap, HashSet},
         fmt::Write,
         str::FromStr,
@@ -37,8 +38,11 @@ pub const MAX_FUTURE_TURNS: usize = 256;
 /// Longer than any name, and it bounds the cost of each comparison.
 const MAX_QUERY_CHARS: usize = 64;
 
-/// Turns read per hold of the history lock: the span a range reply reads.
+/// Turns read per hold of the history lock: the span a range reply reads, so the slot feed's
+/// writes wait no longer than they do behind a range reply.
 const TURNS_PER_LOCK: usize = 1024;
+
+const SLOTS_PER_LOCK: u64 = TURNS_PER_LOCK as u64 * SLOTS_PER_TURN;
 
 /// Fewer non-vote transactions than this is few.
 pub const FEW_TRANSACTIONS: u32 = 100;
@@ -72,7 +76,7 @@ pub enum Only {
 
 /// What gossip and the bank say of a staked node or scheduled leader, for conditions on a turn's
 /// leader. Current, not as of the turn.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct LeaderTraits {
     pub client: Option<String>,
     pub version: Option<String>,
@@ -81,8 +85,10 @@ pub struct LeaderTraits {
     /// In lamports.
     pub stake: u64,
     /// Not voting: never, or too far behind the tip.
+    #[serde(skip)]
     pub delinquent: bool,
     /// The oldest last vote among its staked vote accounts.
+    #[serde(skip)]
     pub last_vote: Option<Slot>,
 }
 
@@ -150,7 +156,7 @@ pub struct Condition {
 }
 
 /// What the page asks for: text matched as the page matches it, and whether only ours count.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 pub struct SearchParams {
     #[serde(default)]
     pub query: String,
@@ -163,25 +169,17 @@ pub struct SearchParams {
     #[serde(default)]
     pub forward: bool,
     #[serde(default)]
-    pub limit: Option<usize>,
-    #[serde(default)]
     pub only: Vec<Only>,
     /// Turns that began after this are passed over, for a jump to a time.
-    #[serde(default)]
     pub until_millis: Option<u64>,
     /// The slow cut-offs a first page answered with, so later pages keep them.
-    #[serde(default)]
     pub slow: Option<Vec<Option<u32>>>,
     #[serde(default, rename = "where")]
     pub conditions: Vec<Condition>,
     /// A range: turns outside it are passed over, and a scan stops on leaving it.
-    #[serde(default)]
     pub from_slot: Option<Slot>,
-    #[serde(default)]
     pub to_slot: Option<Slot>,
-    #[serde(default)]
     pub from_millis: Option<u64>,
-    #[serde(default)]
     pub to_millis: Option<u64>,
 }
 
@@ -387,9 +385,6 @@ fn cut_off(counts: &[u32]) -> Option<u32> {
 fn slow_cut_offs(history: &RwLock<SlotHistory>, floor: Slot, top: Slot) -> Vec<Option<u32>> {
     let places = usize::try_from(SLOTS_PER_TURN).unwrap_or(1);
     let mut counts = vec![vec![0u32; MAX_DURATION_MILLIS.saturating_add(1)]; places];
-    let span = u64::try_from(TURNS_PER_LOCK)
-        .unwrap_or(u64::MAX)
-        .saturating_mul(SLOTS_PER_TURN);
     // The last block to fill, carried across the slots so each is read once.
     let mut last: Option<(Slot, u64)> = None;
     let mut slot = floor;
@@ -397,7 +392,7 @@ fn slow_cut_offs(history: &RwLock<SlotHistory>, floor: Slot, top: Slot) -> Vec<O
         let Ok(history) = history.read() else {
             break;
         };
-        let stop = slot.saturating_add(span).min(top);
+        let stop = slot.saturating_add(SLOTS_PER_LOCK).min(top);
         for at in slot..stop {
             let Some(full) = history.get(at).and_then(full_at) else {
                 continue;
@@ -423,16 +418,19 @@ fn slow_cut_offs(history: &RwLock<SlotHistory>, floor: Slot, top: Slot) -> Vec<O
     counts.iter().map(|counted| cut_off(counted)).collect()
 }
 
-/// What a search is for: text as the page matches it, lower-cased, whether only ours count, and
-/// the filters and conditions a slot must meet.
+/// What a search or a summary is for: text as the page matches it, lower-cased, whether only ours
+/// count, and the filters and conditions a slot must meet; with the ring's length and floor.
 struct Wanted<'a> {
     needle: String,
     digits: bool,
     ours: bool,
     leaders: Vec<EpochLeaders<'a>>,
     only: &'a [Only],
-    slow: Vec<Option<u32>>,
+    /// The slow cut-offs, where slow was asked for.
+    slow: Option<Vec<Option<u32>>>,
     conditions: &'a [Condition],
+    capacity: u64,
+    floor: Slot,
 }
 
 impl Wanted<'_> {
@@ -483,9 +481,8 @@ impl Wanted<'_> {
             Only::Skipped => row.level == SlotLevel::Skipped as u8,
             Only::Slow => self
                 .slow
-                .get(place(slot))
-                .copied()
-                .flatten()
+                .as_deref()
+                .and_then(|slow| slow.get(place(slot)).copied().flatten())
                 .zip(duration_millis(history, slot))
                 .is_some_and(|(limit, millis)| millis > u64::from(limit)),
             Only::LeftOut => row.flags & REWARD_MASK == REWARD_UNPAID,
@@ -577,27 +574,29 @@ fn compared(condition: &Condition, figure: f64) -> bool {
 
 /// `is` and `is_not` against versions, each naming one whole or its start at a dot or dash.
 fn version_listed(condition: &Condition, version: Option<&str>) -> bool {
-    let Some(version) = version else {
-        return false;
-    };
-    let named = condition.values.iter().any(|listed| {
+    listed_by(condition, version, |listed, version| {
         version
-            .strip_prefix(listed.as_str())
-            .is_some_and(|rest| rest.is_empty() || rest.starts_with('.') || rest.starts_with('-'))
-    });
-    match condition.op {
-        Op::Is => named,
-        Op::IsNot => !named,
-        _ => false,
-    }
+            .strip_prefix(listed)
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with(['.', '-']))
+    })
 }
 
 /// `is` and `is_not` against a list; a value not known matches neither.
 fn listed(condition: &Condition, value: Option<&str>) -> bool {
+    listed_by(condition, value, |listed, value| listed == value)
+}
+
+/// `is` and `is_not` against a list, each entry naming the value where `names(entry, value)`; a
+/// value not known matches neither.
+fn listed_by(
+    condition: &Condition,
+    value: Option<&str>,
+    names: impl Fn(&str, &str) -> bool,
+) -> bool {
     let Some(value) = value else {
         return false;
     };
-    let named = condition.values.iter().any(|listed| listed == value);
+    let named = condition.values.iter().any(|listed| names(listed, value));
     match condition.op {
         Op::Is => named,
         Op::IsNot => !named,
@@ -707,17 +706,6 @@ fn began_millis(history: &SlotHistory, start: Slot) -> Option<u64> {
         .or_else(|| (1..=FULL_REACH).find_map(|back| clock(start.checked_sub(back)?)))
 }
 
-/// Holds the history's read lock a thousand turns at a time, so the collector's writes wait no
-/// longer than they do behind a range reply.
-/// What a search and a summary share: the matcher, the ring's length and floor, and the slow
-/// cut-offs where slow was asked for.
-struct Prepared<'a> {
-    wanted: Wanted<'a>,
-    capacity: u64,
-    floor: Slot,
-    slow: Option<Vec<Option<u32>>>,
-}
-
 /// Text as it is matched: trimmed, cut to `MAX_QUERY_CHARS`, lower case.
 fn normalize_text(text: &str) -> String {
     let cut: String = text.trim().chars().take(MAX_QUERY_CHARS).collect();
@@ -730,7 +718,7 @@ fn prepare<'a>(
     map: &LeaderMap,
     epochs: &'a [EpochInfo],
     params: &'a SearchParams,
-) -> Option<Prepared<'a>> {
+) -> Option<Wanted<'a>> {
     let needle = normalize_text(&params.query);
     let names: Vec<(bool, Vec<String>)> = params
         .conditions
@@ -767,19 +755,16 @@ fn prepare<'a>(
             slow_cut_offs(history, floor, params.before.saturating_add(capacity))
         })
     });
-    Some(Prepared {
-        wanted: Wanted {
-            digits: !needle.is_empty() && needle.bytes().all(|byte| byte.is_ascii_digit()),
-            needle,
-            ours: params.ours,
-            leaders,
-            only: &params.only,
-            slow: slow.clone().unwrap_or_default(),
-            conditions: &params.conditions,
-        },
+    Some(Wanted {
+        digits: !needle.is_empty() && needle.bytes().all(|byte| byte.is_ascii_digit()),
+        needle,
+        ours: params.ours,
+        leaders,
+        only: &params.only,
+        slow,
+        conditions: &params.conditions,
         capacity,
         floor,
-        slow,
     })
 }
 
@@ -793,27 +778,18 @@ pub fn search(
     let Ok(map) = leaders.read() else {
         return SearchReply::default();
     };
-    let Some(Prepared {
-        wanted,
-        capacity,
-        floor,
-        slow,
-    }) = prepare(history, info, &map, epochs, params)
-    else {
+    let Some(wanted) = prepare(history, info, &map, epochs, params) else {
         return SearchReply::default();
     };
     drop(map);
-    let limit = params
-        .limit
-        .unwrap_or(MAX_SEARCH_TURNS)
-        .clamp(1, MAX_SEARCH_TURNS);
     let lead = NUM_SLOTS_FOR_REWARD;
     let rows = usize::try_from(lead.saturating_add(SLOTS_PER_TURN)).unwrap_or(usize::MAX);
 
     // Passed once a turn at or before the time is reached; older turns are older still.
     let mut reached = params.until_millis.is_none() || params.forward;
     // Each turn's first slot in the order searched, as far as the ring can reach either way.
-    let ceiling = params.before.saturating_add(capacity);
+    let ceiling = params.before.saturating_add(wanted.capacity);
+    let floor = wanted.floor;
     let mut turn = params.before.checked_div(SLOTS_PER_TURN).unwrap_or(0);
     let mut next_start = || -> Option<Slot> {
         if params.forward {
@@ -853,7 +829,7 @@ pub fn search(
                 continue;
             }
             found.push(history.range(start.saturating_sub(lead), rows));
-            if found.len() >= limit {
+            if found.len() >= MAX_SEARCH_TURNS {
                 break 'scan Some(if params.forward {
                     start.saturating_add(SLOTS_PER_TURN)
                 } else {
@@ -865,40 +841,30 @@ pub fn search(
     SearchReply {
         turns: found,
         next,
-        slow,
+        slow: wanted.slow,
     }
 }
 
-/// What a turn's card shows of its leader.
+/// What a turn's card shows of its leader; whether it votes goes with the summary.
 #[derive(Debug, Default, PartialEq, Eq, Serialize)]
 pub struct LeaderRow {
     pub identity: String,
-    pub client: Option<String>,
-    pub version: Option<String>,
-    pub ip: Option<String>,
-    pub country: Option<&'static str>,
-    pub stake: u64,
-}
-
-impl LeaderRow {
-    fn new(identity: String, traits: Option<&LeaderTraits>) -> Self {
-        Self {
-            identity,
-            client: traits.and_then(|traits| traits.client.clone()),
-            version: traits.and_then(|traits| traits.version.clone()),
-            ip: traits.and_then(|traits| traits.ip.clone()),
-            country: traits.and_then(|traits| traits.country),
-            stake: traits.map_or(0, |traits| traits.stake),
-        }
-    }
+    #[serde(flatten)]
+    pub traits: LeaderTraits,
 }
 
 /// Every staked node and scheduled leader in gossip. The peer table holds only those near the tip.
+/// By identity, so the reply does not change with the map's order.
 pub fn leader_rows(leaders: &LeaderMap) -> Vec<LeaderRow> {
-    leaders
+    let mut rows: Vec<LeaderRow> = leaders
         .iter()
-        .map(|(identity, traits)| LeaderRow::new(identity.to_string(), Some(traits)))
-        .collect()
+        .map(|(identity, traits)| LeaderRow {
+            identity: identity.to_string(),
+            traits: traits.clone(),
+        })
+        .collect();
+    rows.sort_by(|a, b| a.identity.cmp(&b.identity));
+    rows
 }
 
 /// A page of the turns to come that match, oldest first.
@@ -937,14 +903,10 @@ pub fn future(
     let Ok(map) = leaders.read() else {
         return FutureReply::default();
     };
-    let Some(Prepared { wanted, .. }) = prepare(history, info, &map, epochs, params) else {
+    let Some(wanted) = prepare(history, info, &map, epochs, params) else {
         return FutureReply::default();
     };
     drop(map);
-    let limit = params
-        .limit
-        .unwrap_or(MAX_FUTURE_TURNS)
-        .clamp(1, MAX_FUTURE_TURNS);
     let last = epochs.iter().map(|epoch| epoch.end_slot).max().unwrap_or(0);
     let last = params.to_slot.map_or(last, |to| to.min(last));
 
@@ -994,12 +956,15 @@ pub fn future(
                 .iter()
                 .all(|condition| leader_holds(condition, leader) == Some(true));
         if matches {
-            if reply.turns.len() < limit {
+            if reply.turns.len() < MAX_FUTURE_TURNS {
                 reply.turns.push(turn);
                 let key = leader.and_then(|leader| leader.key);
                 if let Some(key) = key.filter(|key| seen.insert(*key)) {
                     let traits = leader.and_then(|leader| leader.traits);
-                    reply.leaders.push(LeaderRow::new(key.to_string(), traits));
+                    reply.leaders.push(LeaderRow {
+                        identity: key.to_string(),
+                        traits: traits.cloned().unwrap_or_default(),
+                    });
                 }
             } else {
                 reply.next.get_or_insert(start);
@@ -1010,8 +975,8 @@ pub fn future(
     }
 }
 
-/// A mean built a slot at a time.
-#[derive(Debug, Default, Clone, Copy)]
+/// A mean built a slot at a time, sent as the mean, or null with nothing added.
+#[derive(Debug, Default, Clone, Copy, PartialEq)]
 struct Mean {
     sum: f64,
     count: u64,
@@ -1030,15 +995,25 @@ impl Mean {
     }
 }
 
-#[derive(Debug, Default, Clone)]
-struct Sums {
+impl Serialize for Mean {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.get().serialize(serializer)
+    }
+}
+
+/// The matching slots summed up; means are per slot, over the slots that have the figure, fees in
+/// lamports and tips before jito's cut.
+#[derive(Debug, Default, Clone, PartialEq, Serialize)]
+pub struct Sums {
     slots: u64,
     skipped: u64,
     transactions: u64,
-    duration: Mean,
-    first_slot: Mean,
-    rest_of_turn: Mean,
-    replay: Mean,
+    duration_ms: Mean,
+    /// Duration of the first slot of each turn.
+    first_slot_ms: Mean,
+    /// Duration of each turn's other slots.
+    rest_of_turn_ms: Mean,
+    replay_ms: Mean,
     base_fee: Mean,
     priority_fee: Mean,
     tips: Mean,
@@ -1056,15 +1031,15 @@ impl Sums {
             self.transactions = self.transactions.saturating_add(u64::from(row.non_votes));
         }
         let duration = duration_millis(history, slot);
-        self.duration.add(duration);
+        self.duration_ms.add(duration);
         if place(slot) == 0 {
-            self.first_slot.add(duration);
+            self.first_slot_ms.add(duration);
         } else {
-            self.rest_of_turn.add(duration);
+            self.rest_of_turn_ms.add(duration);
         }
         // A span from catching up measures the backlog, not replay.
-        self.replay
-            .add(replay_millis(row).filter(|_| slot >= history.live_from()));
+        self.replay_ms
+            .add(replay_millis(row).filter(|_| slot >= history.live_from));
         self.base_fee
             .add(block.then(|| row.fees.saturating_sub(row.priority_fees)));
         self.priority_fee.add(block.then_some(row.priority_fees));
@@ -1072,41 +1047,6 @@ impl Sums {
             .add((row.flags & HAS_TIPS != 0).then_some(row.tips));
         self.compute.add(block.then_some(u64::from(row.compute)));
     }
-
-    fn figures(&self) -> Figures {
-        Figures {
-            slots: self.slots,
-            skipped: self.skipped,
-            transactions: self.transactions,
-            duration_ms: self.duration.get(),
-            first_slot_ms: self.first_slot.get(),
-            rest_of_turn_ms: self.rest_of_turn.get(),
-            replay_ms: self.replay.get(),
-            base_fee: self.base_fee.get(),
-            priority_fee: self.priority_fee.get(),
-            tips: self.tips.get(),
-            compute: self.compute.get(),
-        }
-    }
-}
-
-/// The matching slots summed up; means are per slot, over the slots that have the figure, fees in
-/// lamports and tips before jito's cut.
-#[derive(Debug, Default, Clone, PartialEq, Serialize)]
-pub struct Figures {
-    pub slots: u64,
-    pub skipped: u64,
-    pub transactions: u64,
-    pub duration_ms: Option<f64>,
-    /// Duration of the first slot of each turn.
-    pub first_slot_ms: Option<f64>,
-    /// Duration of each turn's other slots.
-    pub rest_of_turn_ms: Option<f64>,
-    pub replay_ms: Option<f64>,
-    pub base_fee: Option<f64>,
-    pub priority_fee: Option<f64>,
-    pub tips: Option<f64>,
-    pub compute: Option<f64>,
 }
 
 /// One client's share of the matches; `None` for leaders gossip gives no client for.
@@ -1116,7 +1056,7 @@ pub struct ClientFigures {
     /// The leaders these slots came from.
     pub validators: usize,
     #[serde(flatten)]
-    pub figures: Figures,
+    pub figures: Sums,
 }
 
 /// One country's share of the matches; `None` for leaders with no country known.
@@ -1126,7 +1066,7 @@ pub struct CountryFigures {
     /// The leaders these slots came from.
     pub validators: usize,
     #[serde(flatten)]
-    pub figures: Figures,
+    pub figures: Sums,
 }
 
 /// The matching slots of one client or country.
@@ -1134,6 +1074,22 @@ pub struct CountryFigures {
 struct Group<'a> {
     sums: Sums,
     leaders: HashSet<&'a str>,
+}
+
+/// The groups with a matching slot, most slots first, each made a row of.
+fn ranked<K: Ord, R>(
+    groups: HashMap<Option<K>, Group>,
+    row: impl Fn(Option<K>, usize, Sums) -> R,
+) -> Vec<R> {
+    let mut groups: Vec<_> = groups
+        .into_iter()
+        .filter(|(_, group)| group.sums.slots > 0)
+        .collect();
+    groups.sort_by(|(a, x), (b, y)| y.sums.slots.cmp(&x.sums.slots).then_with(|| a.cmp(b)));
+    groups
+        .into_iter()
+        .map(|(key, group)| row(key, group.leaders.len(), group.sums))
+        .collect()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -1153,17 +1109,17 @@ pub struct DelinquentLeader {
 /// scheduled leaders.
 #[derive(Debug, Default, Clone, PartialEq, Eq, Serialize)]
 pub struct Choices {
-    pub clients: Vec<String>,
-    pub countries: Vec<&'static str>,
+    pub clients: BTreeSet<String>,
+    pub countries: BTreeSet<&'static str>,
     /// Highest first.
-    pub versions: Vec<String>,
+    pub versions: BTreeSet<Reverse<String>>,
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Serialize)]
 pub struct SummaryReply {
     /// Turns with a slot that matched.
     pub turns: u64,
-    pub figures: Figures,
+    pub figures: Sums,
     /// Most slots first.
     pub clients: Vec<ClientFigures>,
     /// Most slots first.
@@ -1178,13 +1134,10 @@ pub struct SummaryReply {
 
 /// The oldest held slot between `floor` and `top`.
 fn held_from(history: &RwLock<SlotHistory>, floor: Slot, top: Slot) -> Option<HeldFrom> {
-    let span = u64::try_from(TURNS_PER_LOCK)
-        .unwrap_or(u64::MAX)
-        .saturating_mul(SLOTS_PER_TURN);
     let mut slot = floor;
     while slot < top {
         let history = history.read().ok()?;
-        let stop = slot.saturating_add(span).min(top);
+        let stop = slot.saturating_add(SLOTS_PER_LOCK).min(top);
         if let Some((held, row)) = (slot..stop).find_map(|at| history.get(at).map(|row| (at, *row)))
         {
             return Some(HeldFrom {
@@ -1230,22 +1183,16 @@ pub fn summarize(
     let Ok(map) = leaders.read() else {
         return SummaryReply::default();
     };
-    let choices = {
-        let clients: BTreeSet<&str> = map
+    let choices = Choices {
+        clients: map
             .values()
-            .filter_map(|traits| traits.client.as_deref())
-            .collect();
-        let countries: BTreeSet<&'static str> =
-            map.values().filter_map(|traits| traits.country).collect();
-        let versions: BTreeSet<&str> = map
+            .filter_map(|traits| traits.client.clone())
+            .collect(),
+        countries: map.values().filter_map(|traits| traits.country).collect(),
+        versions: map
             .values()
-            .filter_map(|traits| traits.version.as_deref())
-            .collect();
-        Choices {
-            clients: clients.into_iter().map(str::to_string).collect(),
-            countries: countries.into_iter().collect(),
-            versions: versions.into_iter().rev().map(str::to_string).collect(),
-        }
+            .filter_map(|traits| traits.version.clone().map(Reverse))
+            .collect(),
     };
     let mut delinquent: Vec<DelinquentLeader> = map
         .iter()
@@ -1256,18 +1203,12 @@ pub fn summarize(
         })
         .collect();
     delinquent.sort_by(|a, b| a.identity.cmp(&b.identity));
-    let Some(Prepared {
-        wanted,
-        capacity: _,
-        floor,
-        slow,
-    }) = prepare(history, info, &map, epochs, params)
-    else {
+    let Some(wanted) = prepare(history, info, &map, epochs, params) else {
         return SummaryReply::default();
     };
     drop(map);
 
-    let stop_at = summary_floor(params, epochs, floor);
+    let stop_at = summary_floor(params, epochs, wanted.floor);
     let mut overall = Sums::default();
     let mut by_client: HashMap<Option<&str>, Group> = HashMap::new();
     let mut by_country: HashMap<Option<&'static str>, Group> = HashMap::new();
@@ -1330,44 +1271,22 @@ pub fn summarize(
         }
     }
 
-    let mut clients: Vec<ClientFigures> = by_client
-        .into_iter()
-        .filter(|(_, group)| group.sums.slots > 0)
-        .map(|(client, group)| ClientFigures {
-            client: client.map(str::to_string),
-            validators: group.leaders.len(),
-            figures: group.sums.figures(),
-        })
-        .collect();
-    clients.sort_by(|a, b| {
-        b.figures
-            .slots
-            .cmp(&a.figures.slots)
-            .then_with(|| a.client.cmp(&b.client))
-    });
-    let mut countries: Vec<CountryFigures> = by_country
-        .into_iter()
-        .filter(|(_, group)| group.sums.slots > 0)
-        .map(|(country, group)| CountryFigures {
-            country,
-            validators: group.leaders.len(),
-            figures: group.sums.figures(),
-        })
-        .collect();
-    countries.sort_by(|a, b| {
-        b.figures
-            .slots
-            .cmp(&a.figures.slots)
-            .then_with(|| a.country.cmp(&b.country))
-    });
     SummaryReply {
         turns,
-        figures: overall.figures(),
-        clients,
-        countries,
-        held_from: held_from(history, floor, params.before),
+        figures: overall,
+        clients: ranked(by_client, |client, validators, figures| ClientFigures {
+            client: client.map(str::to_string),
+            validators,
+            figures,
+        }),
+        countries: ranked(by_country, |country, validators, figures| CountryFigures {
+            country,
+            validators,
+            figures,
+        }),
+        held_from: held_from(history, wanted.floor, params.before),
         choices,
-        slow,
+        slow: wanted.slow,
         delinquent,
     }
 }
@@ -1382,7 +1301,7 @@ mod tests {
     const START: Slot = 1_000;
 
     /// An epoch from `START` whose turns cycle through `leaders`, with ours the first.
-    fn epoch(leaders: &[&str]) -> EpochInfo {
+    fn epoch(leaders: &[impl ToString]) -> EpochInfo {
         let turns: Vec<u16> = (0..1_000u16)
             .map(|turn| turn.checked_rem(leaders.len() as u16).unwrap_or(0))
             .collect();
@@ -1399,84 +1318,121 @@ mod tests {
         }
     }
 
-    fn history(from: Slot, to: Slot) -> RwLock<SlotHistory> {
+    fn history(from: Slot, to: Slot) -> SlotHistory {
         let mut history = SlotHistory::new(4_096);
         for slot in from..=to {
             history.record_time(slot, slot);
         }
-        RwLock::new(history)
+        history
     }
 
     fn named(key: &Pubkey, name: &str) -> RwLock<ValidatorInfoCache> {
         let mut info = ValidatorInfoCache::default();
-        info.insert(
-            *key,
-            0,
-            ValidatorInfo {
-                name: Some(name.into()),
-                icon_url: None,
-            },
+        info.replace(
+            [(
+                *key,
+                ValidatorInfo {
+                    name: Some(name.into()),
+                    icon_url: None,
+                },
+            )]
+            .into(),
         );
         RwLock::new(info)
     }
 
-    fn params(query: &str, ours: bool, before: Slot, limit: Option<usize>) -> SearchParams {
+    fn params(query: &str, ours: bool, before: Slot) -> SearchParams {
         SearchParams {
             query: query.into(),
             ours,
             before,
-            limit,
-            forward: false,
-            only: Vec::new(),
-            until_millis: None,
-            slow: None,
-            conditions: Vec::new(),
-            from_slot: None,
-            to_slot: None,
-            from_millis: None,
-            to_millis: None,
+            ..SearchParams::default()
         }
     }
 
-    fn condition(field: Field, op: Op, value: f64, values: &[&str]) -> Condition {
+    fn is(field: Field, op: Op, values: &[&str]) -> Condition {
         Condition {
             field,
             op,
-            value,
+            value: 0.0,
             values: values.iter().map(|value| value.to_string()).collect(),
         }
     }
 
+    fn cmp(field: Field, op: Op, value: f64) -> Condition {
+        Condition {
+            field,
+            op,
+            value,
+            values: Vec::new(),
+        }
+    }
+
+    /// What the searches read, with no names or traits unless set.
+    struct Scan {
+        history: RwLock<SlotHistory>,
+        info: RwLock<ValidatorInfoCache>,
+        map: RwLock<LeaderMap>,
+        epochs: [EpochInfo; 1],
+    }
+
+    impl Scan {
+        fn search(&self, params: SearchParams) -> SearchReply {
+            search(&self.history, &self.info, &self.map, &self.epochs, &params)
+        }
+
+        fn future(&self, params: SearchParams) -> FutureReply {
+            future(&self.history, &self.info, &self.map, &self.epochs, &params)
+        }
+
+        fn summarize(&self, params: SearchParams) -> SummaryReply {
+            summarize(&self.history, &self.info, &self.map, &self.epochs, &params)
+        }
+    }
+
+    fn scan(history: SlotHistory, leaders: &[impl ToString]) -> Scan {
+        Scan {
+            history: RwLock::new(history),
+            info: RwLock::default(),
+            map: RwLock::default(),
+            epochs: [epoch(leaders)],
+        }
+    }
+
     /// Two leaders taking turns, the first ours, with traits for the second only.
-    fn two_leaders() -> ([EpochInfo; 1], RwLock<LeaderMap>) {
+    fn two_leaders(history: SlotHistory) -> Scan {
         let (ours, other) = (Pubkey::new_unique(), Pubkey::new_unique());
-        let map = LeaderMap::from([(
-            other,
-            LeaderTraits {
-                client: Some("AgaveBam".into()),
-                version: Some("4.4.1".into()),
-                ip: Some("192.0.2.1".into()),
-                country: Some("DE"),
-                stake: 5_000,
-                delinquent: true,
-                last_vote: Some(7),
-            },
-        )]);
-        (
-            [epoch(&[&ours.to_string(), &other.to_string()])],
-            RwLock::new(map),
-        )
+        let traits = LeaderTraits {
+            client: Some("AgaveBam".into()),
+            version: Some("4.4.1".into()),
+            ip: Some("192.0.2.1".into()),
+            country: Some("DE"),
+            stake: 5_000,
+            delinquent: true,
+            last_vote: Some(7),
+        };
+        Scan {
+            map: RwLock::new(LeaderMap::from([(other, traits)])),
+            ..scan(history, &[ours, other])
+        }
     }
 
     fn only(conditions: &[Only], before: Slot) -> SearchParams {
         SearchParams {
             only: conditions.to_vec(),
-            ..params("", false, before, None)
+            ..params("", false, before)
+        }
+    }
+
+    fn where_(conditions: Vec<Condition>, before: Slot) -> SearchParams {
+        SearchParams {
+            conditions,
+            ..params("", false, before)
         }
     }
 
     /// Every slot an ordinary block with tips and our vote paid, then `fill` on each.
-    fn rows(from: Slot, to: Slot, fill: impl Fn(Slot, &mut PackedSlot)) -> RwLock<SlotHistory> {
+    fn rows(from: Slot, to: Slot, fill: impl Fn(Slot, &mut PackedSlot)) -> SlotHistory {
         let mut history = SlotHistory::new(4_096);
         for slot in from..=to {
             history.record_test_row(slot, |row| {
@@ -1487,7 +1443,7 @@ mod tests {
                 fill(slot, row);
             });
         }
-        RwLock::new(history)
+        history
     }
 
     fn starts(reply: &SearchReply) -> Vec<Slot> {
@@ -1501,14 +1457,11 @@ mod tests {
     #[test]
     fn test_a_name_matches_whatever_its_case() {
         let (ours, other) = (Pubkey::new_unique(), Pubkey::new_unique());
-        let epochs = [epoch(&[&ours.to_string(), &other.to_string()])];
-        let reply = search(
-            &history(START, START + 15),
-            &named(&other, "Hamsa Labs"),
-            &RwLock::default(),
-            &epochs,
-            &params("hamsa", false, START + 16, None),
-        );
+        let scan = Scan {
+            info: named(&other, "Hamsa Labs"),
+            ..scan(history(START, START + 15), &[ours, other])
+        };
+        let reply = scan.search(params("hamsa", false, START + 16));
         assert_eq!(starts(&reply), vec![START + 12, START + 4], "newest first");
         assert_eq!(reply.next, None);
     }
@@ -1516,90 +1469,50 @@ mod tests {
     #[test]
     fn test_a_key_and_a_slot_number_match() {
         let (ours, other) = (Pubkey::new_unique(), Pubkey::new_unique());
-        let epochs = [epoch(&[&ours.to_string(), &other.to_string()])];
+        let scan = scan(history(START, START + 15), &[ours, other]);
         let key = other.to_string().to_lowercase();
-        let by_key = search(
-            &history(START, START + 15),
-            &RwLock::default(),
-            &RwLock::default(),
-            &epochs,
-            &params(&key[..6], false, START + 16, None),
-        );
+        let by_key = scan.search(params(&key[..6], false, START + 16));
         assert_eq!(starts(&by_key), vec![START + 12, START + 4]);
-        let by_slot = search(
-            &history(START, START + 15),
-            &RwLock::default(),
-            &RwLock::default(),
-            &epochs,
-            &params("1009", false, START + 16, None),
-        );
+        let by_slot = scan.search(params("1009", false, START + 16));
         assert_eq!(starts(&by_slot), vec![START + 8]);
     }
 
     #[test]
     fn test_ours_keeps_only_our_turns() {
-        let (ours, other) = (Pubkey::new_unique(), Pubkey::new_unique());
-        let epochs = [epoch(&[&ours.to_string(), &other.to_string()])];
-        let reply = search(
-            &history(START, START + 15),
-            &RwLock::default(),
-            &RwLock::default(),
-            &epochs,
-            &params("", true, START + 16, None),
-        );
+        let scan = scan(history(START, START + 15), &["a", "b"]);
+        let reply = scan.search(params("", true, START + 16));
         assert_eq!(starts(&reply), vec![START + 8, START]);
     }
 
     #[test]
     fn test_a_turn_with_nothing_held_is_left_out() {
-        let ours = Pubkey::new_unique();
-        let epochs = [epoch(&[&ours.to_string()])];
-        let reply = search(
-            &history(START + 8, START + 11),
-            &RwLock::default(),
-            &RwLock::default(),
-            &epochs,
-            &params("", true, START + 16, None),
-        );
+        let scan = scan(history(START + 8, START + 11), &["a"]);
+        let reply = scan.search(params("", true, START + 16));
         assert_eq!(starts(&reply), vec![START + 8]);
     }
 
     #[test]
     fn test_pages_continue_where_the_last_stopped() {
-        let ours = Pubkey::new_unique();
-        let epochs = [epoch(&[&ours.to_string()])];
-        let held = history(START, START + 19);
-        let first = search(
-            &held,
-            &RwLock::default(),
-            &RwLock::default(),
-            &epochs,
-            &params("", true, START + 20, Some(3)),
-        );
-        assert_eq!(starts(&first), vec![START + 16, START + 12, START + 8]);
+        // A full page and two turns more.
+        let top = START + (MAX_SEARCH_TURNS as u64 + 2) * SLOTS_PER_TURN;
+        let scan = scan(history(START, top - 1), &["a"]);
+        let first = scan.search(params("", true, top));
+        let newest_first: Vec<Slot> = (2..MAX_SEARCH_TURNS as u64 + 2)
+            .rev()
+            .map(|turn| START + turn * SLOTS_PER_TURN)
+            .collect();
+        assert_eq!(starts(&first), newest_first);
+        assert_eq!(first.turns.len(), MAX_SEARCH_TURNS);
         assert_eq!(first.next, Some(START + 8));
-        let rest = search(
-            &held,
-            &RwLock::default(),
-            &RwLock::default(),
-            &epochs,
-            &params("", true, START + 8, Some(3)),
-        );
+        let rest = scan.search(params("", true, START + 8));
         assert_eq!(starts(&rest), vec![START + 4, START]);
         assert_eq!(rest.next, None);
     }
 
     #[test]
     fn test_each_turn_carries_the_rows_its_certificates_are_read_from() {
-        let ours = Pubkey::new_unique();
-        let epochs = [epoch(&[&ours.to_string()])];
-        let reply = search(
-            &history(START, START + 15),
-            &RwLock::default(),
-            &RwLock::default(),
-            &epochs,
-            &params("", true, START + 16, Some(1)),
-        );
+        let scan = scan(history(START, START + 15), &["a"]);
+        let reply = scan.search(params("", true, START + 16));
         let turn = &reply.turns[0];
         assert_eq!(turn.first_slot, START + 4);
         assert_eq!(turn.rows.len(), 12);
@@ -1608,13 +1521,8 @@ mod tests {
 
     #[test]
     fn test_a_search_for_nothing_lists_every_turn_for_a_jump() {
-        let reply = search(
-            &history(START, START + 15),
-            &RwLock::default(),
-            &RwLock::default(),
-            &[epoch(&["a"])],
-            &params("  ", false, START + 12, None),
-        );
+        let scan = scan(history(START, START + 15), &["a"]);
+        let reply = scan.search(params("  ", false, START + 12));
         assert_eq!(starts(&reply), vec![START + 8, START + 4, START]);
         assert_eq!(reply.slow, None, "slow was not asked for");
     }
@@ -1633,16 +1541,8 @@ mod tests {
                 _ => {}
             }
         });
-        let epochs = [epoch(&["a"])];
-        let found = |conditions: &[Only]| {
-            starts(&search(
-                &held,
-                &RwLock::default(),
-                &RwLock::default(),
-                &epochs,
-                &only(conditions, START + 16),
-            ))
-        };
+        let scan = scan(held, &["a"]);
+        let found = |conditions: &[Only]| starts(&scan.search(only(conditions, START + 16)));
         assert_eq!(found(&[Only::NoTips]), vec![START]);
         assert_eq!(found(&[Only::Skipped]), vec![START + 4]);
         assert_eq!(found(&[Only::FewTransactions]), vec![START + 8]);
@@ -1662,13 +1562,8 @@ mod tests {
                 _ => {}
             }
         });
-        let reply = search(
-            &held,
-            &RwLock::default(),
-            &RwLock::default(),
-            &[epoch(&["a"])],
-            &only(&[Only::FewTransactions, Only::LeftOut], START + 8),
-        );
+        let scan = scan(held, &["a"]);
+        let reply = scan.search(only(&[Only::FewTransactions, Only::LeftOut], START + 8));
         assert_eq!(starts(&reply), vec![START + 4]);
     }
 
@@ -1690,41 +1585,22 @@ mod tests {
                 row.time_millis = time;
             });
         }
-        let held = RwLock::new(history);
-        let epochs = [epoch(&["a"])];
-        let first = search(
-            &held,
-            &RwLock::default(),
-            &RwLock::default(),
-            &epochs,
-            &only(&[Only::Slow], START + 400),
-        );
+        let scan = scan(history, &["a"]);
+        let first = scan.search(only(&[Only::Slow], START + 400));
         assert_eq!(
             first.slow,
             Some(vec![Some(300), Some(200), Some(200), Some(200)])
         );
         assert_eq!(starts(&first), vec![START + 200, START + 40]);
         // Starting lower, as a jump does, measures the same slots.
-        let jumped = search(
-            &held,
-            &RwLock::default(),
-            &RwLock::default(),
-            &epochs,
-            &only(&[Only::Slow], START + 100),
-        );
+        let jumped = scan.search(only(&[Only::Slow], START + 100));
         assert_eq!(jumped.slow, first.slow);
         assert_eq!(starts(&jumped), vec![START + 40]);
         // A later page keeps the first page's cut-offs rather than measuring again.
-        let later = search(
-            &held,
-            &RwLock::default(),
-            &RwLock::default(),
-            &epochs,
-            &SearchParams {
-                slow: Some(vec![Some(400), Some(300), Some(300), Some(300)]),
-                ..only(&[Only::Slow], START + 200)
-            },
-        );
+        let later = scan.search(SearchParams {
+            slow: Some(vec![Some(400), Some(300), Some(300), Some(300)]),
+            ..only(&[Only::Slow], START + 200)
+        });
         assert_eq!(starts(&later), Vec::<Slot>::new());
         assert_eq!(
             later.slow,
@@ -1741,59 +1617,38 @@ mod tests {
 
     #[test]
     fn test_a_jump_to_a_time_starts_at_the_turn_begun_by_then() {
-        let epochs = [epoch(&["a"])];
-        let reply = search(
-            &history(START, START + 15),
-            &RwLock::default(),
-            &RwLock::default(),
-            &epochs,
-            &SearchParams {
-                until_millis: Some(START + 9),
-                ..params("", false, START + 16, None)
-            },
-        );
+        let scan = scan(history(START, START + 15), &["a"]);
+        let reply = scan.search(SearchParams {
+            until_millis: Some(START + 9),
+            ..params("", false, START + 16)
+        });
         assert_eq!(starts(&reply), vec![START + 8, START + 4, START]);
     }
 
     #[test]
     fn test_a_forward_search_reads_up_from_its_start_a_page_at_a_time() {
-        let epochs = [epoch(&["a"])];
-        let held = history(START, START + 19);
+        // From the second turn, a full page and two turns more.
+        let top = START + (MAX_SEARCH_TURNS as u64 + 3) * SLOTS_PER_TURN;
+        let scan = scan(history(START, top - 1), &["a"]);
         let forward = |before: Slot| SearchParams {
             forward: true,
-            ..params("", false, before, Some(2))
+            ..params("", false, before)
         };
-        let first = search(
-            &held,
-            &RwLock::default(),
-            &RwLock::default(),
-            &epochs,
-            &forward(START + 4),
-        );
-        assert_eq!(starts(&first), vec![START + 4, START + 8], "oldest first");
-        assert_eq!(first.next, Some(START + 12));
-        let rest = search(
-            &held,
-            &RwLock::default(),
-            &RwLock::default(),
-            &epochs,
-            &forward(START + 12),
-        );
-        assert_eq!(starts(&rest), vec![START + 12, START + 16]);
-        let past = search(
-            &held,
-            &RwLock::default(),
-            &RwLock::default(),
-            &epochs,
-            &forward(START + 20),
-        );
+        let first = scan.search(forward(START + 4));
+        assert_eq!(starts(&first)[..2], [START + 4, START + 8], "oldest first");
+        assert_eq!(first.turns.len(), MAX_SEARCH_TURNS);
+        let next = top - 8;
+        assert_eq!(first.next, Some(next));
+        let rest = scan.search(forward(next));
+        assert_eq!(starts(&rest), vec![next, next + 4]);
+        let past = scan.search(forward(top));
         assert_eq!(starts(&past), Vec::<Slot>::new());
         assert_eq!(past.next, None, "nothing above the newest held");
     }
 
     #[test]
     fn test_failed_conditions_read_the_count_and_the_share() {
-        let held = rows(START, START + 15, |slot, row| {
+        let scan = two_leaders(rows(START, START + 15, |slot, row| {
             match slot.saturating_sub(START) {
                 9 => {
                     row.non_votes = 1_000;
@@ -1805,27 +1660,15 @@ mod tests {
                 }
                 _ => {}
             }
-        });
-        let (epochs, map) = two_leaders();
-        let found = |conditions: Vec<Condition>| {
-            starts(&search(
-                &held,
-                &RwLock::default(),
-                &map,
-                &epochs,
-                &SearchParams {
-                    conditions,
-                    ..params("", false, START + 16, None)
-                },
-            ))
-        };
+        }));
+        let found = |conditions| starts(&scan.search(where_(conditions, START + 16)));
         assert_eq!(
-            found(vec![condition(Field::Failed, Op::Gt, 100.0, &[])]),
+            found(vec![cmp(Field::Failed, Op::Gt, 100.0)]),
             vec![START + 8],
             "the larger count, in the larger block"
         );
         assert_eq!(
-            found(vec![condition(Field::FailedShare, Op::Ge, 50.0, &[])]),
+            found(vec![cmp(Field::FailedShare, Op::Ge, 50.0)]),
             vec![START + 12],
             "the larger share, in the smaller block"
         );
@@ -1833,58 +1676,41 @@ mod tests {
 
     #[test]
     fn test_column_conditions_hold_in_one_slot_with_the_leaders_traits() {
-        let held = rows(START, START + 15, |slot, row| {
+        let scan = two_leaders(rows(START, START + 15, |slot, row| {
             if slot.saturating_sub(START) == 13 || slot.saturating_sub(START) == 1 {
                 row.non_votes = 50;
             }
-        });
-        let (epochs, map) = two_leaders();
-        let found = |conditions: Vec<Condition>| {
-            starts(&search(
-                &held,
-                &RwLock::default(),
-                &map,
-                &epochs,
-                &SearchParams {
-                    conditions,
-                    ..params("", false, START + 16, None)
-                },
-            ))
-        };
+        }));
+        let found = |conditions| starts(&scan.search(where_(conditions, START + 16)));
         assert_eq!(
-            found(vec![condition(Field::Transactions, Op::Lt, 100.0, &[])]),
+            found(vec![cmp(Field::Transactions, Op::Lt, 100.0)]),
             vec![START + 12, START],
             "a figure in one slot"
         );
         assert_eq!(
-            found(vec![condition(
-                Field::Client,
-                Op::Is,
-                0.0,
-                &["AgaveBam", "Other"]
-            )]),
+            found(vec![is(Field::Client, Op::Is, &["AgaveBam", "Other"])]),
             vec![START + 12, START + 4],
             "any of the clients listed"
         );
         assert_eq!(
             found(vec![
-                condition(Field::Country, Op::Is, 0.0, &["DE"]),
-                condition(Field::Transactions, Op::Lt, 100.0, &[]),
+                is(Field::Country, Op::Is, &["DE"]),
+                cmp(Field::Transactions, Op::Lt, 100.0),
             ]),
             vec![START + 12],
             "a leader's trait and a slot's figure together"
         );
         assert_eq!(
-            found(vec![condition(Field::Country, Op::IsNot, 0.0, &["DE"])]),
+            found(vec![is(Field::Country, Op::IsNot, &["DE"])]),
             Vec::<Slot>::new(),
             "a leader with no country known matches neither way"
         );
         assert_eq!(
-            found(vec![condition(Field::Stake, Op::Ge, 5_000.0, &[])]),
+            found(vec![cmp(Field::Stake, Op::Ge, 5_000.0)]),
             vec![START + 12, START + 4]
         );
         assert_eq!(
-            found(vec![condition(Field::Leader, Op::Is, 0.0, &["delinquent"])]),
+            found(vec![is(Field::Leader, Op::Is, &["delinquent"])]),
             vec![START + 12, START + 4],
             "a leader not voting now"
         );
@@ -1893,51 +1719,31 @@ mod tests {
     #[test]
     fn test_a_name_condition_keeps_any_leader_named_or_keyed() {
         let (ours, other) = (Pubkey::new_unique(), Pubkey::new_unique());
-        let epochs = [epoch(&[&ours.to_string(), &other.to_string()])];
-        let held = history(START, START + 15);
-        let info = named(&other, "Hamsa Labs");
-        let found = |conditions: Vec<Condition>| {
-            starts(&search(
-                &held,
-                &info,
-                &RwLock::default(),
-                &epochs,
-                &SearchParams {
-                    conditions,
-                    ..params("", false, START + 16, None)
-                },
-            ))
+        let scan = Scan {
+            info: named(&other, "Hamsa Labs"),
+            ..scan(history(START, START + 15), &[ours, other])
         };
+        let found = |conditions| starts(&scan.search(where_(conditions, START + 16)));
         assert_eq!(
-            found(vec![condition(
-                Field::Name,
-                Op::Is,
-                0.0,
-                &["hamsa", "nobody"]
-            )]),
+            found(vec![is(Field::Name, Op::Is, &["hamsa", "nobody"])]),
             vec![START + 12, START + 4],
             "any of the names, part of one, any case"
         );
         let key: String = ours.to_string().chars().take(8).collect();
         assert_eq!(
-            found(vec![condition(Field::Name, Op::Is, 0.0, &["HAMSA", &key])]),
+            found(vec![is(Field::Name, Op::Is, &["HAMSA", &key])]),
             vec![START + 12, START + 8, START + 4, START],
             "a key as well as a name"
         );
         assert_eq!(
-            found(vec![condition(
-                Field::Name,
-                Op::IsNot,
-                0.0,
-                &["Hamsa Labs"]
-            )]),
+            found(vec![is(Field::Name, Op::IsNot, &["Hamsa Labs"])]),
             vec![START + 8, START],
             "every leader but those named"
         );
         assert_eq!(
             found(vec![
-                condition(Field::Name, Op::Is, 0.0, &["hamsa"]),
-                condition(Field::Name, Op::IsNot, 0.0, &["labs"]),
+                is(Field::Name, Op::Is, &["hamsa"]),
+                is(Field::Name, Op::IsNot, &["labs"]),
             ]),
             Vec::<Slot>::new(),
             "every name condition at once"
@@ -1946,30 +1752,19 @@ mod tests {
 
     #[test]
     fn test_a_range_keeps_the_turns_inside_it() {
-        let reply = search(
-            &history(START, START + 15),
-            &RwLock::default(),
-            &RwLock::default(),
-            &[epoch(&["a"])],
-            &SearchParams {
-                from_slot: Some(START + 5),
-                to_slot: Some(START + 10),
-                ..params("", false, START + 16, None)
-            },
-        );
+        let scan = scan(history(START, START + 15), &["a"]);
+        let reply = scan.search(SearchParams {
+            from_slot: Some(START + 5),
+            to_slot: Some(START + 10),
+            ..params("", false, START + 16)
+        });
         assert_eq!(starts(&reply), vec![START + 8, START + 4]);
         assert_eq!(reply.next, None, "stopped on leaving the range");
-        let by_time = search(
-            &history(START, START + 15),
-            &RwLock::default(),
-            &RwLock::default(),
-            &[epoch(&["a"])],
-            &SearchParams {
-                from_millis: Some(START + 4),
-                to_millis: Some(START + 8),
-                ..params("", false, START + 16, None)
-            },
-        );
+        let by_time = scan.search(SearchParams {
+            from_millis: Some(START + 4),
+            to_millis: Some(START + 8),
+            ..params("", false, START + 16)
+        });
         assert_eq!(starts(&by_time), vec![START + 8, START + 4]);
     }
 
@@ -1986,22 +1781,17 @@ mod tests {
                 held.record_time(slot, slot);
             }
         }
-        let reply = search(
-            &RwLock::new(held),
-            &RwLock::default(),
-            &RwLock::default(),
-            &[epoch(&["a"])],
-            &SearchParams {
-                to_millis: Some(START + 5),
-                ..params("", false, START + 16, None)
-            },
-        );
+        let scan = scan(held, &["a"]);
+        let reply = scan.search(SearchParams {
+            to_millis: Some(START + 5),
+            ..params("", false, START + 16)
+        });
         assert_eq!(starts(&reply), vec![START + 4, START]);
     }
 
     #[test]
     fn test_a_summary_sums_the_matches_overall_and_by_client() {
-        let held = rows(START, START + 7, |slot, row| {
+        let scan = two_leaders(rows(START, START + 7, |slot, row| {
             row.fees = 7_000;
             row.priority_fees = 2_000;
             row.compute = 1_000_000;
@@ -2009,22 +1799,15 @@ mod tests {
                 row.level = SlotLevel::Skipped as u8;
                 row.flags = 0;
             }
-        });
-        let (epochs, map) = two_leaders();
-        let reply = summarize(
-            &held,
-            &RwLock::default(),
-            &map,
-            &epochs,
-            &params("", false, START + 8, None),
-        );
+        }));
+        let reply = scan.summarize(params("", false, START + 8));
         assert_eq!(reply.turns, 2);
         assert_eq!(reply.figures.slots, 8);
         assert_eq!(reply.figures.skipped, 1);
         assert_eq!(reply.figures.transactions, 7 * 500);
-        assert_eq!(reply.figures.base_fee, Some(5_000.0));
-        assert_eq!(reply.figures.priority_fee, Some(2_000.0));
-        assert_eq!(reply.figures.compute, Some(1_000_000.0));
+        assert_eq!(reply.figures.base_fee.get(), Some(5_000.0));
+        assert_eq!(reply.figures.priority_fee.get(), Some(2_000.0));
+        assert_eq!(reply.figures.compute.get(), Some(1_000_000.0));
         assert_eq!(reply.clients.len(), 2);
         let agave = reply
             .clients
@@ -2032,6 +1815,38 @@ mod tests {
             .find(|client| client.client.as_deref() == Some("AgaveBam"))
             .expect("the second leader's client");
         assert_eq!((agave.figures.slots, agave.figures.skipped), (4, 1));
+        assert_eq!(
+            serde_json::to_value(&reply.figures).unwrap(),
+            serde_json::json!({
+                "slots": 8,
+                "skipped": 1,
+                "transactions": 3_500,
+                "duration_ms": null,
+                "first_slot_ms": null,
+                "rest_of_turn_ms": null,
+                "replay_ms": null,
+                "base_fee": 5_000.0,
+                "priority_fee": 2_000.0,
+                "tips": 10.0,
+                "compute": 1_000_000.0,
+            })
+        );
+        let row = serde_json::to_value(agave).unwrap();
+        assert_eq!(
+            (
+                &row["client"],
+                &row["validators"],
+                &row["slots"],
+                &row["base_fee"]
+            ),
+            (
+                &serde_json::json!("AgaveBam"),
+                &serde_json::json!(1),
+                &serde_json::json!(4),
+                &serde_json::json!(5_000.0)
+            ),
+            "{row}"
+        );
         assert!(
             reply.clients.iter().any(|client| client.client.is_none()),
             "a leader with no traits has its own row"
@@ -2043,23 +1858,16 @@ mod tests {
                 millis: None
             })
         );
-        assert_eq!(reply.choices.clients, vec!["AgaveBam".to_string()]);
-        assert_eq!(reply.choices.countries, vec!["DE"]);
+        assert_eq!(reply.choices.clients, BTreeSet::from(["AgaveBam".into()]));
+        assert_eq!(reply.choices.countries, BTreeSet::from(["DE"]));
         assert_eq!(reply.delinquent.len(), 1);
         assert_eq!(reply.delinquent[0].last_vote, Some(7));
     }
 
     #[test]
     fn test_a_summary_groups_by_country_and_counts_each_leader_once() {
-        let held = rows(START, START + 23, |_, _| {});
-        let (epochs, map) = two_leaders();
-        let reply = summarize(
-            &held,
-            &RwLock::default(),
-            &map,
-            &epochs,
-            &params("", false, START + 24, None),
-        );
+        let scan = two_leaders(rows(START, START + 23, |_, _| {}));
+        let reply = scan.summarize(params("", false, START + 24));
         assert_eq!(reply.countries.len(), 2);
         let germany = reply
             .countries
@@ -2083,20 +1891,11 @@ mod tests {
 
     #[test]
     fn test_a_summary_leaves_out_groups_with_no_matching_slot() {
-        let held = rows(START, START + 7, |slot, row| {
+        let scan = two_leaders(rows(START, START + 7, |slot, row| {
             row.non_votes = if slot < START + 4 { 50 } else { 500 };
-        });
-        let (epochs, map) = two_leaders();
-        let reply = summarize(
-            &held,
-            &RwLock::default(),
-            &map,
-            &epochs,
-            &SearchParams {
-                conditions: vec![condition(Field::Transactions, Op::Lt, 100.0, &[])],
-                ..params("", false, START + 8, None)
-            },
-        );
+        }));
+        let few = vec![cmp(Field::Transactions, Op::Lt, 100.0)];
+        let reply = scan.summarize(where_(few, START + 8));
         assert_eq!(reply.clients.len(), 1);
         assert_eq!(reply.countries.len(), 1);
         assert_eq!(reply.countries[0].country, None);
@@ -2115,17 +1914,11 @@ mod tests {
             };
             row.full_millis = 100;
         });
-        let reply = summarize(
-            &held,
-            &RwLock::default(),
-            &RwLock::default(),
-            &[epoch(&["a"])],
-            &params("", false, START + 8, None),
-        );
+        let reply = scan(held, &["a"]).summarize(params("", false, START + 8));
         // The first slot held has no earlier block to measure from.
-        assert_eq!(reply.figures.first_slot_ms, Some(350.0));
-        assert_eq!(reply.figures.rest_of_turn_ms, Some(200.0));
-        assert_eq!(reply.countries[0].figures.first_slot_ms, Some(350.0));
+        assert_eq!(reply.figures.first_slot_ms.get(), Some(350.0));
+        assert_eq!(reply.figures.rest_of_turn_ms.get(), Some(200.0));
+        assert_eq!(reply.countries[0].figures.first_slot_ms.get(), Some(350.0));
     }
 
     #[test]
@@ -2135,31 +1928,16 @@ mod tests {
                 row.non_votes = 50;
             }
         });
-        let reply = summarize(
-            &held,
-            &RwLock::default(),
-            &RwLock::default(),
-            &[epoch(&["a"])],
-            &SearchParams {
-                conditions: vec![condition(Field::Transactions, Op::Lt, 100.0, &[])],
-                ..params("", false, START + 8, None)
-            },
-        );
+        let few = vec![cmp(Field::Transactions, Op::Lt, 100.0)];
+        let reply = scan(held, &["a"]).summarize(where_(few, START + 8));
         assert_eq!((reply.turns, reply.figures.slots), (1, 1));
         assert_eq!(reply.figures.transactions, 50);
     }
 
     #[test]
     fn test_a_summary_asked_nothing_stops_at_the_epoch_while_a_filter_reads_all_held() {
-        let held = rows(START - 8, START + 7, |_, _| {});
-        let (epochs, map) = two_leaders();
-        let reply = summarize(
-            &held,
-            &RwLock::default(),
-            &map,
-            &epochs,
-            &params("", false, START + 8, None),
-        );
+        let scan = two_leaders(rows(START - 8, START + 7, |_, _| {}));
+        let reply = scan.summarize(params("", false, START + 8));
         assert_eq!((reply.turns, reply.figures.slots), (2, 8));
         assert_eq!(
             reply.held_from.map(|held| held.slot),
@@ -2167,48 +1945,31 @@ mod tests {
             "the oldest slot held still reaches past the epoch"
         );
 
-        let filtered = summarize(
-            &held,
-            &RwLock::default(),
-            &map,
-            &epochs,
-            &SearchParams {
-                conditions: vec![condition(Field::Transactions, Op::Gt, 100.0, &[])],
-                ..params("", false, START + 8, None)
-            },
-        );
+        let many = vec![cmp(Field::Transactions, Op::Gt, 100.0)];
+        let filtered = scan.summarize(where_(many, START + 8));
         assert_eq!((filtered.turns, filtered.figures.slots), (4, 16));
     }
 
     #[test]
     fn test_a_summary_leaves_slots_replayed_while_catching_up_out_of_the_replay_mean() {
-        let held = rows(START, START + 7, |slot, row| {
+        let scan = two_leaders(rows(START, START + 7, |slot, row| {
             row.flags |= HAS_SHREDS | HAS_REPLAYED;
             row.full_millis = 200;
             row.replayed_millis = if slot < START + 4 { 20_200 } else { 208 };
-        });
-        let (epochs, map) = two_leaders();
-        let read = |held: &RwLock<SlotHistory>| {
-            summarize(
-                held,
-                &RwLock::default(),
-                &map,
-                &epochs,
-                &params("", false, START + 8, None),
-            )
-        };
-        assert_eq!(read(&held).figures.replay_ms, Some(10_004.0));
+        }));
+        let read = || scan.summarize(params("", false, START + 8));
+        assert_eq!(read().figures.replay_ms.get(), Some(10_004.0));
 
-        held.write().unwrap().set_live_from(Slot::MAX);
+        scan.history.write().unwrap().live_from = Slot::MAX;
         assert_eq!(
-            read(&held).figures.replay_ms,
+            read().figures.replay_ms.get(),
             None,
             "still catching up, nothing is live yet"
         );
 
-        held.write().unwrap().set_live_from(START + 4);
-        let reply = read(&held);
-        assert_eq!(reply.figures.replay_ms, Some(8.0));
+        scan.history.write().unwrap().live_from = START + 4;
+        let reply = read();
+        assert_eq!(reply.figures.replay_ms.get(), Some(8.0));
         assert_eq!(reply.figures.slots, 8, "the slots themselves still count");
     }
 
@@ -2232,57 +1993,29 @@ mod tests {
 
     #[test]
     fn test_a_full_page_fits_the_message_ceiling() {
-        let ours = Pubkey::new_unique();
-        let epochs = [epoch(&[&ours.to_string()])];
         let mut held = SlotHistory::new(4_096);
         for slot in START..START + 4_000 {
             held.record_worst_case(slot);
         }
-        let reply = search(
-            &RwLock::new(held),
-            &RwLock::default(),
-            &RwLock::default(),
-            &epochs,
-            &params("", true, START + 4_000, None),
-        );
+        let reply = scan(held, &["a"]).search(params("", true, START + 4_000));
         assert_eq!(reply.turns.len(), MAX_SEARCH_TURNS);
         let encoded = proto::encode_with_id("slot", "search", Some(1), &reply);
-        assert!(
-            encoded.len() < proto::MAX_MESSAGE / 2,
-            "a full page is {} bytes against a {} byte ceiling",
-            encoded.len(),
-            proto::MAX_MESSAGE
-        );
-    }
-
-    fn future_of(conditions: Vec<Condition>, before: Slot) -> FutureReply {
-        let (epochs, map) = two_leaders();
-        future(
-            &RwLock::new(SlotHistory::new(4_096)),
-            &RwLock::default(),
-            &map,
-            &epochs,
-            &SearchParams {
-                conditions,
-                ..params("", false, before, Some(4))
-            },
-        )
+        proto::assert_under("a full page", &encoded, proto::MAX_MESSAGE / 2);
     }
 
     #[test]
     fn test_turns_to_come_match_on_their_leader_with_no_history_held() {
-        let reply = future_of(
-            vec![condition(Field::Client, Op::Is, 0.0, &["AgaveBam"])],
-            START,
-        );
+        let agave = vec![is(Field::Client, Op::Is, &["AgaveBam"])];
+        let reply = two_leaders(SlotHistory::new(4_096)).future(where_(agave, START));
         let first = START / SLOTS_PER_TURN;
         assert_eq!(
-            reply.turns,
+            reply.turns[..4],
             [first + 1, first + 3, first + 5, first + 7],
             "the second leader's turns"
         );
+        assert!(reply.turns.iter().all(|turn| (turn - first) % 2 == 1));
         assert_eq!(reply.leaders.len(), 1, "each leader once");
-        let leader = &reply.leaders[0];
+        let leader = &reply.leaders[0].traits;
         assert_eq!(leader.version.as_deref(), Some("4.4.1"));
         assert_eq!(leader.ip.as_deref(), Some("192.0.2.1"));
         assert_eq!(leader.country, Some("DE"));
@@ -2291,61 +2024,56 @@ mod tests {
 
     #[test]
     fn test_a_filter_on_a_slots_figures_matches_no_turn_to_come() {
-        let leader = condition(Field::Country, Op::Is, 0.0, &["DE"]);
-        let figure = condition(Field::Duration, Op::Gt, 400.0, &[]);
+        let scan = two_leaders(SlotHistory::new(4_096));
+        let leader = is(Field::Country, Op::Is, &["DE"]);
+        let figure = cmp(Field::Duration, Op::Gt, 400.0);
         assert_eq!(
-            future_of(vec![leader, figure], START),
+            scan.future(where_(vec![leader, figure], START)),
             FutureReply::default()
         );
-        let (epochs, map) = two_leaders();
-        let reply = future(
-            &RwLock::new(SlotHistory::new(4_096)),
-            &RwLock::default(),
-            &map,
-            &epochs,
-            &SearchParams {
-                only: vec![Only::Skipped],
-                ..params("", false, START, None)
-            },
+        assert_eq!(
+            scan.future(only(&[Only::Skipped], START)),
+            FutureReply::default()
         );
-        assert_eq!(reply, FutureReply::default());
     }
 
     #[test]
     fn test_turns_to_come_are_read_a_page_at_a_time() {
-        let stake = || condition(Field::Stake, Op::Gt, 0.0, &[]);
-        let page = future_of(vec![stake()], START);
-        // Half of the epoch's thousand turns, four on this page.
-        assert_eq!(page.rest, 496);
+        let scan = two_leaders(SlotHistory::new(4_096));
+        let staked = |before| scan.future(where_(vec![cmp(Field::Stake, Op::Gt, 0.0)], before));
+        let page = staked(START);
+        // Half of the epoch's thousand turns, a full page on this one.
+        let after = 500 - MAX_FUTURE_TURNS;
+        assert_eq!(page.turns.len(), MAX_FUTURE_TURNS);
+        assert_eq!(page.rest, after as u64);
         let next = page.next.expect("more to come");
-        let later = future_of(vec![stake()], next);
-        assert_eq!(later.rest, 492);
-        assert!(later.turns[0] > page.turns[3], "carries on from the page");
+        let later = staked(next);
+        assert_eq!(later.turns.len(), after, "the rest on the next page");
+        assert_eq!((later.rest, later.next), (0, None));
+        assert!(
+            later.turns[0] > page.turns[MAX_FUTURE_TURNS - 1],
+            "carries on from the page"
+        );
         assert_eq!(later.turns[0].saturating_mul(SLOTS_PER_TURN), next);
     }
 
     #[test]
     fn test_turns_to_come_start_no_lower_than_the_held_epochs() {
-        let from_nought = future_of(Vec::new(), 0);
+        let scan = two_leaders(SlotHistory::new(4_096));
+        let from_nought = scan.future(params("", false, 0));
         assert_eq!(from_nought.turns[0], START / SLOTS_PER_TURN);
-        assert_eq!(from_nought.rest, future_of(Vec::new(), START).rest);
+        assert_eq!(from_nought.rest, scan.future(params("", false, START)).rest);
     }
 
     #[test]
     fn test_turns_to_come_start_at_the_next_whole_turn_and_keep_to_the_range() {
-        let (epochs, map) = two_leaders();
+        let scan = two_leaders(SlotHistory::new(4_096));
         let first = START / SLOTS_PER_TURN;
-        let reply = future(
-            &RwLock::new(SlotHistory::new(4_096)),
-            &RwLock::default(),
-            &map,
-            &epochs,
-            &SearchParams {
-                from_slot: Some(START + 8),
-                to_slot: Some(START + 15),
-                ..params("", false, START + 1, None)
-            },
-        );
+        let reply = scan.future(SearchParams {
+            from_slot: Some(START + 8),
+            to_slot: Some(START + 15),
+            ..params("", false, START + 1)
+        });
         assert_eq!(reply.turns, [first + 2, first + 3]);
         assert_eq!(reply.next, None);
         assert_eq!(reply.rest, 0);
@@ -2353,19 +2081,10 @@ mod tests {
 
     #[test]
     fn test_turns_to_come_match_ours_and_words() {
-        let (epochs, map) = two_leaders();
+        let scan = two_leaders(SlotHistory::new(4_096));
         let first = START / SLOTS_PER_TURN;
-        let read = |query: &str, ours: bool| {
-            future(
-                &RwLock::new(SlotHistory::new(4_096)),
-                &RwLock::default(),
-                &map,
-                &epochs,
-                &params(query, ours, START, Some(2)),
-            )
-            .turns
-        };
-        assert_eq!(read("", true), [first, first + 2]);
+        let read = |query: &str, ours: bool| scan.future(params(query, ours, START)).turns;
+        assert_eq!(read("", true)[..2], [first, first + 2]);
         // Digits read as part of a slot number.
         assert_eq!(read("1009", false), [first + 2]);
         assert!(read("nobody", false).is_empty());
@@ -2374,7 +2093,7 @@ mod tests {
     #[test]
     fn test_a_version_is_named_whole_or_by_its_start_at_a_dot() {
         let holds = |op: Op, values: &[&str], version: Option<&str>| {
-            version_listed(&condition(Field::Version, op, 0.0, values), version)
+            version_listed(&is(Field::Version, op, values), version)
         };
         assert!(holds(Op::Is, &["4.4.1"], Some("4.4.1")));
         assert!(holds(Op::Is, &["4.4"], Some("4.4.1")));
@@ -2392,8 +2111,6 @@ mod tests {
         let keys: Vec<String> = (0..MAX_FUTURE_TURNS)
             .map(|_| Pubkey::new_unique().to_string())
             .collect();
-        let refs: Vec<&str> = keys.iter().map(String::as_str).collect();
-        let epochs = [epoch(&refs)];
         let map: LeaderMap = keys
             .iter()
             .map(|key| {
@@ -2409,22 +2126,15 @@ mod tests {
                 (Pubkey::from_str(key).unwrap(), traits)
             })
             .collect();
-        let reply = future(
-            &RwLock::new(SlotHistory::new(4_096)),
-            &RwLock::default(),
-            &RwLock::new(map),
-            &epochs,
-            &params("", false, START, None),
-        );
+        let scan = Scan {
+            map: RwLock::new(map),
+            ..scan(SlotHistory::new(4_096), &keys)
+        };
+        let reply = scan.future(params("", false, START));
         assert_eq!(reply.turns.len(), MAX_FUTURE_TURNS);
         assert_eq!(reply.leaders.len(), MAX_FUTURE_TURNS);
         let encoded = proto::encode_with_id("slot", "future", Some(1), &reply);
-        assert!(
-            encoded.len() < proto::MAX_MESSAGE / 2,
-            "a full page is {} bytes against a {} byte ceiling",
-            encoded.len(),
-            proto::MAX_MESSAGE
-        );
+        proto::assert_under("a full page", &encoded, proto::MAX_MESSAGE / 2);
     }
 
     #[test]
@@ -2447,12 +2157,7 @@ mod tests {
         let rows = leader_rows(&map);
         assert_eq!(rows.len(), 2_000);
         let encoded = proto::encode_with_id("peers", "leaders", Some(1), &rows);
-        assert!(
-            encoded.len() < proto::MAX_MESSAGE / 2,
-            "every leader is {} bytes against a {} byte ceiling",
-            encoded.len(),
-            proto::MAX_MESSAGE
-        );
+        proto::assert_under("every leader", &encoded, proto::MAX_MESSAGE / 2);
     }
 
     #[test]
@@ -2466,60 +2171,30 @@ mod tests {
 
     #[test]
     fn test_a_gap_condition_keeps_the_turns_with_a_long_enough_gap() {
-        let (mut epochs, map) = two_leaders();
-        epochs[0].turns = vec![0, 1, 0, 0, 1, 1];
-        epochs[0].end_slot = START + 23;
+        let mut scan = two_leaders(SlotHistory::new(4_096));
+        scan.epochs[0].turns = vec![0, 1, 0, 0, 1, 1];
+        scan.epochs[0].end_slot = START + 23;
         let first = START / SLOTS_PER_TURN;
-        let reply = future(
-            &RwLock::new(SlotHistory::new(4_096)),
-            &RwLock::default(),
-            &map,
-            &epochs,
-            &SearchParams {
-                conditions: vec![condition(Field::Gap, Op::Ge, 8.0, &[])],
-                ..params("", false, START, None)
-            },
-        );
+        let reply = scan.future(where_(vec![cmp(Field::Gap, Op::Ge, 8.0)], START));
         assert_eq!(reply.turns, [first + 1, first + 3], "gaps of 8 slots");
         // Held turns answer the same condition.
-        let held = rows(START, START + 23, |_, _| {});
-        let found = search(
-            &held,
-            &RwLock::default(),
-            &map,
-            &epochs,
-            &SearchParams {
-                conditions: vec![condition(Field::Gap, Op::Ge, 4.0, &[])],
-                ..params("", false, START + 24, None)
-            },
-        );
+        scan.history = RwLock::new(rows(START, START + 23, |_, _| {}));
+        let found = scan.search(where_(vec![cmp(Field::Gap, Op::Ge, 4.0)], START + 24));
         assert_eq!(found.turns.len(), 3, "turns 0, 1 and 3");
     }
 
     #[test]
     fn test_turns_to_come_name_the_one_validator_chosen() {
         let (ours, other) = (Pubkey::new_unique(), Pubkey::new_unique());
-        let epochs = [epoch(&[&ours.to_string(), &other.to_string()])];
-        let read = |conditions: Vec<Condition>| {
-            future(
-                &RwLock::new(SlotHistory::new(4_096)),
-                &named(&ours, "Lantern"),
-                &RwLock::default(),
-                &epochs,
-                &SearchParams {
-                    conditions,
-                    ..params("", false, START, Some(1))
-                },
-            )
-            .named
+        let scan = Scan {
+            info: named(&ours, "Lantern"),
+            ..scan(SlotHistory::new(4_096), &[ours, other])
         };
-        let name = |op: Op, value: &str| condition(Field::Name, op, 0.0, &[value]);
+        let read = |conditions| scan.future(where_(conditions, START)).named;
+        let name = |op: Op, value: &str| is(Field::Name, op, &[value]);
         assert_eq!(read(vec![name(Op::Is, "lantern")]), Some(ours.to_string()));
         assert_eq!(
-            read(vec![
-                name(Op::Is, "lantern"),
-                condition(Field::Gap, Op::Gt, 1e9, &[])
-            ]),
+            read(vec![name(Op::Is, "lantern"), cmp(Field::Gap, Op::Gt, 1e9)]),
             Some(ours.to_string()),
             "still chosen when no turn matches"
         );

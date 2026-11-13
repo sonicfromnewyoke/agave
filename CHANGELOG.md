@@ -50,10 +50,6 @@ and follows a [Backwards Compatibility Policy](https://docs.anza.xyz/backwards-c
 * Added `vote-update-commission-collector` to set the account that collects a vote account's
   commission. The `COMMISSION_KIND` argument selects which collector to update:
   `inflation-rewards` or `block-revenue`.
-* Added an optional web dashboard, served by the validator itself and enabled with `--dashboard-port`.
-  It has no authentication and binds `127.0.0.1` unless `--dashboard-bind-address` says otherwise;
-  `--dashboard-allowed-host` names the domains it answers to behind a reverse proxy. The host and
-  socket panels read `/proc` and appear on Linux only.
 
 ## 4.3.0
 

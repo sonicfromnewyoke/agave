@@ -1,40 +1,47 @@
 # agave-dashboard
 
-A web dashboard served by `agave-validator` itself.
+A web dashboard for an `agave-validator`, served by a process of its own beside it. Nothing of
+it runs inside the validator: it follows the validator's ledger as a RocksDB secondary, and
+reads its metrics export, its JSON-RPC and admin socket, and `/proc` of its process.
 
 ```bash
-agave-validator --dashboard-port 10999
+SOLANA_METRICS_CONFIG=host=http://127.0.0.1:18186,db=dashboard,u=dashboard,p=dashboard \
+  agave-validator --rpc-port 8899 ...
+
+agave-dashboard --ledger /path/to/ledger \
+  --metrics-listen 127.0.0.1:18186 --vote-account <VOTE_PUBKEY> --listen 127.0.0.1:11000
 ```
 
-Then open <http://127.0.0.1:10999>. There is nothing else to configure and no
-second process to run. The SPA is embedded in the validator binary, and the data
-comes from handles the validator already holds.
+Then open <http://127.0.0.1:11000>. The dashboard runs as the validator's user, on the same
+host, since the admin socket is mode 0600 and the ledger, `/proc` and `/sys` are read in place.
+It can be started and stopped at any time, and attaches to a validator already running; started
+before the validator, it has the metrics export from the first point. `--metrics-forward` passes
+the points on to an InfluxDB the validator reported to before. `--tip-payment-program` measures
+Jito tips per block. `--rpc-url` names another RPC node of the cluster for the chain's state,
+which spares the validator's own.
 
 ## Exposing it
 
-The dashboard has no authentication and no TLS. It binds to `127.0.0.1` unless
-`--dashboard-bind-address` says otherwise, and everything below assumes you have
-decided to serve it to somebody else.
+The dashboard has no authentication and no TLS. It binds `127.0.0.1:11000` unless `--listen`
+says otherwise, and everything below assumes you have decided to serve it to somebody else.
 
 ```bash
-agave-validator \
-  --dashboard-port 10999 \
-  --dashboard-allowed-host dashboard.example.com
+agave-dashboard ... --listen 0.0.0.0:11000 --allowed-host dashboard.example.com
 ```
 
-`--dashboard-allowed-host` lists the names the dashboard will answer to; repeat
-the flag for each one. `localhost` and any IP literal are accepted without it, so
-`http://<your-ip>:10999` works out of the box. A **domain** has to be listed.
+`--allowed-host` lists the names the dashboard will answer to; repeat the flag
+for each one. `localhost` and any IP literal are accepted without it, so
+`http://<your-ip>:11000` works out of the box. A **domain** has to be listed.
 
 A request whose `Host` is not on the list gets a **421** and the page does not
 load at all. That is the failure to expect when a proxy forwards a name the
-validator has not been told about, and the refused name is in the validator log.
+dashboard has not been told about, and the refused name is in its log.
 
 Behind Caddy:
 
 ```caddy
 dashboard.example.com {
-	reverse_proxy 127.0.0.1:10999
+	reverse_proxy 127.0.0.1:11000
 }
 ```
 
@@ -72,13 +79,14 @@ the domain in the site block is the name to allow, and nothing else is needed.
   other validators leading the slots on screen. All of that is already public,
   since every node in the cluster holds it, but serving the page publishes it to
   anyone who can reach it.
-- The Gossip page lists every node this validator hears in gossip, with its
-  stake, client, gossip address, RPC port, start time and advertised snapshot
-  and lowest slots. Every node holds the same table, so none of it is private,
-  but the page gathers it in one place.
+- The Gossip page lists every node in this validator's gossip table, with its
+  stake, client, gossip address and RPC port. Every node holds the
+  same table, so none of it is private, but the page gathers it in one place.
 - The Cluster page totals the cluster's stake by client and by country, and
   names the leaders that skipped most this epoch. All of it is public on chain
   or in gossip.
+- The Accounts page shows the accounts database's caches, storage files, clean
+  and shrink and index, with the accounts paths. None of it is on chain.
 - The machine card shows what is not on chain: the host's memory and the
   validator's share of it, its core count, load, CPU use, governor and swap,
   each disk's device name and fill, the absolute paths of the ledger, accounts
@@ -93,68 +101,92 @@ the domain in the site block is the name to allow, and nothing else is needed.
 
 ### What it costs the validator
 
-The expensive sampling only runs while at least one viewer is connected: on the
-collector, the cluster-wide validator list; on the meters, the `/proc` walks
-behind the host, thread and socket panels. With nobody watching, the collector
-does slot bookkeeping, the meters keep the clock, throughput, network counters
-and the totals lifted from metrics points, and little else runs. A viewer
-connecting finds the throughput and network charts whole; the host, thread and
-socket panels fill from that moment.
+No code of the dashboard runs in the validator, and the validator is started
+with no flag for it but the metrics export. Everything runs in the dashboard's
+own process: the metrics listener, which answers each export at once and parses
+it after, the ledger followed as a RocksDB secondary, RPC reads, and the `/proc`
+walks behind the host, thread and socket panels, which run only while a viewer
+is connected.
 
-What runs whatever the audience, beyond that: a metrics tap that observes the
-datapoints the validator already emits, a listing of the snapshot archive
-directories once a second, a pass over the accounts each frozen block wrote,
-picking out the config program's, which keeps validator names current, and
-under alpenglow a walk of the block footers for their reward certificates and the
-leader's close time, which reads the last two FEC sets of each newly rooted block
-out of the blockstore, at most 64 slots a tick, with or without a seat. Each
-frozen block's entries are also read back for their fee payers, with a status
-cache lookup for each transaction of ours and for each of a followed payer's
-elsewhere: about 1.6 ms a mainnet block on one core. For our own blocks the same
-read keeps the five fee payers and the five transactions that paid the most.
+What it asks of the validator's RPC is the chain's state the ledger does not
+hold, at about 1.3 calls a second: our identity and vote account in one read
+every second, every vote account every five seconds, the gossip table every
+ten. What changes only as an epoch begins is read once an epoch: features, rent,
+the fee, the inflation account, the epoch's start stamp, the leader schedule
+and the rank maps. Slots, transaction counts and the epoch's progress come from
+the ledger and genesis, the block height from the metrics. Two subscriptions
+stay open, to slot updates and, with `--tip-payment-program`, to the eight tip
+accounts. Once a second the ledger reader asks, in one read where it can, for
+the results of the transactions the fee payer card needs in the blocks rooted
+since: every non-vote one of our blocks, and those of the payers it follows in
+other leaders' blocks. `--rpc-url` moves all of it to another node.
 
-The one-off read that maps identities to names runs once, when the collector
-attaches. It asks the secondary index which accounts the config program owns and
-reads only those, so it costs about what any other account load costs, and it is
-skipped entirely on a validator whose index does not cover that program. See
-[Validator names](#validator-names).
+#### Following the ledger
+
+A secondary opens the validator's database read-only beside it. It takes no
+lock and writes nothing into the ledger, but it keeps every file of the ledger
+open, so a dashboard that stopped taking in the validator's writes would hold
+the files the validator has purged since, and the ledger's disk would fill. Only
+the dashboard's process ending frees them, so:
+
+- a pass over the ledger that does not come back within 30 seconds ends the
+  process;
+- three passes that fail in a row, or another validator answering the admin
+  socket, close the ledger and open it again;
+- each second the follower tells systemd it is alive, so a unit with a watchdog
+  ends a process that is stopped whole.
+
+```ini
+[Service]
+ExecStart=/usr/local/bin/agave-dashboard --ledger /path/to/ledger ...
+User=sol
+Restart=always
+WatchdogSec=60
+NotifyAccess=main
+LimitNOFILE=1000000
+```
+
+The secondary holds in memory what the validator has written and not yet
+flushed to its own files, as the validator does.
+
+Validator names are read with `getProgramAccounts` on the config program, once a
+minute, and only where the validator indexes that program by owner (its command
+line has `--account-index program-id`); unindexed, the call would read every
+account. See [Validator names](#validator-names).
 
 ## Architecture
 
 ```
-core/src/validator.rs ──► DashboardService
-                            ├── server thread     (HTTP + websocket on one port)
-                            ├── boot thread       (startup progress until the collector attaches)
-                            ├── collector thread  (samples state at 5Hz, diffs, publishes)
-                            ├── meters thread     (once-a-second readings: TPS, host, network)
-                            └── info loader       (validator names, read once at attach)
+agave-validator -- ledger (RocksDB secondary) ----------------------------+
+                -- metrics export (SOLANA_METRICS_CONFIG), line protocol --+
+                -- JSON-RPC, RPC pubsub, admin socket ----------------------+
+                -- /proc ----------------------------------------------------+
+                                                                             v
+agave-dashboard -- ledger follower (50 ms: first shreds, blocks, footers, roots)
+                |- slot feed       (200 ms tick: slots, blocks, certificates, gossip)
+                |- pollers         (admin socket, RPC, snapshots, names)
+                |- ledger reader   (versions, fee payers)
+                |- meters          (once a second: TPS, host, network, threads)
+                +- server          (HTTP + websocket on one port)
 ```
 
-`context.rs` holds the handles the dashboard reads through. The validator binary
-starts the service before the snapshot download, so the page is up through the
-slowest part of a cold start, and builds the context from the `Validator` once
-`Validator::new` returns. `solana-core` itself changes in two places: the
-config gains two hooks (a list of extra bank notification senders, served by a
-relay thread that copies each of replay's notifications to them and to the
-RPC tracker, and a sender handed gossip and bank forks before the
-supermajority wait), and `Validator` makes three fields public: the block
-commitment cache, the leader schedule cache and the highest finalized
-certificate.
+The dashboard follows one validator at a time and starts over when another
+answers its admin socket. The ledger follower sends the slot feed what the
+ledger gains: each slot's first shred and parent, each block and footer once
+its slot is whole and known frozen, and the confirmed and rooted slots. The
+publisher retains the latest value of every key, so a client connecting late is
+caught up in one shot.
 
-`collect.rs` samples five times a second but publishes only what changed, so an
-idle validator produces almost no websocket traffic. `proto.rs` defines the
-envelope format and the publisher, which retains the latest value of every key
-so a client connecting late is caught up in one shot. `server.rs` routes a
+The feed samples five times a second but publishes only what changed, so an
+idle validator produces almost no websocket traffic. `server.rs` routes a
 connection by peeking at its request head, then either serves an embedded asset
 or hands the untouched socket to soketto.
 
 The SPA lives in `frontend/`. Its `dist` directory is checked in so that a plain
 `cargo build` needs no Node toolchain.
 
-[INPUTS.md](INPUTS.md) lists every validator input the dashboard reads and what
-each one feeds.
-The events it needs from agave's event system are listed in
-[bola-sol/agave-dashboard-events](https://github.com/bola-sol/agave-dashboard-events).
+[INPUTS.md](INPUTS.md) lists every input the dashboard reads and what each one
+feeds.
 
 ## Wire protocol
 
@@ -168,7 +200,7 @@ Topics currently published:
 
 | Topic     | Keys |
 |-----------|------|
-| `summary` | `version`, `client`, `gossip_address`, `cluster`, `consensus`, `shred_version`, `identity_key`, `identity_name`, `identity_icon`, `vote_key`, `startup_time_nanos`, `server_time_nanos`, `uptime_nanos`, `startup_progress`, `gossip_stake`, `caught_up_time_nanos`, `root_slot`, `optimistically_confirmed_slot`, `finalized_slot`, `completed_slot`, `estimated_slot`, `behind_cluster`, `replay_rate`, `block_height`, `next_leader_slot`, `vote_slot`, `identity_balance`, `vote_balance`, `vote_cost`, `vote_commission`, `stake`, `validator_counts`, `versions`, `estimated_slot_duration_nanos`, `observed_slot_duration_nanos`, `finality_from_leader_micros`, `finalization_share`, `block_life`, `handoff`, `handoff_now`, `fee_payers`, `epoch_span`, `epoch_remaining_nanos`, `program_cache`, `accounts_cache`, `replay`, `shreds`, `slot_waterfalls`, `slot_costs`, `quic_paths`, `ingest_paths`, `verify`, `executed`, `produced_blocks`, `produced_block`, `produced_turns`, `bundles`, `tip_rates`, `skip_rate`, `leader_slot_counts`, `health`, `host`, `snapshots`, `tps_history`, `tps_sample`, `network`, `network_sample`, `net_interfaces`, `network_egress`, `xdp`, `turbine`, `threads_history`, `threads_sample`, `bls_key`, `admission`, `vote_credits`, `vote_participation`, `gossip` |
+| `summary` | `version`, `client`, `gossip_address`, `cluster`, `consensus`, `shred_version`, `identity_key`, `identity_name`, `identity_icon`, `vote_key`, `startup_time_nanos`, `server_time_nanos`, `uptime_nanos`, `startup_progress`, `gossip_stake`, `caught_up_time_nanos`, `root_slot`, `optimistically_confirmed_slot`, `finalized_slot`, `completed_slot`, `estimated_slot`, `behind_cluster`, `replay_rate`, `block_height`, `next_leader_slot`, `vote_slot`, `identity_balance`, `vote_balance`, `vote_cost`, `vote_commission`, `stake`, `validator_counts`, `versions`, `estimated_slot_duration_nanos`, `observed_slot_duration_nanos`, `finality_from_leader_micros`, `finalization_share`, `block_life`, `handoff`, `handoff_now`, `fee_payers`, `epoch_span`, `epoch_remaining_nanos`, `program_cache`, `accounts_cache`, `accounts_db`, `replay`, `shreds`, `slot_waterfalls`, `slot_costs`, `quic_paths`, `ingest_paths`, `verify`, `executed`, `produced_blocks`, `produced_block`, `produced_turns`, `bundles`, `tip_rates`, `skip_rate`, `leader_slot_counts`, `health`, `host`, `snapshots`, `tps_history`, `tps_sample`, `network`, `network_sample`, `net_interfaces`, `network_egress`, `xdp`, `turbine`, `threads_history`, `threads_sample`, `bls_key`, `admission`, `vote_credits`, `vote_participation`, `gossip` |
 | `epoch`   | `new` |
 | `peers`   | `all` |
 | `slot`    | `overview`, `update` |
@@ -188,7 +220,7 @@ so the two cover the same interval; its kind, state and routes are read every
 five seconds.
 
 A client can also send a request carrying an `id`, and the reply goes back to
-that `id` alone: `summary.ping`, `summary.displays` for the whole name table,
+that `id` alone: `summary.displays` for the whole name table,
 `summary.misses` for the epoch's unrewarded votes one a row, `summary.written`
 for what this node's own certificates left out per validator, both rebuilt
 every five seconds while either is asked for and once a minute otherwise,
@@ -220,7 +252,7 @@ reports the bytes published per key once a minute.
 ## Building the frontend
 
 `frontend/dist` is committed to the repository, so a normal `cargo build` needs
-no Node toolchain and produces a validator with the UI already inside it. You
+no Node toolchain and produces a dashboard with the UI already inside it. You
 only need the steps below when you change the UI, or when `dist` is missing:
 
 ```bash
@@ -230,7 +262,7 @@ npm test               # pure logic: the bar scale, formatting, the store
 npm run build          # writes dist/, which build.rs embeds
 ```
 
-Then build the validator again and commit the regenerated `dist`. `build.rs`
+Then build the dashboard again and commit the regenerated `dist`. `build.rs`
 watches the directory, so cargo picks the new bundle up on its own.
 
 Because `dist` is committed, a reviewer is otherwise asked to accept a bundle
@@ -254,7 +286,7 @@ server serves a page explaining how to produce the bundle rather than returning
 a 404.
 
 `npm run dev` serves the UI on Vite's dev server and proxies `/websocket` to a
-validator on `127.0.0.1:10999`. This is the fast loop for UI work, since it needs
+dashboard on `127.0.0.1:11000`. This is the fast loop for UI work, since it needs
 no Rust rebuild.
 
 ## Validator names
@@ -268,12 +300,13 @@ generates a fresh keypair for it, so there is no address to compute from a
 validator's pubkey and the only way to find these accounts is to search by
 owner.
 
-That search is affordable against the secondary index and ruinous without it.
-Unindexed, the same call reads every account on the validator off disk to check
-one field, which on a mainnet node means hundreds of gigabytes and does not
-finish in any useful time. The dashboard therefore checks for the index and
-skips the search when it is absent, which is why an ordinary validator shows
-pubkeys.
+That search, RPC's `getProgramAccounts`, is affordable against the secondary
+index and ruinous without it. Unindexed, the same call reads every account on
+the validator off disk to check one field, which on a mainnet node means
+hundreds of gigabytes and does not finish in any useful time. The dashboard
+therefore reads the validator's command line for the index and skips the search
+when it is absent, which is why an ordinary validator shows pubkeys. RPC must
+serve the full API (`--full-rpc-api`).
 
 To show names instead, start the validator with:
 

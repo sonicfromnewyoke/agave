@@ -24,7 +24,7 @@ fn main() {
         // Say so during the build. Otherwise the first sign of a missing bundle
         // is the placeholder page, long after the build looked like it worked.
         println!(
-            "cargo:warning=agave-dashboard: frontend/dist is empty or missing, so the validator \
+            "cargo:warning=agave-dashboard: frontend/dist is empty or missing, so the dashboard \
              will serve a placeholder page. Run `npm install && npm run build` in \
              dashboard/frontend, then build again."
         );

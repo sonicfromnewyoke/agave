@@ -1,23 +1,19 @@
-//! Validator display names from on-chain `ValidatorInfo` config accounts,
-//! found by owner through the secondary index and kept current from each
-//! slot's writes. Without the index the dashboard shows pubkeys.
+//! Validator display names from on-chain `ValidatorInfo` config accounts, read whole off RPC.
+//! Without the validator's index of the config program the dashboard shows pubkeys.
 
 use {
+    crate::collect::json_or_null,
     serde::{Deserialize, Serialize},
-    solana_account::ReadableAccount,
-    solana_accounts_db::accounts_index::IndexKey,
-    solana_clock::Slot,
-    solana_config_interface::state::{ConfigKeys, get_config_data},
+    solana_account_decoder::{
+        parse_config::{ConfigAccountType, parse_config},
+        validator_info,
+    },
     solana_pubkey::Pubkey,
-    solana_runtime::bank::Bank,
     std::{
-        collections::{HashMap, hash_map::Entry},
+        collections::HashMap,
         sync::{Arc, OnceLock},
     },
 };
-
-const VALIDATOR_INFO_PROGRAM: Pubkey =
-    Pubkey::from_str_const("Va1idator1nfo111111111111111111111111111111");
 
 const MAX_VALIDATOR_INFO_LEN: usize = 576 + 1 + (32 + 1) * 2;
 
@@ -38,237 +34,86 @@ pub struct Displays {
 
 #[derive(Debug, Default)]
 pub struct ValidatorInfoCache {
-    /// Each entry with the slot it was read at.
-    by_identity: HashMap<Pubkey, (Slot, ValidatorInfo)>,
-    /// `displays` as JSON, made on the first request after an entry changes.
+    by_identity: HashMap<Pubkey, ValidatorInfo>,
+    /// `displays` as JSON, made on the first request after the table changes.
     displays_json: OnceLock<Arc<str>>,
 }
 
 impl ValidatorInfoCache {
     pub fn get(&self, identity: &Pubkey) -> Option<&ValidatorInfo> {
-        self.by_identity.get(identity).map(|(_, info)| info)
+        self.by_identity.get(identity)
     }
 
     pub fn displays(&self) -> Displays {
-        let mut keys = Vec::with_capacity(self.by_identity.len());
-        let mut names = Vec::with_capacity(self.by_identity.len());
-        let mut icons = Vec::with_capacity(self.by_identity.len());
-        for (identity, (_, info)) in &self.by_identity {
-            if info.name.is_none() && info.icon_url.is_none() {
-                continue;
-            }
-            keys.push(identity.to_string());
-            names.push(info.name.clone());
-            icons.push(info.icon_url.clone());
-        }
+        let (keys, (names, icons)) = self
+            .by_identity
+            .iter()
+            .filter(|(_, info)| info.name.is_some() || info.icon_url.is_some())
+            .map(|(key, info)| (key.to_string(), (info.name.clone(), info.icon_url.clone())))
+            .unzip();
         Displays { keys, names, icons }
     }
 
-    /// The `summary.displays` value, encoded once and shared until an entry changes.
+    /// The `summary.displays` value, encoded once and shared until the table changes.
     pub fn displays_json(&self) -> Arc<str> {
-        Arc::clone(self.displays_json.get_or_init(|| {
-            match serde_json::to_string(&self.displays()) {
-                Ok(json) => Arc::from(json),
-                Err(err) => {
-                    log::error!("dashboard: failed to encode the display table: {err}");
-                    Arc::from("null")
-                }
-            }
-        }))
+        Arc::clone(
+            self.displays_json
+                .get_or_init(|| json_or_null(&self.displays())),
+        )
     }
 
-    /// A read from an older slot than the one held is ignored.
-    pub fn insert(&mut self, identity: Pubkey, slot: Slot, info: ValidatorInfo) -> bool {
-        match self.by_identity.entry(identity) {
-            Entry::Vacant(entry) => {
-                entry.insert((slot, info));
-            }
-            Entry::Occupied(mut entry) => {
-                let (held_slot, held) = entry.get_mut();
-                if slot < *held_slot {
-                    return false;
-                }
-                *held_slot = slot;
-                if *held == info {
-                    return false;
-                }
-                *held = info;
-            }
+    /// The table as one read of the config program's accounts gives it.
+    pub fn replace(&mut self, by_identity: HashMap<Pubkey, ValidatorInfo>) {
+        if self.by_identity != by_identity {
+            self.by_identity = by_identity;
+            self.displays_json = OnceLock::new();
         }
-        self.displays_json = OnceLock::new();
-        true
-    }
-
-    /// Separate from the scan so the lock is held only for the merge. `slot` is the scanned bank's.
-    pub fn merge(&mut self, slot: Slot, entries: Vec<(Pubkey, ValidatorInfo)>) -> usize {
-        entries
-            .into_iter()
-            .map(|(identity, info)| self.insert(identity, slot, info))
-            .filter(|changed| *changed)
-            .count()
     }
 }
 
-pub fn scan_slot(bank: &Bank) -> Vec<(Pubkey, ValidatorInfo)> {
-    bank.get_program_accounts_modified_since_parent(&solana_sdk_ids::config::id())
-        .into_iter()
-        .filter_map(|(_pubkey, account)| parse(account.data()))
-        .collect()
-}
-
-/// Minutes on a real cluster: run off-thread with no lock held.
-pub fn scan_all(bank: &Bank) -> Vec<(Pubkey, ValidatorInfo)> {
-    let config_id = solana_sdk_ids::config::id();
-
-    // Without the config program in the index, the indexed call reads every account on the
-    // validator, which takes hours and cannot be interrupted.
-    if !bank.account_indexes_include_key(&config_id) {
-        log::info!(
-            "dashboard: the config program is excluded from the account index, so validator names \
-             are unavailable and the dashboard will show pubkeys"
-        );
-        return Vec::new();
-    }
-
-    let accounts = match bank.get_filtered_indexed_accounts(
-        &IndexKey::ProgramId(config_id),
-        |account| account.owner() == &config_id,
-        None,
-    ) {
-        Ok(accounts) => accounts,
-        Err(err) => {
-            log::warn!("dashboard: could not read validator info accounts: {err}");
-            return Vec::new();
-        }
-    };
-
-    // An empty result on a live cluster means the index is not switched on: an
-    // index never built answers none rather than failing.
-    if accounts.is_empty() {
-        log::info!(
-            "dashboard: found no validator info accounts. Start the validator with \
-             --account-index program-id --account-index-include-key {config_id} to show validator \
-             names instead of pubkeys"
-        );
-    }
-
-    accounts
-        .into_iter()
-        .filter_map(|(_pubkey, account)| parse(account.data()))
-        .collect()
-}
-
-fn parse(data: &[u8]) -> Option<(Pubkey, ValidatorInfo)> {
+/// Keyed on the identity that signed for the account, its second key.
+pub fn parse(data: &[u8]) -> Option<(Pubkey, ValidatorInfo)> {
     if data.len() > MAX_VALIDATOR_INFO_LEN {
         return None;
     }
-    let keys = bincode::deserialize::<ConfigKeys>(data).ok()?;
-    // The first key marks the account type; the second is the identity that
-    // signed for it, which is what we key the cache on.
-    if keys.keys.first()?.0 != VALIDATOR_INFO_PROGRAM {
-        return None;
-    }
-    let identity = keys.keys.get(1)?.0;
-
-    let json = bincode::deserialize::<String>(get_config_data(data).ok()?).ok()?;
-    let info = serde_json::from_str::<ValidatorInfo>(&json).ok()?;
-    Some((identity, info))
-}
-
-#[cfg(test)]
-fn encode(keys: Vec<(Pubkey, bool)>, json: &str) -> Vec<u8> {
-    let mut data = bincode::serialize(&ConfigKeys { keys }).unwrap();
-    data.extend(bincode::serialize(&json.to_string()).unwrap());
-    data
-}
-
-/// A validator info account naming `identity`, for tests elsewhere too.
-#[cfg(test)]
-pub(crate) fn info_account(identity: Pubkey, json: &str) -> solana_account::AccountSharedData {
-    solana_account::AccountSharedData::from(solana_account::Account {
-        lamports: 1,
-        data: encode(
-            vec![(VALIDATOR_INFO_PROGRAM, false), (identity, true)],
-            json,
-        ),
-        owner: solana_sdk_ids::config::id(),
-        executable: false,
-        rent_epoch: 0,
-    })
+    // The account's own key goes unread.
+    let ConfigAccountType::ValidatorInfo(config) =
+        parse_config(data, &validator_info::id()).ok()?;
+    let identity = config.keys.get(1)?.pubkey.parse().ok()?;
+    Some((identity, serde_json::from_value(config.config_data).ok()?))
 }
 
 #[cfg(test)]
 mod tests {
-    use {super::*, crate::fixture::fixture};
+    use {super::*, solana_config_interface::state::ConfigKeys};
 
-    #[test]
-    fn test_the_slot_sweep_finds_info_written_in_that_slot() {
-        let harness = fixture();
-        let identity = Pubkey::new_unique();
-        let bank = harness.advance_with(
-            1,
-            &[(
-                Pubkey::new_unique(),
-                info_account(identity, r#"{"name":"Lantern"}"#),
-            )],
-        );
-
-        let found = scan_slot(&bank);
-        assert_eq!(found.len(), 1);
-        assert_eq!(found[0].0, identity);
-        assert_eq!(found[0].1.name.as_deref(), Some("Lantern"));
+    fn encode(keys: Vec<(Pubkey, bool)>, json: &str) -> Vec<u8> {
+        let mut data = bincode::serialize(&ConfigKeys { keys }).unwrap();
+        data.extend(bincode::serialize(&json.to_string()).unwrap());
+        data
     }
 
-    #[test]
-    fn test_the_slot_sweep_ignores_slots_that_wrote_nothing() {
-        let harness = fixture();
-        harness.advance_with(
-            1,
-            &[(
-                Pubkey::new_unique(),
-                info_account(Pubkey::new_unique(), r#"{"name":"Lantern"}"#),
-            )],
-        );
-        let later = harness.advance_to(2);
-
-        assert!(
-            scan_slot(&later).is_empty(),
-            "a slot's sweep must cover its own writes only"
-        );
-    }
-
-    #[test]
-    fn test_the_full_scan_finds_info_from_an_earlier_slot() {
-        let harness = fixture();
-        let identity = Pubkey::new_unique();
-        harness.advance_with(
-            1,
-            &[(
-                Pubkey::new_unique(),
-                info_account(identity, r#"{"name":"Lantern"}"#),
-            )],
-        );
-        let later = harness.advance_to(2);
-
-        let found = scan_all(&later);
-        assert_eq!(found.len(), 1, "the scan should reach back past this slot");
-        assert_eq!(found[0].0, identity);
-    }
-
-    #[test]
-    fn test_merging_reports_only_what_changed() {
-        let mut cache = ValidatorInfoCache::default();
-
-        let identity = Pubkey::new_unique();
-        let info = ValidatorInfo {
-            name: Some("Lantern".into()),
+    fn named(name: &str) -> ValidatorInfo {
+        ValidatorInfo {
+            name: Some(name.into()),
             icon_url: None,
-        };
-        assert_eq!(cache.merge(1, vec![(identity, info.clone())]), 1);
-        assert_eq!(cache.merge(1, vec![(identity, info)]), 0, "nothing changed");
+        }
+    }
+
+    #[test]
+    fn test_each_read_replaces_the_table() {
+        let mut cache = ValidatorInfoCache::default();
+        let (identity, other) = (Pubkey::new_unique(), Pubkey::new_unique());
+        cache.replace(HashMap::from([(identity, named("Lantern"))]));
         assert_eq!(
             cache.get(&identity).and_then(|info| info.name.as_deref()),
             Some("Lantern")
+        );
+        cache.replace(HashMap::from([(other, named("Beacon"))]));
+        assert_eq!(cache.get(&identity), None, "an account gone takes its name");
+        assert_eq!(
+            cache.get(&other).and_then(|info| info.name.as_deref()),
+            Some("Beacon")
         );
     }
 
@@ -276,7 +121,7 @@ mod tests {
     fn test_parses_a_validator_info_account() {
         let identity = Pubkey::new_unique();
         let data = encode(
-            vec![(VALIDATOR_INFO_PROGRAM, false), (identity, true)],
+            vec![(validator_info::id(), false), (identity, true)],
             r#"{"name":"Lantern","iconUrl":"https://example.com/i.png"}"#,
         );
         let (parsed_identity, info) = parse(&data).unwrap();
@@ -291,7 +136,7 @@ mod tests {
         // lose its name too.
         let identity = Pubkey::new_unique();
         let data = encode(
-            vec![(VALIDATOR_INFO_PROGRAM, false), (identity, true)],
+            vec![(validator_info::id(), false), (identity, true)],
             r#"{"name":"Lantern","website":"https://example.com","details":"hi",
                 "keybaseUsername":"lantern"}"#,
         );
@@ -316,58 +161,28 @@ mod tests {
     }
 
     #[test]
-    fn test_an_older_read_does_not_replace_a_newer_one() {
+    fn test_the_encoded_table_is_kept_until_the_table_changes() {
         let mut cache = ValidatorInfoCache::default();
         let identity = Pubkey::new_unique();
-        let named = |name: &str| ValidatorInfo {
-            name: Some(name.into()),
-            icon_url: None,
-        };
-        let held =
-            |cache: &ValidatorInfoCache| cache.get(&identity).and_then(|info| info.name.clone());
-
-        assert_eq!(cache.merge(10, vec![(identity, named("New"))]), 1);
-        assert_eq!(
-            cache.merge(5, vec![(identity, named("Old"))]),
-            0,
-            "a scan of an older bank finishing late must not revert the name"
-        );
-        assert_eq!(held(&cache).as_deref(), Some("New"));
-
-        assert_eq!(cache.merge(12, vec![(identity, named("Newer"))]), 1);
-        assert_eq!(held(&cache).as_deref(), Some("Newer"));
-
-        // An unchanged read still moves the entry's slot forward.
-        assert_eq!(cache.merge(20, vec![(identity, named("Newer"))]), 0);
-        assert_eq!(cache.merge(15, vec![(identity, named("Older"))]), 0);
-        assert_eq!(held(&cache).as_deref(), Some("Newer"));
-    }
-
-    #[test]
-    fn test_the_encoded_table_is_kept_until_an_entry_changes() {
-        let mut cache = ValidatorInfoCache::default();
-        let identity = Pubkey::new_unique();
-        let named = |name: &str| ValidatorInfo {
-            name: Some(name.into()),
-            icon_url: None,
-        };
         let fresh = |cache: &ValidatorInfoCache| serde_json::to_string(&cache.displays()).unwrap();
 
         assert_eq!(&*cache.displays_json(), fresh(&cache).as_str());
-        cache.insert(identity, 10, named("Lantern"));
+        cache.replace(HashMap::from([(identity, named("Lantern"))]));
         let held = cache.displays_json();
         assert_eq!(&*held, fresh(&cache).as_str());
 
-        // Reads that change nothing shown keep the encoding.
-        cache.insert(identity, 12, named("Lantern"));
-        cache.insert(identity, 5, named("Old"));
+        // A read that changes nothing keeps the encoding.
+        cache.replace(HashMap::from([(identity, named("Lantern"))]));
         assert!(Arc::ptr_eq(&held, &cache.displays_json()));
 
-        cache.insert(identity, 14, named("Beacon"));
+        cache.replace(HashMap::from([(identity, named("Beacon"))]));
         assert_eq!(&*cache.displays_json(), fresh(&cache).as_str());
         assert!(cache.displays_json().contains("Beacon"));
 
-        cache.insert(Pubkey::new_unique(), 14, named("Harbour"));
+        cache.replace(HashMap::from([
+            (identity, named("Beacon")),
+            (Pubkey::new_unique(), named("Harbour")),
+        ]));
         assert_eq!(&*cache.displays_json(), fresh(&cache).as_str());
         assert!(cache.displays_json().contains("Harbour"));
     }

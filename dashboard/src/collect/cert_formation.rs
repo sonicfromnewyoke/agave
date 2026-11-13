@@ -3,13 +3,18 @@
 //! reported. Weighted by that epoch's rank map, the stake the certificates count against.
 
 use {
-    super::Collector,
     crate::metrics_tap::VoteArrival,
+    agave_votor_messages::{
+        certificate::CertificateType, consensus_message::Block, fraction::Fraction,
+    },
     serde::Serialize,
     solana_clock::Epoch,
     solana_pubkey::Pubkey,
-    solana_runtime::bank::Bank,
-    std::collections::{BTreeMap, HashMap},
+    solana_runtime::epoch_stakes::BLSPubkeyToRankMap,
+    std::{
+        collections::{BTreeMap, HashMap},
+        num::NonZeroU64,
+    },
 };
 
 /// The curves run from the slot's start to this many milliseconds.
@@ -18,32 +23,28 @@ pub(crate) const CURVE_MILLIS: u64 = 480;
 /// Shares are sent in hundredths of a percent.
 const SHARE_SCALE: u128 = 10_000;
 
-const NOTARIZED_PERCENT: u128 = 60;
-const FAST_FINAL_PERCENT: u128 = 80;
-const SECOND_ROUND_PERCENT: u128 = 60;
-
 /// What a published formation was built from: the epoch, its slot time and its path counts.
-pub(super) type FormationKey = (Epoch, Option<u64>, Option<(u64, u64)>);
+pub type FormationKey = (Epoch, Option<u64>, Option<(u64, u64)>);
 
 /// The epoch votor reports can trail the current one by two.
 const PATH_EPOCHS_HELD: usize = 3;
 
 /// Finalized slots per epoch, by the certificate votor tracked as finalizing them.
 #[derive(Debug, Default)]
-pub(super) struct FinalizedPaths {
+pub struct FinalizedPaths {
     /// Fast, then second round.
     by_epoch: BTreeMap<Epoch, (u64, u64)>,
 }
 
 impl FinalizedPaths {
-    fn note(&mut self, epoch: Epoch, fast: bool) {
+    pub fn note(&mut self, epoch: Epoch, fast: bool) {
         let (fast_slots, second_slots) = self.by_epoch.entry(epoch).or_default();
         let count = if fast { fast_slots } else { second_slots };
         *count = count.saturating_add(1);
         crate::metrics_tap::keep_newest(&mut self.by_epoch, PATH_EPOCHS_HELD);
     }
 
-    fn counts(&self, epoch: Epoch) -> Option<(u64, u64)> {
+    pub fn counts(&self, epoch: Epoch) -> Option<(u64, u64)> {
         self.by_epoch.get(&epoch).copied()
     }
 }
@@ -105,13 +106,13 @@ fn curve(arrivals: &[(u64, u64)], total: u128) -> Vec<u16> {
     points
 }
 
-/// When the arrived stake first reaches `percent` of the total, in rounded milliseconds.
-fn crossing(arrivals: &[(u64, u64)], total: u128, percent: u128) -> Option<u64> {
-    let needed = total.saturating_mul(percent);
-    let mut held: u128 = 0;
+/// When the arrived stake first reaches `threshold` of the total, in rounded milliseconds.
+fn crossing(arrivals: &[(u64, u64)], total: u64, threshold: Fraction) -> Option<u64> {
+    let total = NonZeroU64::new(total)?;
+    let mut held = 0u64;
     arrivals.iter().find_map(|(micros, stake)| {
-        held = held.saturating_add(u128::from(*stake));
-        (held.saturating_mul(100) >= needed)
+        held = held.saturating_add(*stake);
+        (Fraction::new(held, total) >= threshold)
             .then(|| micros.saturating_add(500).checked_div(1_000))
             .flatten()
     })
@@ -125,6 +126,7 @@ fn formation(
     votes: &[(u64, Option<u64>, Option<u64>)],
     slot_nanos: Option<u64>,
     slots: Option<u64>,
+    paths: Option<(u64, u64)>,
 ) -> Option<CertFormation> {
     let total = u128::from(total_stake);
     let notarize = sorted_arrivals(votes.iter().map(|(stake, n, _)| (*stake, *n)));
@@ -138,6 +140,10 @@ fn formation(
             total,
         )
     };
+    let block = Block::default();
+    let reaches = |arrivals: &[(u64, u64)], certificate: CertificateType| {
+        crossing(arrivals, total_stake, certificate.threshold())
+    };
     Some(CertFormation {
         epoch,
         slot_nanos,
@@ -145,62 +151,25 @@ fn formation(
         finalize: curve(&finalize, total),
         notarize_total: measured(&notarize),
         finalize_total: measured(&finalize),
-        notarized_millis: crossing(&notarize, total, NOTARIZED_PERCENT),
-        fast_final_millis: crossing(&notarize, total, FAST_FINAL_PERCENT),
-        second_round_millis: crossing(&finalize, total, SECOND_ROUND_PERCENT),
+        notarized_millis: reaches(&notarize, CertificateType::Notarize(block)),
+        fast_final_millis: reaches(&notarize, CertificateType::FinalizeFast(block)),
+        second_round_millis: reaches(&finalize, CertificateType::Finalize(block.slot)),
         slots,
-        fast_slots: None,
-        second_round_slots: None,
+        fast_slots: paths.map(|(fast, _)| fast),
+        second_round_slots: paths.map(|(_, second)| second),
     })
 }
 
-impl Collector {
-    /// Read every tick, so a page left closed loses no slot.
-    pub(super) fn collect_finalized_paths(&mut self, root_bank: &Bank) {
-        let schedule = root_bank.epoch_schedule();
-        for (slot, fast) in self.metrics_tap.take_finalized_paths() {
-            self.finalized_paths.note(schedule.get_epoch(slot), fast);
-        }
-    }
-
-    /// Rebuilt only when votor reports a new epoch, or that epoch's slot time or path counts move.
-    pub(super) fn collect_cert_formation(&mut self, bank: &Bank) {
-        let Some(epoch) = self.metrics_tap.vote_arrival_epoch() else {
-            return;
-        };
-        let slot_nanos = self.clock.epoch_mean_nanos(epoch);
-        let paths = self.finalized_paths.counts(epoch);
-        if self.cert_formation_for == Some((epoch, slot_nanos, paths)) {
-            return;
-        }
-        let (held, arrivals) = self.metrics_tap.vote_arrivals();
-        // A newer epoch arrived between the two reads; the next tick builds it.
-        if held != Some(epoch) {
-            return;
-        }
-        self.cert_formation_for = Some((epoch, slot_nanos, paths));
-        let formation =
-            cert_formation(bank, epoch, &arrivals, slot_nanos).map(|formation| CertFormation {
-                fast_slots: paths.map(|(fast, _)| fast),
-                second_round_slots: paths.map(|(_, second)| second),
-                ..formation
-            });
-        self.debounces
-            .cert_formation
-            .publish(&self.publisher, formation);
-    }
-}
-
-fn cert_formation(
-    bank: &Bank,
+/// From the epoch's rank map, votor's arrivals by vote account, this node's slot time and the
+/// epoch's finalized paths, fast then second round.
+pub fn cert_formation(
+    rank_map: &BLSPubkeyToRankMap,
     epoch: Epoch,
     arrivals: &HashMap<Pubkey, VoteArrival>,
     slot_nanos: Option<u64>,
+    paths: Option<(u64, u64)>,
 ) -> Option<CertFormation> {
-    let first_slot = bank.epoch_schedule().get_first_slot_in_epoch(epoch);
-    let rank_map = bank.get_rank_map(first_slot)?;
-    let ranked: Vec<(u64, Option<&VoteArrival>)> = (0..rank_map.len())
-        .filter_map(|rank| rank_map.get_pubkey_stake_entry(rank))
+    let ranked: Vec<(u64, Option<&VoteArrival>)> = crate::certs::rank_entries(rank_map)
         .map(|entry| (entry.stake.get(), arrivals.get(&entry.vote_account_pubkey)))
         .collect();
     let votes: Vec<(u64, Option<u64>, Option<u64>)> = ranked
@@ -223,6 +192,7 @@ fn cert_formation(
         &votes,
         slot_nanos,
         slots,
+        paths,
     )
 }
 
@@ -258,9 +228,10 @@ mod tests {
             ]
             .into_iter(),
         );
-        assert_eq!(crossing(&arrivals, 100, 60), Some(291));
-        assert_eq!(crossing(&arrivals, 100, 50), Some(280));
-        assert_eq!(crossing(&arrivals, 200, 60), None);
+        let percent = Fraction::from_percentage;
+        assert_eq!(crossing(&arrivals, 100, percent(60)), Some(291));
+        assert_eq!(crossing(&arrivals, 100, percent(50)), Some(280));
+        assert_eq!(crossing(&arrivals, 200, percent(60)), None);
     }
 
     #[test]
@@ -271,7 +242,7 @@ mod tests {
             (20, Some(600_000), Some(700_000)),
             (10, None, None),
         ];
-        let built = formation(1_063, 100, &votes, Some(222_000_000), Some(12_700)).unwrap();
+        let built = formation(1_063, 100, &votes, Some(222_000_000), Some(12_700), None).unwrap();
         // Late votes count toward the totals but not the curves.
         assert_eq!(built.notarize_total, 9_000);
         assert_eq!(built.notarize[480], 7_000);
@@ -299,15 +270,14 @@ mod tests {
         assert_eq!(paths.counts(20), None, "four epochs held is one too many");
         assert_eq!(paths.counts(23), Some((0, 1)));
     }
-
     #[test]
     fn test_nothing_without_a_notarize_vote() {
         assert_eq!(
-            formation(1, 100, &[(100, None, Some(300_000))], None, None),
+            formation(1, 100, &[(100, None, Some(300_000))], None, None, None),
             None
         );
         assert_eq!(
-            formation(1, 0, &[(0, Some(300_000), None)], None, None),
+            formation(1, 0, &[(0, Some(300_000), None)], None, None, None),
             None
         );
     }

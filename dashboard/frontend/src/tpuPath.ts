@@ -359,9 +359,7 @@ const LOAD_REASONS: Array<[key: string, label: string, field: keyof ExecutedStag
   ["exec_account_missing", "account not found", "account_missing"],
   ["exec_too_many_locks", "too many account locks", "too_many_locks"],
   ["exec_bad_compute_budget", "compute budget", "bad_compute_budget"],
-  ["exec_account_data_too_large", "account data too large", "account_data_too_large"],
   ["exec_program_not_executable", "program not executable", "program_not_executable"],
-  ["exec_program_restricted", "program restricted", "program_restricted"],
 ];
 
 function executedDetail(

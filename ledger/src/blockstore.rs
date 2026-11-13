@@ -5652,6 +5652,11 @@ impl Blockstore {
         self.db.is_primary_access()
     }
 
+    /// For a [`AccessType::Secondary`] instance, takes in what the primary has written since.
+    pub fn try_catch_up_with_primary(&self) -> Result<()> {
+        self.db.try_catch_up_with_primary()
+    }
+
     /// Scan for any ancestors of the supplied `start_root` that are not
     /// marked as roots themselves. Mark any found slots as roots since
     /// the ancestor of a root is also inherently a root. Returns the

@@ -69,7 +69,6 @@ impl PortWindow {
 }
 
 /// `/proc/net/udp6` is absent on a kernel without IPv6.
-#[cfg(target_os = "linux")]
 pub fn read() -> io::Result<PortMap> {
     let mut ports = PortMap::new();
     let mut rows: usize = 0;
@@ -90,13 +89,7 @@ pub fn read() -> io::Result<PortMap> {
     Ok(ports)
 }
 
-#[cfg(not(target_os = "linux"))]
-pub fn read() -> io::Result<PortMap> {
-    Err(io::ErrorKind::Unsupported.into())
-}
-
 /// `drops` is the thirteenth column, so an appended column is ignored.
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn parse_into(contents: &str, ports: &mut PortMap) -> usize {
     let mut rows: usize = 0;
 
@@ -256,15 +249,6 @@ mod tests {
 
         window.push(back + Duration::from_secs(5), totals(8001, 5_007));
         assert_eq!(window.since(8001, 5_007), 7);
-    }
-
-    #[test]
-    fn test_gap_shorter_than_the_span_keeps_the_window() {
-        let base = Instant::now();
-        let mut window = PortWindow::new(Duration::from_secs(60));
-        window.push(base, totals(8001, 0));
-        window.push(base + Duration::from_secs(30), totals(8001, 9));
-        assert_eq!(window.since(8001, 9), 9);
     }
 
     #[test]

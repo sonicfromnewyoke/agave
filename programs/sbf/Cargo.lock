@@ -117,54 +117,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "agave-dashboard"
-version = "4.4.1"
-dependencies = [
- "agave-feature-set",
- "agave-snapshots",
- "agave-votor-messages",
- "bincode",
- "crossbeam-channel",
- "flate2",
- "log",
- "nix",
- "serde",
- "serde_json",
- "socket2 0.6.5",
- "soketto",
- "solana-account",
- "solana-accounts-db",
- "solana-clock 4.0.0",
- "solana-cluster-type",
- "solana-compute-budget-instruction",
- "solana-config-interface",
- "solana-core",
- "solana-entry",
- "solana-gossip",
- "solana-leader-schedule",
- "solana-ledger",
- "solana-message",
- "solana-metrics",
- "solana-program-runtime",
- "solana-pubkey 4.3.0",
- "solana-rpc",
- "solana-rpc-client-types",
- "solana-runtime",
- "solana-sdk-ids",
- "solana-signer-store",
- "solana-slot-history",
- "solana-svm-transaction",
- "solana-time-utils",
- "solana-transaction",
- "solana-version",
- "solana-vote",
- "solana-vote-interface 7.0.0",
- "thiserror 2.0.20",
- "tokio",
- "tokio-util 0.7.19",
-]
-
-[[package]]
 name = "agave-feature-set"
 version = "4.4.1"
 dependencies = [
@@ -373,7 +325,6 @@ name = "agave-validator"
 version = "4.4.1"
 dependencies = [
  "agave-cpu-utils",
- "agave-dashboard",
  "agave-feature-set",
  "agave-logger",
  "agave-snapshots",

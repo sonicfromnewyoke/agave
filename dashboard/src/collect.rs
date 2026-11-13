@@ -3,90 +3,49 @@
 
 use {
     crate::{
-        certs,
-        context::{DashboardContext, StartProgress},
-        geoip,
-        history::SlotHistory,
-        meters::QuicPort,
-        metrics_tap::{
-            BundleLanding, MetricsTap, ShredFill, SlotCost, StageTimes, TapCounters,
-            WindowedCounters, WorkerSum,
-        },
-        produced::{
-            Bundles, CostDetail, Execution, ProducedBlock, ProducedDetail, ProducedStore, held_from,
-        },
-        proto::{Debounced, Publisher, TOPIC_EPOCH, TOPIC_PEERS, TOPIC_SLOT, TOPIC_SUMMARY},
-        search::{LeaderMap, LeaderTraits},
-        slots::{BlockDetail, ShredArrival, SlotEntry, SlotLevel, SlotRing},
-        snapshot::{self, SnapshotTracker, Snapshots},
-        startup::StartupPublisher,
-        tips::{TipMeter, TipRates},
-        turns::{LeaderTurn, TurnTracker},
-        validator_info::{self, ValidatorInfoCache},
-        versions,
+        metrics_tap::{MetricsTap, ShredFill, SlotCost, StageTimes, WorkerSum},
+        produced::{CostDetail, Execution, ProducedDetail, ProducedStore},
+        search::LeaderMap,
+        slots::{ShredArrival, SlotLevel},
     },
     serde::Serialize,
     solana_clock::{Epoch, Slot},
-    solana_gossip::{cluster_info::ClusterInfo, contact_info::ContactInfo},
-    solana_leader_schedule::NUM_CONSECUTIVE_LEADER_SLOTS,
-    solana_ledger::blockstore::Blockstore,
+    solana_cluster_type::ClusterType,
     solana_pubkey::Pubkey,
-    solana_rpc::optimistically_confirmed_bank_tracker::{
-        BankNotification, BankNotificationReceiver,
-    },
     solana_rpc_client_types::request::DELINQUENT_VALIDATOR_SLOT_DISTANCE,
-    solana_runtime::bank::{Bank, VATHealthError},
-    solana_time_utils::timestamp,
-    solana_vote_interface::state::VoteStateV4,
     std::{
-        collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque},
+        cmp::Ordering,
+        collections::{HashMap, HashSet, VecDeque},
+        hash::Hash,
         sync::{
-            Arc, Mutex, RwLock,
-            atomic::{AtomicU64, Ordering},
+            Arc, RwLock,
+            atomic::{self, AtomicU64},
         },
         time::{Duration, Instant, SystemTime, UNIX_EPOCH},
     },
 };
 
-mod block_life;
-mod cert_formation;
-mod certificates;
-mod cluster_charts;
-mod earnings;
-mod fee_payers;
-mod finalization;
-mod gossip_peers;
-mod handoff;
-mod skip_rate;
-mod slot_clock;
+pub mod block_life;
+pub mod cert_formation;
+pub mod certificates;
+pub mod cluster_charts;
+pub mod earnings;
+pub mod fee_payers;
+pub mod finalization;
+pub mod gossip_peers;
+pub mod handoff;
+pub mod skip_rate;
+pub mod slot_clock;
 
+use self::certificates::LastVotes;
 pub(crate) use self::slot_clock::CATCH_UP_SLOTS_PER_SECOND;
-use self::{
-    block_life::{BlockLifeSummary, BlockLives},
-    cert_formation::{CertFormation, FinalizedPaths, FormationKey},
-    certificates::{CertificateWalk, Contacts, GossipEntry, LastVotes},
-    earnings::{EarningsWalk, EpochEarnings},
-    fee_payers::{FeePayerSummary, FeePayers},
-    finalization::{FinalizationShare, FinalizationTally},
-    handoff::{HandoffNow, HandoffSummary, Handoffs},
-    skip_rate::{LeaderSlotCounts, SkipRateWalk},
-    slot_clock::SlotClock,
-};
-pub use self::{
-    certificates::{
-        MissList, MissReplies, MissRow, MissValidator, MissWriter, WrittenList, WrittenRow,
-    },
-    gossip_peers::GossipPeers,
-    handoff::LeaderFigures,
-};
-
-const SLOW_TICK: Duration = Duration::from_secs(5);
+pub use self::{certificates::MissReplies, handoff::LeaderFigures};
 
 /// How long after the last request an on-demand reply is still gathered.
-const WANTED_FOR_MILLIS: u64 = 30_000;
+pub const WANTED_FOR_MILLIS: u64 = 30_000;
 
 /// A reply encoded for the server to hold.
-fn json_or_null<T: Serialize>(value: &T) -> Arc<str> {
+pub fn json_or_null<T: Serialize>(value: &T) -> Arc<str> {
     match serde_json::to_string(value) {
         Ok(json) => Arc::from(json),
         Err(err) => {
@@ -95,37 +54,65 @@ fn json_or_null<T: Serialize>(value: &T) -> Arc<str> {
         }
     }
 }
-/// Stakes and gossip versions move slowly; the schedule's leader conditions read them.
-const LEADER_TRAITS_EVERY: Duration = Duration::from_secs(10);
 
 /// The tip counts the slot still arriving, so a node in step reads a slot or two behind it.
-const IN_STEP_SLOTS: u64 = 4;
+pub const IN_STEP_SLOTS: u64 = 4;
 /// Parents walked down from the tip before the rest of the distance is counted in slots.
-const BEHIND_WALK_BLOCKS: u64 = 32;
-const SNAPSHOT_READ: Duration = Duration::from_secs(1);
+pub const BEHIND_WALK_BLOCKS: u64 = 32;
 
-/// Replies to requests, encoded by the collector and handed out by the server as they stand.
+/// Replies to requests, encoded by the slot feed and handed out by the server as they stand.
+#[derive(Default)]
 pub struct Replies {
-    pub misses: RwLock<MissReplies>,
-    /// Written by the collector; the server pages through it for the slot details page.
+    /// The miss and written lists, rebuilt every slow tick while asked for.
+    pub misses: OnDemand<MissReplies>,
+    /// Written by the slot feed; the server pages through it for the slot details page.
     pub produced: RwLock<ProducedStore>,
     /// For the waterfall and costs of a slot asked about.
     pub tap: Arc<MetricsTap>,
-    pub gossip_peers: RwLock<Arc<str>>,
-    /// Unix milliseconds of the last request for the gossip peers, which are gathered only while
-    /// someone is asking.
-    pub gossip_peers_wanted: AtomicU64,
-    /// Unix milliseconds of the last request for the miss or written list, which are rebuilt
-    /// every slow tick only while someone is asking.
-    pub misses_wanted: AtomicU64,
+    pub gossip_peers: OnDemand<Encoded>,
     /// Every settled leader's handoff figures, by median, for the leaders in a bin asked about.
     pub handoff_leaders: RwLock<Vec<LeaderFigures>>,
-    /// The Cluster page's charts, gathered only while someone is asking.
-    pub cluster_charts: RwLock<Arc<str>>,
-    pub cluster_charts_wanted: AtomicU64,
+    /// The Cluster page's charts.
+    pub cluster_charts: OnDemand<Encoded>,
     /// The client, country and stake of staked nodes and scheduled leaders, for the schedule's leader
     /// conditions.
     pub leader_traits: RwLock<LeaderMap>,
+}
+
+/// A reply gathered only while someone asks for it, and the time of the last ask.
+#[derive(Default)]
+pub struct OnDemand<T> {
+    pub held: RwLock<T>,
+    /// Unix milliseconds.
+    asked_at: AtomicU64,
+}
+
+impl<T> OnDemand<T> {
+    /// Notes an ask; true where the one before it had lapsed.
+    pub fn ask(&self, now_millis: u64) -> bool {
+        let before = self.asked_at.swap(now_millis, atomic::Ordering::Relaxed);
+        now_millis.saturating_sub(before) > WANTED_FOR_MILLIS
+    }
+
+    pub fn wanted(&self, now_millis: u64) -> bool {
+        let asked_at = self.asked_at.load(atomic::Ordering::Relaxed);
+        now_millis.saturating_sub(asked_at) <= WANTED_FOR_MILLIS
+    }
+
+    #[cfg(test)]
+    pub fn asked_at(&self) -> u64 {
+        self.asked_at.load(atomic::Ordering::Relaxed)
+    }
+}
+
+/// An encoded reply, null until first gathered.
+#[derive(Clone)]
+pub struct Encoded(pub Arc<str>);
+
+impl Default for Encoded {
+    fn default() -> Self {
+        Self(Arc::from("null"))
+    }
 }
 
 impl Replies {
@@ -189,73 +176,46 @@ impl Replies {
     }
 }
 
-impl Default for Replies {
-    fn default() -> Self {
-        Self {
-            misses: RwLock::default(),
-            produced: RwLock::default(),
-            tap: Arc::default(),
-            gossip_peers: RwLock::new(Arc::from("null")),
-            gossip_peers_wanted: AtomicU64::new(0),
-            misses_wanted: AtomicU64::new(0),
-            handoff_leaders: RwLock::default(),
-            cluster_charts: RwLock::new(Arc::from("null")),
-            cluster_charts_wanted: AtomicU64::new(0),
-            leader_traits: RwLock::default(),
-        }
-    }
-}
-
 /// Only a connecting client reads the overview, a few hundred kilobytes.
-const OVERVIEW_INTERVAL: Duration = Duration::from_secs(1);
+pub const OVERVIEW_INTERVAL: Duration = Duration::from_secs(1);
 
-const NANOS_PER_DAY: u128 = 86_400_000_000_000;
+pub const NANOS_PER_DAY: u128 = 86_400_000_000_000;
 
-const REPLAY_RATE_WINDOW: Duration = Duration::from_secs(30);
+const MINUTE_MILLIS: u64 = 60_000;
+
+pub const REPLAY_RATE_WINDOW: Duration = Duration::from_secs(30);
 
 /// Matches the slot time beside it in the strip's head.
-const FINALITY_WINDOW_MILLIS: u64 = 60_000;
+pub const FINALITY_WINDOW_MILLIS: u64 = 60_000;
 const REPLAY_RATE_MIN_SPAN: Duration = Duration::from_secs(5);
 
-const TOTALS_KEPT: u64 = 64;
-
-/// Kept so a child can be differenced after its parent is pruned.
-#[derive(Debug, Clone, Copy)]
-struct Totals {
-    transactions: u64,
-    non_vote: u64,
-    tips: u64,
-    /// Failed transactions along the fork, from the first bank seen on it.
-    failed: u64,
-}
-
-const SLOT_OVERVIEW_LEN: usize = 512;
+pub const SLOT_OVERVIEW_LEN: usize = 512;
 
 /// How far back a slot's duration looks for an earlier block that filled.
-const FULL_REACH_SLOTS: u64 = 64;
+pub const FULL_REACH_SLOTS: u64 = 64;
 
 /// A slot arriving this far behind the cluster's tip was caught up on, not received live.
-const HANDOFF_BEHIND_SLOTS: u64 = 32;
+pub const HANDOFF_BEHIND_SLOTS: u64 = 32;
 
 /// How far back a leader's run of consecutive turns is followed to its first slot.
-const HANDOFF_RUN_TURNS: usize = 8;
+pub const HANDOFF_RUN_TURNS: usize = 8;
 
-const SLOT_HISTORY: usize = 4096;
+pub const SLOT_HISTORY: usize = 4096;
 
 const MAX_VERSIONS_REPORTED: usize = 5;
 
-const NEXT_LEADER_LOOKAHEAD: u64 = 20_000;
+pub const NEXT_LEADER_LOOKAHEAD: u64 = 20_000;
 
-const UPCOMING_SLOTS: u64 = 32;
+pub const UPCOMING_SLOTS: u64 = 32;
 
 /// Sent to a connecting client; older blocks are asked for.
-const PRODUCED_BLOCKS: usize = 500;
+pub const PRODUCED_BLOCKS: usize = 500;
 
-const WORKER_REPORT_MILLIS: u64 = 20;
+pub const WORKER_REPORT_MILLIS: u64 = 20;
 
-const EXECUTION_WAIT_SLOTS: u64 = 64;
+pub const EXECUTION_WAIT_SLOTS: u64 = 64;
 
-const LEADER_TURNS: usize = 128;
+pub const LEADER_TURNS: usize = 128;
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct StakeSummary {
@@ -301,17 +261,9 @@ pub struct Peer {
 
 /// Where the cluster reaches this node, shown in the header.
 #[derive(Debug, PartialEq, Eq, Serialize)]
-struct GossipAddress {
-    ip: String,
-    country: Option<&'static str>,
-}
-
-#[derive(Default)]
-struct Heard {
-    version: Option<String>,
-    client: Option<String>,
-    ip: Option<String>,
-    country: Option<&'static str>,
+pub struct GossipAddress {
+    pub ip: String,
+    pub country: Option<&'static str>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -402,29 +354,6 @@ pub struct Admission {
     pub ticket_short: Option<u64>,
 }
 
-/// From the rank maps, which hold each epoch's admitted set. `None` before alpenglow.
-fn read_admission(bank: &Bank, vote_account: &Pubkey) -> Option<Admission> {
-    if !bank.is_alpenglow() {
-        return None;
-    }
-    let schedule = bank.epoch_schedule();
-    let seated = |epoch: Epoch| {
-        bank.get_rank_map(schedule.get_first_slot_in_epoch(epoch))
-            .map(|map| map.get_rank_for_vote_pubkey(vote_account).is_some())
-    };
-    let ticket_short = match bank.get_vat_health_for_next_epoch(vote_account) {
-        Err(VATHealthError::InsufficientFundsInVoteAccount(balance, minimum)) => {
-            Some(minimum.saturating_sub(balance))
-        }
-        Ok(()) | Err(_) => None,
-    };
-    Some(Admission {
-        seat: seated(bank.epoch())?,
-        next_seat: seated(bank.epoch().saturating_add(1)),
-        ticket_short,
-    })
-}
-
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct SkipRate {
     pub epoch: Epoch,
@@ -433,1913 +362,10 @@ pub struct SkipRate {
     pub rate: Option<f64>,
 }
 
-struct Debounces {
-    client: Debounced<String>,
-    gossip_address: Debounced<Option<GossipAddress>>,
-    identity_key: Debounced<String>,
-    identity_name: Debounced<Option<String>>,
-    identity_icon: Debounced<Option<String>>,
-    vote_key: Debounced<String>,
-    root_slot: Debounced<Slot>,
-    optimistically_confirmed_slot: Debounced<Slot>,
-    finalized_slot: Debounced<Slot>,
-    completed_slot: Debounced<Slot>,
-    estimated_slot: Debounced<Slot>,
-    vote_slot: Debounced<Option<Slot>>,
-    behind_cluster: Debounced<Option<u64>>,
-    replay_rate: Debounced<Option<f64>>,
-    identity_balance: Debounced<u64>,
-    vote_balance: Debounced<u64>,
-    vote_commission: Debounced<Option<u8>>,
-    stake: Debounced<StakeSummary>,
-    validator_counts: Debounced<ValidatorCounts>,
-    versions: Debounced<Vec<VersionShare>>,
-    block_height: Debounced<u64>,
-    slot_duration_nanos: Debounced<u64>,
-    observed_slot_duration_nanos: Debounced<Option<u64>>,
-    finality_from_leader_micros: Debounced<Option<u64>>,
-    finalization_share: Debounced<Option<FinalizationShare>>,
-    next_leader_slot: Debounced<Option<Slot>>,
-    skip_rate: Debounced<SkipRate>,
-    leader_slot_counts: Debounced<Vec<LeaderSlotCounts>>,
-    health: Debounced<Health>,
-    epoch: Debounced<EpochInfo>,
-    consensus: Debounced<Consensus>,
-    epoch_remaining_nanos: Debounced<u64>,
-    peers: Debounced<Vec<Peer>>,
-    snapshots: Debounced<Option<Snapshots>>,
-    bls_key: Debounced<Option<bool>>,
-    admission: Debounced<Option<Admission>>,
-    vote_credits: Debounced<Option<VoteCredits>>,
-    epoch_earnings: Debounced<Option<EpochEarnings>>,
-    vote_participation: Debounced<certs::Participation>,
-    vote_cost: Debounced<VoteCost>,
-    block_life: Debounced<Option<BlockLifeSummary>>,
-    cert_formation: Debounced<Option<CertFormation>>,
-    handoff: Debounced<Option<HandoffSummary>>,
-    handoff_now: Debounced<Option<HandoffNow>>,
-    fee_payers: Debounced<Option<FeePayerSummary>>,
-}
-
-impl Default for Debounces {
-    fn default() -> Self {
-        Self {
-            client: Debounced::new(TOPIC_SUMMARY, "client"),
-            gossip_address: Debounced::new(TOPIC_SUMMARY, "gossip_address"),
-            identity_key: Debounced::new(TOPIC_SUMMARY, "identity_key"),
-            identity_name: Debounced::new(TOPIC_SUMMARY, "identity_name"),
-            identity_icon: Debounced::new(TOPIC_SUMMARY, "identity_icon"),
-            vote_key: Debounced::new(TOPIC_SUMMARY, "vote_key"),
-            root_slot: Debounced::new(TOPIC_SUMMARY, "root_slot"),
-            optimistically_confirmed_slot: Debounced::new(
-                TOPIC_SUMMARY,
-                "optimistically_confirmed_slot",
-            ),
-            finalized_slot: Debounced::new(TOPIC_SUMMARY, "finalized_slot"),
-            completed_slot: Debounced::new(TOPIC_SUMMARY, "completed_slot"),
-            estimated_slot: Debounced::new(TOPIC_SUMMARY, "estimated_slot"),
-            vote_slot: Debounced::new(TOPIC_SUMMARY, "vote_slot"),
-            behind_cluster: Debounced::new(TOPIC_SUMMARY, "behind_cluster"),
-            replay_rate: Debounced::new(TOPIC_SUMMARY, "replay_rate"),
-            identity_balance: Debounced::new(TOPIC_SUMMARY, "identity_balance"),
-            vote_balance: Debounced::new(TOPIC_SUMMARY, "vote_balance"),
-            vote_commission: Debounced::new(TOPIC_SUMMARY, "vote_commission"),
-            stake: Debounced::new(TOPIC_SUMMARY, "stake"),
-            validator_counts: Debounced::new(TOPIC_SUMMARY, "validator_counts"),
-            versions: Debounced::new(TOPIC_SUMMARY, "versions"),
-            block_height: Debounced::new(TOPIC_SUMMARY, "block_height"),
-            slot_duration_nanos: Debounced::new(TOPIC_SUMMARY, "estimated_slot_duration_nanos"),
-            observed_slot_duration_nanos: Debounced::new(
-                TOPIC_SUMMARY,
-                "observed_slot_duration_nanos",
-            ),
-            finality_from_leader_micros: Debounced::new(
-                TOPIC_SUMMARY,
-                "finality_from_leader_micros",
-            ),
-            finalization_share: Debounced::new(TOPIC_SUMMARY, "finalization_share"),
-            next_leader_slot: Debounced::new(TOPIC_SUMMARY, "next_leader_slot"),
-            skip_rate: Debounced::new(TOPIC_SUMMARY, "skip_rate"),
-            leader_slot_counts: Debounced::new(TOPIC_SUMMARY, "leader_slot_counts"),
-            health: Debounced::new(TOPIC_SUMMARY, "health"),
-            epoch: Debounced::new(TOPIC_EPOCH, "new"),
-            consensus: Debounced::new(TOPIC_SUMMARY, "consensus"),
-            epoch_remaining_nanos: Debounced::new(TOPIC_SUMMARY, "epoch_remaining_nanos"),
-            peers: Debounced::new(TOPIC_PEERS, "all"),
-            snapshots: Debounced::new(TOPIC_SUMMARY, "snapshots"),
-            bls_key: Debounced::new(TOPIC_SUMMARY, "bls_key"),
-            admission: Debounced::new(TOPIC_SUMMARY, "admission"),
-            vote_credits: Debounced::new(TOPIC_SUMMARY, "vote_credits"),
-            epoch_earnings: Debounced::new(TOPIC_SUMMARY, "epoch_earnings"),
-            vote_participation: Debounced::new(TOPIC_SUMMARY, "vote_participation"),
-            vote_cost: Debounced::new(TOPIC_SUMMARY, "vote_cost"),
-            block_life: Debounced::new(TOPIC_SUMMARY, "block_life"),
-            cert_formation: Debounced::new(TOPIC_SUMMARY, "cert_formation"),
-            handoff: Debounced::new(TOPIC_SUMMARY, "handoff"),
-            handoff_now: Debounced::new(TOPIC_SUMMARY, "handoff_now"),
-            fee_payers: Debounced::new(TOPIC_SUMMARY, "fee_payers"),
-        }
-    }
-}
-
-pub struct Collector {
-    ctx: DashboardContext,
-    publisher: Arc<Publisher>,
-    /// From the service, since the boot thread reports before a context exists.
-    startup_progress: StartProgress,
-
-    debounces: Debounces,
-    slots: SlotRing,
-    info_cache: Arc<RwLock<ValidatorInfoCache>>,
-    /// The boot thread's publisher, handed over so the phases it recorded survive.
-    startup: Arc<Mutex<StartupPublisher>>,
-    metrics_tap: Arc<MetricsTap>,
-
-    leaders_resolved_to: Slot,
-    info_scanned_to: Slot,
-    /// Tip at the moment the collector started. Slots below it were never
-    /// watched, so they are neither tracked nor counted as skipped.
-    first_observed_slot: Option<Slot>,
-    completed_window: VecDeque<(Instant, Slot)>,
-    versions_pending: BTreeSet<Slot>,
-    execution_pending: BTreeSet<Slot>,
-    history: Arc<RwLock<SlotHistory>>,
-    epochs: Arc<RwLock<Vec<EpochInfo>>>,
-    epoch_published: Option<(Epoch, Pubkey, bool)>,
-    skip_rate: SkipRateWalk,
-    earnings: EarningsWalk,
-    /// The epoch before the root's, whose blocks the slot page holds for a while.
-    previous_slots: SkipRateWalk,
-    finalization: FinalizationTally,
-    block_lives: BlockLives,
-    handoffs: Handoffs,
-    fee_payers: FeePayers,
-    /// The newest slot whose first shred has arrived.
-    newest_arrival: Slot,
-    /// The turn, whether its gap was known, and the summary it was measured against.
-    handoff_now_for: Option<(Slot, bool, Option<u64>)>,
-    cert_formation_for: Option<FormationKey>,
-    finalized_paths: FinalizedPaths,
-    /// Read once a tick.
-    cluster_tip: Option<Slot>,
-    last_completed_slot: Slot,
-    last_completed_at: Instant,
-    certificates: CertificateWalk,
-    replies: Arc<Replies>,
-    clock: SlotClock,
-    /// Whether a tip ahead of replay has been seen since startup, and whether replay has since
-    /// drawn level with it. The first tip read after a restart is stale.
-    trailed_cluster: bool,
-    caught_cluster: bool,
-    last_vote_advance: Instant,
-    /// False on a backup identity.
-    voting: bool,
-    last_slow_tick: Instant,
-    leader_traits_at: Instant,
-    /// Unix milliseconds the Cluster page's charts were last gathered.
-    cluster_charts_made: u64,
-    /// Unix milliseconds this node caught up with the cluster, where it had to.
-    caught_up_millis: Option<u64>,
-    /// The previous epoch's skipped percent, by the epoch it was read in.
-    previous_skips: Option<(Epoch, Option<f64>)>,
-    subscribers: usize,
-
-    tips: Option<TipMeter>,
-    /// `None` reads bank forks instead, which misses banks pruned between ticks.
-    frozen_banks: Option<BankNotificationReceiver>,
-    totals: BTreeMap<Slot, Totals>,
-    /// Failed transactions along the working fork, read by the meters for TPS.
-    failed_total: Arc<AtomicU64>,
-    /// Never applied to another validator's turn.
-    commission_bps: Option<u16>,
-    tips_residual: Option<u64>,
-    turns: TurnTracker,
-    turns_scanned_to: Slot,
-    turn_reference: TapCounters,
-    turn_drained: Option<u64>,
-    held_from: Slot,
-    overview_dirty: bool,
-    overview_retained_at: Instant,
-    /// Dropped while nobody watched, so owed whole to the next viewer.
-    overview_unsent: bool,
-    /// The publisher's subscriptions as of the last tick.
-    joined: u64,
-    /// As `overview_unsent`, for the produced list.
-    produced_unsent: bool,
-    /// The root the produced list was last checked against.
-    produced_settled_to: Slot,
-    snapshots: SnapshotTracker,
-    snapshots_read_at: Instant,
-}
-
-/// The shared failed count until the collector first stores one.
+/// The shared failed count until RPC's slot updates first give one.
 pub const FAILED_UNREAD: u64 = u64::MAX;
 
-pub struct CollectorShared {
-    pub publisher: Arc<Publisher>,
-    pub info_cache: Arc<RwLock<ValidatorInfoCache>>,
-    pub history: Arc<RwLock<SlotHistory>>,
-    pub epochs: Arc<RwLock<Vec<EpochInfo>>>,
-    pub replies: Arc<Replies>,
-    pub startup_progress: StartProgress,
-    pub startup: Arc<Mutex<StartupPublisher>>,
-    pub metrics_tap: Arc<MetricsTap>,
-    pub failed_total: Arc<AtomicU64>,
-}
-
-impl Collector {
-    pub fn new(
-        ctx: DashboardContext,
-        shared: CollectorShared,
-        tips: Option<TipMeter>,
-        commission_bps: Option<u16>,
-        frozen_banks: Option<BankNotificationReceiver>,
-    ) -> Self {
-        let CollectorShared {
-            publisher,
-            info_cache,
-            history,
-            epochs,
-            replies,
-            startup_progress,
-            startup,
-            metrics_tap,
-            failed_total,
-        } = shared;
-        let now = Instant::now();
-        Self {
-            slots: SlotRing::new(SLOT_HISTORY),
-            ctx,
-            publisher,
-            startup_progress,
-            debounces: Debounces::default(),
-            info_cache,
-            startup,
-            metrics_tap,
-            leaders_resolved_to: 0,
-            info_scanned_to: 0,
-            first_observed_slot: None,
-            versions_pending: BTreeSet::new(),
-            execution_pending: BTreeSet::new(),
-            history,
-            epochs,
-            skip_rate: SkipRateWalk::default(),
-            earnings: EarningsWalk::default(),
-            previous_slots: SkipRateWalk::default(),
-            finalization: FinalizationTally::default(),
-            block_lives: BlockLives::default(),
-            handoffs: Handoffs::default(),
-            fee_payers: FeePayers::default(),
-            newest_arrival: 0,
-            handoff_now_for: None,
-            cert_formation_for: None,
-            finalized_paths: FinalizedPaths::default(),
-            cluster_tip: None,
-            epoch_published: None,
-            last_completed_slot: 0,
-            last_completed_at: now,
-            completed_window: VecDeque::new(),
-            certificates: CertificateWalk::default(),
-            replies,
-            trailed_cluster: false,
-            caught_cluster: false,
-            clock: SlotClock::default(),
-            last_vote_advance: now,
-            // Nothing is known until the first bank is read, and claiming to be
-            // voting before then would flash the wrong status on startup.
-            voting: false,
-            last_slow_tick: now.checked_sub(SLOW_TICK).unwrap_or(now),
-            leader_traits_at: now.checked_sub(LEADER_TRAITS_EVERY).unwrap_or(now),
-            cluster_charts_made: 0,
-            caught_up_millis: None,
-            previous_skips: None,
-            subscribers: 0,
-            tips,
-            commission_bps,
-            tips_residual: None,
-            turns: TurnTracker::default(),
-            turns_scanned_to: 0,
-            turn_reference: TapCounters::default(),
-            turn_drained: None,
-            held_from: 0,
-            frozen_banks,
-            totals: BTreeMap::new(),
-            failed_total,
-            overview_dirty: false,
-            overview_retained_at: now.checked_sub(OVERVIEW_INTERVAL).unwrap_or(now),
-            overview_unsent: false,
-            joined: 0,
-            produced_unsent: false,
-            produced_settled_to: 0,
-            snapshots: SnapshotTracker::default(),
-            snapshots_read_at: now.checked_sub(SNAPSHOT_READ).unwrap_or(now),
-        }
-    }
-
-    pub fn publish_static(&mut self) {
-        let version = solana_version::Version::this_build();
-        self.publisher
-            .publish(TOPIC_SUMMARY, "version", &version.as_semver_string());
-        self.collect_contact();
-        self.publisher
-            .publish(TOPIC_SUMMARY, "cluster", &self.ctx.cluster_name());
-        // The rates the page derives tip figures with, sent rather than applied so a corrected rate
-        // repairs the whole history.
-        if let Some(meter) = &self.tips {
-            log::info!(
-                "dashboard: reading jito tips from {} accounts, {:?}",
-                meter.accounts().len(),
-                meter.accounts()
-            );
-            self.publisher.publish(
-                TOPIC_SUMMARY,
-                "tip_rates",
-                &TipRates {
-                    jito_cut_bps: crate::tips::JITO_CUT_BPS,
-                    commission_bps: self.commission_bps,
-                },
-            );
-        }
-        self.publisher.publish(
-            TOPIC_SUMMARY,
-            "shred_version",
-            &self.ctx.cluster_info.my_shred_version(),
-        );
-    }
-
-    pub fn tick(&mut self) {
-        let now = Instant::now();
-
-        // Held only to clone the handles out: replay takes this lock to advance.
-        let (root_bank, working_bank, highest_slot, mut frozen) = {
-            let bank_forks = self.ctx.bank_forks.read().unwrap();
-            (
-                bank_forks.root_bank(),
-                bank_forks.working_bank(),
-                bank_forks.highest_slot(),
-                bank_forks.frozen_banks().collect::<Vec<_>>(),
-            )
-        };
-        // Slot order, for the tip meter's running total. Everything else is a
-        // difference against a parent and would be right in any order.
-        frozen.sort_by_key(|(slot, _)| *slot);
-        let completed = frozen.last().map_or(0, |(slot, _)| *slot);
-        // Processed's own, which the page shows it beside; the working bank is Highest's.
-        let completed_height = frozen.last().map(|(_, bank)| bank.block_height());
-
-        self.collect_slot_positions(&root_bank, highest_slot, completed);
-        self.hold_produced_from(&root_bank);
-        // Read once: before Alpenglow it opens a blockstore iterator, and two
-        // readers want it every tick.
-        let cluster_tip = self.ctx.cluster_tip();
-        self.cluster_tip = cluster_tip;
-        // Measured against the cluster's tip, not this node's own view, which
-        // lags when replay lags.
-        let behind_cluster = cluster_tip
-            .map(|tip| blocks_behind(&self.ctx.blockstore, tip, self.last_completed_slot));
-        self.mark_caught_cluster(behind_cluster);
-        self.collect_leaders(&root_bank, highest_slot);
-        self.collect_slot_levels(&root_bank, &frozen);
-        self.store_failed(&working_bank);
-        self.collect_vote_certs(&root_bank);
-        self.collect_earnings(&root_bank);
-        self.collect_finalized_paths(&root_bank);
-        self.collect_turns(completed);
-        // From the working bank: the root trails the tip by the thirty-two slots it
-        // takes to root.
-        self.collect_identity_and_vote(&working_bank, behind_cluster);
-        self.collect_epoch(&working_bank, completed_height);
-        self.debounces.consensus.publish(
-            &self.publisher,
-            if working_bank.is_alpenglow() {
-                Consensus::Alpenglow
-            } else {
-                Consensus::Tower
-            },
-        );
-        self.collect_startup_progress();
-
-        // With or without a viewer: the certificate walk reads the write spans. After the vote
-        // pass, which notes how far a write fell behind.
-        if now.duration_since(self.snapshots_read_at) >= SNAPSHOT_READ {
-            self.snapshots_read_at = now;
-            self.collect_snapshots();
-        }
-
-        // The slow tier walks every vote account, so it waits for a viewer. The
-        // tiers above feed the slot ring and must not skip.
-        let subscribers = self.publisher.subscriber_count();
-        if subscribers != self.subscribers {
-            log::debug!(
-                "dashboard: {subscribers} viewers attached, cluster sampling {}",
-                if subscribers == 0 {
-                    "paused"
-                } else {
-                    "running"
-                }
-            );
-            self.subscribers = subscribers;
-        }
-
-        // Encoded on a timer rather than per change: live clients follow the updates above, and
-        // only a connecting one reads this. Dropped while nobody watches and sent whole to the next
-        // viewer, as is the produced list.
-        // The overview a viewer joining beside another was handed is up to a second behind the
-        // updates, and those sent before it subscribed never reach it.
-        let joined = self.publisher.joined();
-        if std::mem::replace(&mut self.joined, joined) != joined {
-            self.overview_unsent = true;
-        }
-        if subscribers == 0 {
-            if std::mem::take(&mut self.overview_dirty) {
-                self.publisher.forget(TOPIC_SLOT, "overview");
-                self.overview_unsent = true;
-            }
-        } else if self.overview_unsent
-            || (self.overview_dirty
-                && now.duration_since(self.overview_retained_at) >= OVERVIEW_INTERVAL)
-        {
-            self.publish_slot_overview();
-            self.overview_dirty = false;
-            self.overview_retained_at = now;
-        }
-        if subscribers > 0 {
-            if self.produced_unsent {
-                self.publish_produced();
-            }
-            self.collect_handoff_now(&root_bank);
-        }
-
-        // Off the slow tier, so a page's first ask is answered on the next tick.
-        let now_millis = timestamp();
-        if subscribers > 0 && self.cluster_charts_due(now_millis) {
-            self.cluster_charts_made = now_millis;
-            let peers = self.ctx.cluster_info.all_peers();
-            self.collect_cluster_charts(&root_bank, &working_bank, &peers, now_millis);
-        }
-
-        if subscribers > 0 && now.duration_since(self.last_slow_tick) >= SLOW_TICK {
-            self.last_slow_tick = now;
-            // One snapshot for both walks below: it clones the whole table under
-            // the gossip lock.
-            let peers = self.ctx.cluster_info.all_peers();
-            self.collect_contact();
-            let votes = self.collect_peers(&working_bank, &peers);
-            self.collect_health();
-            self.collect_skip_rate(&root_bank);
-            if now.duration_since(self.leader_traits_at) >= LEADER_TRAITS_EVERY {
-                self.leader_traits_at = now;
-                self.collect_leader_traits(&working_bank, &peers);
-            }
-            self.collect_finalization_share(&working_bank, &peers);
-            self.collect_cert_formation(&root_bank);
-            self.debounces
-                .fee_payers
-                .publish(&self.publisher, self.fee_payers.summary());
-            self.debounces
-                .block_life
-                .publish(&self.publisher, self.block_lives.summary(timestamp()));
-            let ours = self.ctx.identity();
-            self.debounces.handoff.publish(
-                &self.publisher,
-                self.handoffs.summary(timestamp(), &ours, |key| {
-                    country_of(&self.ctx.cluster_info, key)
-                }),
-            );
-            if let Some(leaders) = self.handoffs.take_leaders()
-                && let Ok(mut held) = self.replies.handoff_leaders.write()
-            {
-                *held = leaders;
-            }
-            let ahead = self.upcoming_leaders(&root_bank, highest_slot);
-            self.collect_peer_table(&working_bank, ahead, &peers);
-            self.collect_gossip_peers(&working_bank, root_bank.slot(), &peers, timestamp());
-            self.report_tip_residual();
-            let heard: Contacts = peers
-                .iter()
-                .map(|(contact, at_millis)| {
-                    (
-                        *contact.pubkey(),
-                        GossipEntry {
-                            contact,
-                            at_millis: *at_millis,
-                        },
-                    )
-                })
-                .collect();
-            self.collect_miss_list(&working_bank, &heard, &votes, timestamp());
-            if self.fill_certificates(&working_bank, &heard) {
-                self.publish_produced();
-            }
-        }
-    }
-
-    /// The client this node gossips, which the version does not carry, and its gossip address. The
-    /// client comes from gossip rather than the build: jito's validator gossips `AgaveBam` while on
-    /// BAM and `JitoLabs` otherwise.
-    fn collect_contact(&mut self) {
-        let contact = self.ctx.cluster_info.my_contact_info();
-        self.debounces
-            .client
-            .publish(&self.publisher, contact.version().client().to_string());
-        let address = contact.gossip().map(|addr| GossipAddress {
-            ip: addr.ip().to_string(),
-            country: geoip::country(addr.ip()),
-        });
-        self.debounces
-            .gossip_address
-            .publish(&self.publisher, address);
-    }
-
-    fn report_tip_residual(&mut self) {
-        let residual = self.tips.as_ref().and_then(TipMeter::residual);
-        if residual == self.tips_residual {
-            return;
-        }
-        self.tips_residual = residual;
-        if let Some(lamports) = residual {
-            log::info!(
-                "dashboard: {lamports} lamports of tips were paid before the receiver changed and \
-                 are counted against no turn"
-            );
-        }
-    }
-
-    fn collect_snapshots(&mut self) {
-        let read = self.ctx.snapshot_config.as_ref().and_then(snapshot::read);
-        let snapshots = self
-            .snapshots
-            .observe(read, self.last_completed_slot, timestamp());
-        self.debounces.snapshots.publish(&self.publisher, snapshots);
-    }
-
-    fn collect_slot_positions(&mut self, root_bank: &Bank, highest_slot: Slot, completed: Slot) {
-        let commitment = self.ctx.block_commitment_cache.read().unwrap();
-        let (root, confirmed, finalized) = (
-            commitment.root(),
-            commitment.highest_confirmed_slot(),
-            commitment.highest_super_majority_root(),
-        );
-        drop(commitment);
-
-        // `root_bank` is the authority on the root. The commitment cache can
-        // briefly lag it during startup.
-        let root = root.max(root_bank.slot());
-
-        self.debounces.root_slot.publish(&self.publisher, root);
-        self.debounces
-            .optimistically_confirmed_slot
-            .publish(&self.publisher, confirmed);
-        self.debounces
-            .finalized_slot
-            .publish(&self.publisher, finalized);
-        self.debounces
-            .estimated_slot
-            .publish(&self.publisher, highest_slot);
-
-        self.debounces
-            .completed_slot
-            .publish(&self.publisher, completed);
-        self.collect_slot_durations(root_bank, completed);
-        self.clock
-            .mark_caught_up(self.trailed_cluster && !self.caught_cluster, completed);
-        self.observe_slot_duration(root_bank, completed);
-    }
-
-    fn observe_slot_duration(&mut self, root_bank: &Bank, completed: Slot) {
-        let now = Instant::now();
-        if completed > self.last_completed_slot {
-            self.last_completed_slot = completed;
-            self.last_completed_at = now;
-        }
-        self.completed_window.push_back((now, completed));
-        while let Some((at, _)) = self.completed_window.front() {
-            if now.duration_since(*at) <= REPLAY_RATE_WINDOW {
-                break;
-            }
-            self.completed_window.pop_front();
-        }
-
-        let ns_per_slot = root_bank.ns_per_slot_at_slot(completed) as u64;
-        self.debounces
-            .slot_duration_nanos
-            .publish(&self.publisher, ns_per_slot);
-
-        self.debounces
-            .observed_slot_duration_nanos
-            .publish(&self.publisher, self.clock.observed_nanos());
-
-        self.debounces.finality_from_leader_micros.publish(
-            &self.publisher,
-            self.metrics_tap
-                .finality_from_leader_micros(timestamp(), FINALITY_WINDOW_MILLIS),
-        );
-    }
-
-    /// Timed from the blockstore's first-shred record rather than a 200ms poll.
-    fn collect_slot_durations(&mut self, root_bank: &Bank, up_to: Slot) {
-        let schedule = root_bank.epoch_schedule();
-        let mut changed = Vec::new();
-        let mut filled = Vec::new();
-        for slot in self.clock.slots_to_time(up_to) {
-            // A skipped slot has no shreds and no timestamp, so the next slot that does is
-            // measured from the last that did.
-            let Some(arrived) = self.first_shred_time(slot) else {
-                continue;
-            };
-
-            // The minute's mean stays on first shreds: it is the same over a window, and needs no
-            // block to fill.
-            self.clock.record(slot, arrived);
-            // A slot repaired while catching up arrived long after it was made.
-            if !self.trailed_cluster || self.caught_cluster {
-                self.clock
-                    .record_in_epoch(schedule.get_epoch(slot), slot, arrived);
-            }
-            self.newest_arrival = self.newest_arrival.max(slot);
-            let shreds = self.metrics_tap.shred_fill(slot).map(ShredArrival::from);
-            let was_full = self.slots.get(slot).and_then(SlotEntry::full_at).is_some();
-            if let Some(entry) = self.slots.update(slot, |entry| {
-                entry.time_millis = Some(arrived);
-                if entry.shreds.is_none() {
-                    entry.shreds = shreds;
-                }
-            }) {
-                if !was_full && entry.full_at().is_some() {
-                    filled.push(slot);
-                }
-                changed.push(entry);
-            }
-
-            self.history.write().unwrap().record_time(slot, arrived);
-        }
-
-        // A block's fill can be reported after both moments it is read above, our own most often,
-        // since broadcast inserts our shreds after the bank freezes. Unfilled, the next slot would be
-        // timed from an older block.
-        for slot in up_to.saturating_sub(FULL_REACH_SLOTS)..=up_to {
-            let late = self
-                .slots
-                .get(slot)
-                .is_some_and(|entry| entry.time_millis.is_some() && entry.shreds.is_none());
-            let Some(shreds) = late
-                .then(|| self.metrics_tap.shred_fill(slot).map(ShredArrival::from))
-                .flatten()
-            else {
-                continue;
-            };
-            if let Some(entry) = self.slots.update(slot, |entry| entry.shreds = Some(shreds)) {
-                filled.push(slot);
-                changed.push(entry);
-            }
-        }
-
-        let retimed = self.retime(&filled, &mut changed);
-        let touched: BTreeSet<Slot> = changed
-            .iter()
-            .flat_map(|entry| [entry.slot, entry.slot.saturating_add(1)])
-            .collect();
-        for slot in touched {
-            self.note_handoff(root_bank, slot);
-        }
-        for entry in &changed {
-            self.publish_slot(entry);
-        }
-        if retimed {
-            self.publish_produced();
-        }
-    }
-
-    /// The gap before a leader's turn, once this slot's first shred and the previous slot's fill are
-    /// both known. Not after our own turn, where the gap is a round trip to the next leader, nor
-    /// while catching up, when repair rather than turbine brings the blocks.
-    fn note_handoff(&mut self, root_bank: &Bank, slot: Slot) {
-        if self.handoffs.holds(slot)
-            || (self.trailed_cluster && !self.caught_cluster)
-            || self
-                .cluster_tip
-                .is_some_and(|tip| tip.saturating_sub(slot) > HANDOFF_BEHIND_SLOTS)
-        {
-            return;
-        }
-        let Some(previous) = slot.checked_sub(1) else {
-            return;
-        };
-        let (Some(arrived), Some(filled)) = (
-            self.slots.get(slot).and_then(|entry| entry.time_millis),
-            self.slots.get(previous).and_then(SlotEntry::full_at),
-        ) else {
-            return;
-        };
-        let cache = &self.ctx.leader_schedule_cache;
-        let (Some(leader), Some(before)) = (
-            cache.slot_leader_at(slot, Some(root_bank)),
-            cache.slot_leader_at(previous, Some(root_bank)),
-        ) else {
-            return;
-        };
-        if leader.id == before.id || before.id == self.ctx.identity() {
-            return;
-        }
-        let (Ok(arrived_at), Ok(filled_at)) = (i64::try_from(arrived), i64::try_from(filled))
-        else {
-            return;
-        };
-        self.handoffs.note(
-            slot,
-            leader.id,
-            arrived_at.saturating_sub(filled_at),
-            arrived,
-        );
-    }
-
-    /// The leader whose turn is arriving now, from the first slot of its run of turns.
-    fn collect_handoff_now(&mut self, root_bank: &Bank) {
-        let slot = self.newest_arrival;
-        if slot == 0 {
-            return;
-        }
-        let cache = &self.ctx.leader_schedule_cache;
-        let Some(leader) = cache.slot_leader_at(slot, Some(root_bank)) else {
-            return;
-        };
-        let stride = NUM_CONSECUTIVE_LEADER_SLOTS.get() as u64;
-        let (_, index) = root_bank.epoch_schedule().get_epoch_and_slot_index(slot);
-        let mut first = slot.saturating_sub(index.checked_rem(stride).unwrap_or(0));
-        for _ in 0..HANDOFF_RUN_TURNS {
-            let Some(before) = first.checked_sub(stride) else {
-                break;
-            };
-            if cache
-                .slot_leader_at(before, Some(root_bank))
-                .is_none_or(|earlier| earlier.id != leader.id)
-            {
-                break;
-            }
-            first = before;
-        }
-        let key = (
-            first,
-            self.handoffs.holds(first),
-            self.handoffs.computed_at(),
-        );
-        if self.handoff_now_for == Some(key) {
-            return;
-        }
-        self.handoff_now_for = Some(key);
-        let country = country_of(&self.ctx.cluster_info, &leader.id);
-        let now = self.handoffs.now(&leader.id, country, first, timestamp());
-        self.debounces
-            .handoff_now
-            .publish(&self.publisher, Some(now));
-    }
-
-    /// From the last earlier block that filled here to this one filling, so a slot's figure lines up
-    /// with its own work. The next block to have filled is timed again, since its baseline may have
-    /// been one of these. Returns whether a produced block changed.
-    fn retime(&mut self, filled: &[Slot], changed: &mut Vec<SlotEntry>) -> bool {
-        let mut produced_changed = false;
-        for &slot in filled {
-            let next =
-                (slot.saturating_add(1)..=slot.saturating_add(FULL_REACH_SLOTS)).find(|later| {
-                    self.slots
-                        .get(*later)
-                        .and_then(SlotEntry::full_at)
-                        .is_some()
-                });
-            for timed in std::iter::once(slot).chain(next) {
-                let Some(duration) = self.full_duration(timed) else {
-                    continue;
-                };
-                if let Some(entry) = self
-                    .slots
-                    .update(timed, |entry| entry.duration_nanos = Some(duration))
-                {
-                    changed.push(entry);
-                }
-                if self
-                    .replies
-                    .produced
-                    .write()
-                    .unwrap()
-                    .set_duration(timed, duration)
-                {
-                    produced_changed = true;
-                }
-            }
-        }
-        produced_changed
-    }
-
-    fn full_duration(&self, slot: Slot) -> Option<u64> {
-        let end = self.slots.get(slot)?.full_at()?;
-        let start = (slot.saturating_sub(FULL_REACH_SLOTS)..slot)
-            .rev()
-            .find_map(|earlier| self.slots.get(earlier)?.full_at())?;
-        Some(end.saturating_sub(start).saturating_mul(1_000_000))
-    }
-
-    fn first_shred_time(&self, slot: Slot) -> Option<u64> {
-        match self.ctx.blockstore.meta(slot) {
-            Ok(Some(meta)) if meta.first_shred_timestamp > 0 => Some(meta.first_shred_timestamp),
-            _ => None,
-        }
-    }
-
-    fn collect_leaders(&mut self, root_bank: &Bank, highest_slot: Slot) {
-        let me = self.ctx.identity();
-        // Slots before the tip at start would all read as skipped.
-        let from = match self.first_observed_slot {
-            None => {
-                self.first_observed_slot = Some(highest_slot);
-                highest_slot
-            }
-            Some(_) => self
-                .leaders_resolved_to
-                .max(highest_slot.saturating_sub(SLOT_HISTORY as u64)),
-        };
-
-        for slot in from..=highest_slot {
-            let Some(leader) = self
-                .ctx
-                .leader_schedule_cache
-                .slot_leader_at(slot, Some(root_bank))
-            else {
-                self.leaders_resolved_to = slot;
-                return;
-            };
-            if let Some(entry) = self.slots.set_mine(slot, leader.id == me) {
-                self.publish_slot(&entry);
-            }
-            self.leaders_resolved_to = slot.saturating_add(1);
-        }
-
-        // The cache's own lookahead skips slots we already have shreds for. A
-        // plain walk of the schedule would report those as still upcoming.
-        let next_mine = self.ctx.leader_schedule_cache.next_leader_slot(
-            &me,
-            highest_slot,
-            root_bank,
-            Some(self.ctx.blockstore.as_ref()),
-            NEXT_LEADER_LOOKAHEAD,
-        );
-        self.debounces
-            .next_leader_slot
-            .publish(&self.publisher, next_mine.map(|(first, _last)| first));
-    }
-
-    /// Once the cluster passes a turn, credits it with the change in the tap's totals since the
-    /// previous reading.
-    fn collect_turns(&mut self, completed: Slot) {
-        let from = self
-            .turns_scanned_to
-            .max(self.first_observed_slot.unwrap_or(0));
-        for slot in from..self.leaders_resolved_to {
-            let mine = self.slots.get(slot).is_some_and(|entry| entry.mine);
-            self.turns.observe(slot, mine);
-        }
-        self.turns_scanned_to = self.leaders_resolved_to.max(from);
-
-        let ended = self.turns.ended(completed);
-        if ended.is_empty() {
-            return;
-        }
-        // Two turns ending on one tick share the reading; the second spans nothing.
-        let reading = self.metrics_tap.counters();
-        let drained_millis = timestamp();
-        let mut store = self.replies.produced.write().unwrap();
-        for (first, last) in ended {
-            let produced = store.produced_in(first, last);
-            store.add_turn(LeaderTurn {
-                first,
-                last,
-                produced,
-                drained_millis,
-                since_millis: self.turn_drained,
-                quic: QuicPort {
-                    name: "tpu",
-                    counts: reading.quic.since(&self.turn_reference.quic),
-                    levels: reading.quic_levels,
-                    kernel_drops: None,
-                },
-                verify: reading.verify.since(&self.turn_reference.verify),
-                executed: reading.executed.since(&self.turn_reference.executed),
-            });
-            self.turn_reference = reading;
-            self.turn_drained = Some(drained_millis);
-        }
-        drop(store);
-        self.publish_turns();
-    }
-
-    fn publish_turns(&self) {
-        let recent = self
-            .replies
-            .produced
-            .read()
-            .unwrap()
-            .recent_turns(LEADER_TURNS);
-        self.publisher
-            .publish(TOPIC_SUMMARY, "produced_turns", &recent);
-    }
-
-    /// This epoch's blocks, and the previous epoch's until a share of this one has passed.
-    fn hold_produced_from(&mut self, root_bank: &Bank) {
-        let schedule = root_bank.epoch_schedule();
-        let (epoch, index) = schedule.get_epoch_and_slot_index(root_bank.slot());
-        let floor = held_from(
-            schedule.get_first_slot_in_epoch(epoch),
-            schedule.get_first_slot_in_epoch(epoch.saturating_sub(1)),
-            index,
-            schedule.get_slots_in_epoch(epoch),
-        );
-        if floor == self.held_from {
-            return;
-        }
-        self.held_from = floor;
-        self.replies.produced.write().unwrap().hold_from(floor);
-        self.metrics_tap.hold_slots_from(floor);
-        self.publisher
-            .publish(TOPIC_SUMMARY, "produced_floor", &floor);
-        self.publish_produced();
-        self.publish_turns();
-    }
-
-    /// The leaders of the next slots, as far as the schedule is known.
-    fn upcoming_leaders(&self, root_bank: &Bank, highest_slot: Slot) -> HashSet<Pubkey> {
-        let cache = &self.ctx.leader_schedule_cache;
-        (highest_slot.saturating_add(1)..=highest_slot.saturating_add(UPCOMING_SLOTS))
-            .map_while(|slot| cache.slot_leader_at(slot, Some(root_bank)))
-            .map(|leader| leader.id)
-            .collect()
-    }
-
-    /// The client, country and stake of every staked node and of every held epoch's leaders, which
-    /// the schedule's leader conditions, its by-client summary and its turn cards read.
-    fn collect_leader_traits(&self, bank: &Bank, peers: &[(ContactInfo, u64)]) {
-        let tally = tally_bank_stake(bank);
-        let mut map: LeaderMap = tally
-            .staked
-            .iter()
-            .map(|(identity, stake)| {
-                let last_vote = tally.stalest_votes.get(identity).copied().flatten();
-                let traits = LeaderTraits {
-                    stake: *stake,
-                    last_vote,
-                    delinquent: is_delinquent(last_vote, bank.slot()),
-                    ..LeaderTraits::default()
-                };
-                (*identity, traits)
-            })
-            .collect();
-        // A leader can lose its stake after the schedule that names it was fixed.
-        let scheduled: HashSet<Pubkey> = self
-            .epochs
-            .read()
-            .unwrap()
-            .iter()
-            .flat_map(|epoch| &epoch.leaders)
-            .filter_map(|key| key.parse().ok())
-            .collect();
-        for (contact_info, _) in peers {
-            let identity = contact_info.pubkey();
-            if map.contains_key(identity) || scheduled.contains(identity) {
-                let traits = map.entry(*identity).or_default();
-                traits.client = Some(contact_info.version().client().to_string());
-                traits.version = Some(contact_info.version().to_string());
-                traits.ip = contact_info.gossip().map(|addr| addr.ip().to_string());
-                traits.country = contact_info
-                    .gossip()
-                    .and_then(|addr| geoip::country(addr.ip()));
-            }
-        }
-        if let Ok(mut held) = self.replies.leader_traits.write() {
-            *held = map;
-        }
-    }
-
-    fn collect_peer_table(
-        &mut self,
-        bank: &Bank,
-        mut leaders: HashSet<Pubkey>,
-        peers: &[(ContactInfo, u64)],
-    ) {
-        let highest = self.last_completed_slot;
-        let first = highest.saturating_sub(SLOT_OVERVIEW_LEN as u64);
-        let stride = NUM_CONSECUTIVE_LEADER_SLOTS.get() as u64;
-        let mut slot = first.saturating_sub(first.checked_rem(stride).unwrap_or(0));
-        while slot <= highest {
-            if let Some(leader) = self
-                .ctx
-                .leader_schedule_cache
-                .slot_leader_at(slot, Some(bank))
-            {
-                leaders.insert(leader.id);
-            }
-            slot = slot.saturating_add(stride);
-        }
-
-        let stakes = tally_bank_stake(bank).staked;
-
-        let mut gossip: HashMap<Pubkey, Heard> = HashMap::new();
-        for (contact_info, _) in peers {
-            let identity = contact_info.pubkey();
-            if !leaders.contains(identity) {
-                continue;
-            }
-            gossip.insert(
-                *identity,
-                Heard {
-                    version: Some(contact_info.version().to_string()),
-                    client: Some(contact_info.version().client().to_string()),
-                    ip: contact_info.gossip().map(|addr| addr.ip().to_string()),
-                    country: contact_info
-                        .gossip()
-                        .and_then(|addr| geoip::country(addr.ip())),
-                },
-            );
-        }
-
-        let mut peers: Vec<Peer> = leaders
-            .into_iter()
-            .map(|identity| {
-                let Heard {
-                    version,
-                    client,
-                    ip,
-                    country,
-                } = gossip.remove(&identity).unwrap_or_default();
-                let (name, icon) = self.peer_display(&identity);
-                Peer {
-                    stake: stakes.get(&identity).copied().unwrap_or(0),
-                    version,
-                    client,
-                    ip,
-                    country,
-                    name,
-                    icon,
-                    identity: identity.to_string(),
-                }
-            })
-            .collect();
-        peers.sort_by(|a, b| a.identity.cmp(&b.identity));
-
-        self.debounces.peers.publish(&self.publisher, peers);
-    }
-
-    fn collect_slot_levels(&mut self, root_bank: &Bank, frozen: &[(Slot, Arc<Bank>)]) {
-        let commitment = self.ctx.block_commitment_cache.read().unwrap();
-        let (confirmed, finalized) = (
-            commitment.highest_confirmed_slot(),
-            commitment.highest_super_majority_root(),
-        );
-        drop(commitment);
-        let root = root_bank.slot();
-
-        let banks: Vec<Arc<Bank>> = match &self.frozen_banks {
-            Some(receiver) => receiver
-                .try_iter()
-                .filter_map(|(notification, _)| match notification {
-                    BankNotification::Frozen(bank) => Some(bank),
-                    _ => None,
-                })
-                .collect(),
-            None => frozen.iter().map(|(_, bank)| bank.clone()).collect(),
-        };
-        self.collect_validator_info(&banks, frozen);
-
-        let mut changed = Vec::new();
-        let mut became_full = Vec::new();
-        let mut captured = false;
-        for bank in &banks {
-            self.observe_finalization(bank);
-            let slot = bank.slot();
-            // Counts are cumulative along a fork; a block's own is the difference
-            // from its parent, off the parent's totals or the parent itself.
-            let before = self.totals.get(&bank.parent_slot()).copied();
-            let parent = before.is_none().then(|| bank.parent()).flatten();
-            let counts = before
-                .map(|before| (before.transactions, before.non_vote))
-                .or_else(|| {
-                    let parent = parent.as_ref()?;
-                    Some((
-                        parent.transaction_count(),
-                        parent.non_vote_transaction_count_since_restart(),
-                    ))
-                })
-                .map(|(transactions, non_vote)| {
-                    (
-                        bank.transaction_count().saturating_sub(transactions),
-                        bank.non_vote_transaction_count_since_restart()
-                            .saturating_sub(non_vote),
-                    )
-                });
-            // Unlike the counts above, a bank's error count is its own. A genesis bank is its
-            // own parent.
-            let failed = before
-                .filter(|_| bank.parent_slot() < slot)
-                .map_or(0, |before| before.failed)
-                .saturating_add(bank.transaction_error_count());
-            self.totals.insert(
-                slot,
-                Totals {
-                    transactions: bank.transaction_count(),
-                    non_vote: bank.non_vote_transaction_count_since_restart(),
-                    tips: self.tips.as_ref().map_or(0, |meter| meter.total(bank)),
-                    failed,
-                },
-            );
-            // Read at a bank's first sighting: the cost tracker and fees go with the bank once it
-            // is rooted.
-            let fresh = self
-                .slots
-                .get(slot)
-                .is_none_or(|entry| entry.block.is_none());
-            let tips = if fresh {
-                self.tips.as_mut().and_then(|meter| {
-                    let before_tips = before
-                        .map(|before| before.tips)
-                        .or_else(|| parent.as_ref().map(|parent| meter.total(parent)))?;
-                    Some(meter.measure(bank, before_tips))
-                })
-            } else {
-                None
-            };
-            // Replay reports nought for a bank this validator built, finding it already executed;
-            // left absent rather than shown as replayed in no time.
-            let mine = self.slots.get(slot).is_some_and(|entry| entry.mine);
-            self.fee_payers.note_frozen(bank, mine);
-            let replayed = (fresh && !mine)
-                .then(|| self.metrics_tap.replayed(slot))
-                .flatten();
-            let replay = replayed.map(|times| times.serial());
-            // On the blockstore's clock: from the entry once timed, from the blockstore before
-            // that.
-            let replayed_millis = replayed.and_then(|times| {
-                let first = self
-                    .slots
-                    .get(slot)
-                    .and_then(|entry| entry.time_millis)
-                    .or_else(|| self.first_shred_time(slot))?;
-                Some(times.observed_millis.saturating_sub(first))
-            });
-            let shreds = fresh
-                .then(|| self.metrics_tap.shred_fill(slot).map(ShredArrival::from))
-                .flatten();
-            let detail = counts
-                .filter(|_| fresh)
-                .map(|(total, non_vote)| block_detail(bank, total, non_vote, tips, replay));
-
-            if let Some(detail) = &detail
-                && mine
-            {
-                let block = self.capture_block(slot, bank, detail);
-                if self.replies.produced.write().unwrap().insert(block) {
-                    self.versions_pending.insert(slot);
-                    self.execution_pending.insert(slot);
-                    captured = true;
-                }
-            }
-
-            let level = classify_slot(slot, root, confirmed, finalized);
-            let was_full = self.slots.get(slot).and_then(SlotEntry::full_at).is_some();
-            if let Some(entry) = self.slots.update(slot, |entry| {
-                entry.level = level;
-                if let Some(detail) = &detail {
-                    entry.block = Some(detail.clone());
-                }
-                if replayed_millis.is_some() {
-                    entry.replayed_millis = replayed_millis;
-                }
-                if entry.shreds.is_none() {
-                    entry.shreds = shreds;
-                }
-            }) {
-                if !was_full && entry.full_at().is_some() {
-                    became_full.push(slot);
-                }
-                // Blocks this node replayed, on the clock their replay was timed on; none while it
-                // catches up after starting, when repair rather than turbine brings them.
-                let catching_up = self.trailed_cluster && !self.caught_cluster;
-                if !catching_up
-                    && let (Some(replayed), Some(shreds), Some(first)) = (
-                        replayed_millis,
-                        entry.shreds,
-                        entry.time_millis.or_else(|| self.first_shred_time(slot)),
-                    )
-                {
-                    self.block_lives
-                        .note_arrival(slot, first, &shreds, replayed, self.cluster_tip);
-                }
-                changed.push(entry);
-            }
-        }
-        let blockstore = &self.ctx.blockstore;
-        let fees = self.fee_payers.read(blockstore);
-        if !fees.is_empty() {
-            let mut produced = self.replies.produced.write().unwrap();
-            for block in fees {
-                produced.set_fees(block);
-            }
-        }
-        self.fee_payers
-            .settle(root, root_bank.epoch(), |slot| blockstore.is_root(slot));
-        // A block of ours the cluster skipped is not a produced block.
-        let dropped = self.replies.produced.write().unwrap().drop_unrooted(
-            self.produced_settled_to,
-            root,
-            |slot| blockstore.is_root(slot),
-        );
-        self.produced_settled_to = root;
-        let retimed = self.retime(&became_full, &mut changed);
-        // The next slot's first shred usually arrives before this block fills.
-        for slot in &became_full {
-            self.note_handoff(root_bank, *slot);
-            self.note_handoff(root_bank, slot.saturating_add(1));
-        }
-
-        // The loop above no longer covers slots that have fallen out of bank
-        // forks, so their levels advance from the roots directly.
-        changed.extend(self.slots.promote(finalized, SlotLevel::Finalized));
-        changed.extend(self.slots.promote(root, SlotLevel::Rooted));
-        changed.extend(
-            self.slots
-                .promote(confirmed, SlotLevel::OptimisticallyConfirmed),
-        );
-
-        changed.extend(self.slots.mark_skipped_below(root));
-        self.totals = self.totals.split_off(&root.saturating_sub(TOTALS_KEPT));
-
-        for entry in &changed {
-            self.publish_slot(entry);
-        }
-        // The bundle stage reports a slot after its bank freezes.
-        let tap = &self.metrics_tap;
-        let filled = self
-            .replies
-            .produced
-            .write()
-            .unwrap()
-            .fill_bundles(|slot| tap.bundles_landed(slot).map(Bundles::from));
-        let led = self
-            .replies
-            .produced
-            .write()
-            .unwrap()
-            .fill_leading(|slot| tap.leader_timing(slot));
-        let read = self.fill_versions();
-        let timed = self.fill_execution();
-        if dropped {
-            // No message takes a block back, so the lists go whole.
-            self.produced_unsent = true;
-            self.publish_turns();
-        }
-        if captured || filled || led || read || timed || retimed || dropped {
-            self.publish_produced();
-        }
-    }
-
-    /// From the working fork's newest frozen bank, so failures on an abandoned fork drop out.
-    fn store_failed(&self, working_bank: &Bank) {
-        let slot = if working_bank.is_frozen() {
-            working_bank.slot()
-        } else {
-            working_bank.parent_slot()
-        };
-        if let Some(totals) = self.totals.get(&slot) {
-            self.failed_total.store(totals.failed, Ordering::Relaxed);
-        }
-    }
-
-    /// The whole list is for a client connecting, and is dropped while nobody watches; one already
-    /// connected is sent each block that changed. Retained first, so a client connecting in between
-    /// misses neither.
-    fn publish_produced(&mut self) {
-        let changed = self.replies.produced.write().unwrap().take_changed();
-        if self.publisher.subscriber_count() == 0 {
-            self.publisher.forget(TOPIC_SUMMARY, "produced_blocks");
-            self.produced_unsent = true;
-            return;
-        }
-        let send = std::mem::take(&mut self.produced_unsent);
-        {
-            // The collector is the only writer, so this is the list `changed` was taken from.
-            let store = self.replies.produced.read().unwrap();
-            let recent = store.recent_refs(PRODUCED_BLOCKS);
-            if send {
-                self.publisher
-                    .publish(TOPIC_SUMMARY, "produced_blocks", &recent);
-            } else {
-                self.publisher
-                    .retain_only(TOPIC_SUMMARY, "produced_blocks", &recent);
-            }
-        }
-        for block in changed {
-            self.publisher
-                .publish_update(TOPIC_SUMMARY, "produced_block", block.slot, &block);
-        }
-    }
-
-    fn fill_versions(&mut self) -> bool {
-        let blockstore = &self.ctx.blockstore;
-        let floor = blockstore.lowest_slot();
-        let mut changed = false;
-        for slot in std::mem::take(&mut self.versions_pending) {
-            if slot < floor || !self.replies.produced.read().unwrap().contains(slot) {
-                continue;
-            }
-            if !blockstore.is_full(slot) {
-                self.versions_pending.insert(slot);
-                continue;
-            }
-            let Ok(entries) = blockstore.get_slot_entries(slot, 0) else {
-                continue;
-            };
-            let tally = versions::tally(entries.iter().flat_map(|entry| &entry.transactions));
-            if self
-                .replies
-                .produced
-                .write()
-                .unwrap()
-                .set_versions(slot, tally)
-            {
-                changed = true;
-            }
-        }
-        changed
-    }
-
-    fn fill_execution(&mut self) -> bool {
-        let now = timestamp();
-        let mut changed = false;
-        for slot in std::mem::take(&mut self.execution_pending) {
-            if !self.replies.produced.read().unwrap().contains(slot) {
-                continue;
-            }
-            let window = self
-                .first_shred_time(slot)
-                .zip(self.metrics_tap.shred_fill(slot))
-                .map(|(start, fill)| (start, fill.full_millis));
-            let Some((start, full_millis)) = window else {
-                if slot.saturating_add(EXECUTION_WAIT_SLOTS) > self.last_completed_slot {
-                    self.execution_pending.insert(slot);
-                }
-                continue;
-            };
-            let settled = start
-                .saturating_add(full_millis)
-                .saturating_add(WORKER_REPORT_MILLIS.saturating_mul(2));
-            if now < settled {
-                self.execution_pending.insert(slot);
-                continue;
-            }
-            let mine = |slot: Option<Slot>| {
-                slot.and_then(|slot| self.slots.get(slot))
-                    .is_some_and(|entry| entry.mine)
-            };
-            let next = slot.saturating_add(1);
-            let next_start = mine(Some(next))
-                .then(|| self.first_shred_time(next))
-                .flatten();
-            let (from, to) =
-                execution_window(start, mine(slot.checked_sub(1)), next_start, settled);
-            if now < to {
-                self.execution_pending.insert(slot);
-                continue;
-            }
-            let workers = self.metrics_tap.worker_time(from, to);
-            let votes = self.metrics_tap.vote_time(slot);
-            let Some(execution) = build_execution(workers, votes, full_millis) else {
-                continue;
-            };
-            if self
-                .replies
-                .produced
-                .write()
-                .unwrap()
-                .set_execution(slot, execution)
-            {
-                changed = true;
-            }
-        }
-        changed
-    }
-
-    fn capture_block(&self, slot: Slot, bank: &Bank, detail: &BlockDetail) -> ProducedBlock {
-        ProducedBlock {
-            slot,
-            slot_time_millis: self.first_shred_time(slot),
-            blockhash: bank.last_blockhash().to_string(),
-            duration_nanos: self.slots.get(slot).and_then(|entry| entry.duration_nanos),
-            transactions: detail.transactions,
-            non_vote_transactions: detail.non_vote_transactions,
-            failed_transactions: detail.failed_transactions,
-            entries: detail.entries,
-            block_cost: detail.block_cost,
-            block_cost_limit: detail.block_cost_limit,
-            account_cost_limit: detail.account_cost_limit,
-            total_fees: detail.total_fees,
-            priority_fees: detail.priority_fees,
-            tips: detail.tips,
-            bundles: self.metrics_tap.bundles_landed(slot).map(Bundles::from),
-            versions: None,
-            execution: None,
-            certificate: None,
-            leading: self.metrics_tap.leader_timing(slot),
-        }
-    }
-
-    /// Here because no single moment finishes an entry. Not sent while the overview is owed, which
-    /// carries it and must reach the next viewer before any update.
-    fn publish_slot(&mut self, entry: &SlotEntry) {
-        self.history.write().unwrap().record(entry);
-        if !self.overview_unsent {
-            self.publisher
-                .publish_update(TOPIC_SLOT, "update", entry.slot, entry);
-        }
-        self.overview_dirty = true;
-    }
-
-    fn publish_slot_overview(&mut self) {
-        let overview = self.slots.overview(SLOT_OVERVIEW_LEN);
-        if std::mem::take(&mut self.overview_unsent) {
-            self.publisher.publish(TOPIC_SLOT, "overview", &overview);
-        } else {
-            self.publisher
-                .retain_only(TOPIC_SLOT, "overview", &overview);
-        }
-    }
-
-    fn collect_identity_and_vote(&mut self, bank: &Bank, behind_cluster: Option<u64>) {
-        let identity = self.ctx.identity();
-        self.debounces
-            .identity_key
-            .publish(&self.publisher, identity.to_string());
-        self.debounces
-            .vote_key
-            .publish(&self.publisher, self.ctx.vote_account.to_string());
-        let (my_name, my_icon) = self.peer_display(&identity);
-        self.debounces
-            .identity_name
-            .publish(&self.publisher, my_name);
-        self.debounces
-            .identity_icon
-            .publish(&self.publisher, my_icon);
-        self.debounces
-            .identity_balance
-            .publish(&self.publisher, bank.get_balance(&identity));
-        self.debounces
-            .vote_balance
-            .publish(&self.publisher, bank.get_balance(&self.ctx.vote_account));
-
-        let epoch = bank.epoch();
-        let vote_accounts = bank.vote_accounts();
-        let mine = vote_accounts.get(&self.ctx.vote_account);
-        let pending = mine.map_or(0, |(_, account)| {
-            account.vote_state_view().pending_delegator_rewards()
-        });
-        self.debounces
-            .vote_cost
-            .publish(&self.publisher, compute_vote_cost(bank, pending));
-        let total_stake: u64 = vote_accounts.values().map(|(stake, _)| *stake).sum();
-        // From the same bank as our own credits, so the share never compares two moments.
-        let staked_credits: Vec<u64> = vote_accounts
-            .values()
-            .filter(|(stake, _)| *stake > 0)
-            .map(|(_, account)| count_epoch_credits(account.vote_state_view(), epoch))
-            .collect();
-        let cluster_max = staked_credits.iter().copied().max();
-        let cluster_median = certs::median_of(staked_credits);
-
-        // After a failover the vote account is voted from another machine, whose
-        // last vote must not be read as this one's health.
-        let voting = mine.is_some_and(|(_, account)| *account.node_pubkey() == identity);
-        self.voting = voting;
-
-        let (activated_stake, commission, voter_vote) = match mine {
-            Some((stake, account)) => {
-                let view = account.vote_state_view();
-                (*stake, Some(view.commission()), view.last_voted_slot())
-            }
-            None => (0, None, None),
-        };
-
-        let bls_key =
-            mine.map(|(_, account)| account.vote_state_view().bls_pubkey_compressed().is_some());
-        let vote_credits = mine.map(|(_, account)| VoteCredits {
-            epoch,
-            credits: count_epoch_credits(account.vote_state_view(), epoch),
-            cluster_max,
-            cluster_median,
-        });
-        self.debounces.bls_key.publish(&self.publisher, bls_key);
-        self.debounces.admission.publish(
-            &self.publisher,
-            read_admission(bank, &self.ctx.vote_account),
-        );
-        self.debounces
-            .vote_credits
-            .publish(&self.publisher, vote_credits);
-
-        let last_vote = if voting { voter_vote } else { None };
-
-        self.debounces
-            .vote_commission
-            .publish(&self.publisher, commission);
-        self.debounces.stake.publish(
-            &self.publisher,
-            StakeSummary {
-                activated_stake,
-                total_stake,
-                share: if total_stake == 0 {
-                    0.0
-                } else {
-                    activated_stake as f64 / total_stake as f64
-                },
-            },
-        );
-
-        if self.debounces.vote_slot.last() != Some(&last_vote) {
-            self.last_vote_advance = Instant::now();
-        }
-        self.debounces.vote_slot.publish(&self.publisher, last_vote);
-
-        if let Some(behind) = behind_cluster {
-            self.snapshots.note_behind(behind);
-        }
-        self.debounces
-            .behind_cluster
-            .publish(&self.publisher, behind_cluster);
-    }
-
-    fn collect_epoch(&mut self, bank: &Bank, completed_height: Option<u64>) {
-        // Blocks, not slots: the gap between the two is how many slots the cluster skipped.
-        if let Some(height) = completed_height {
-            self.debounces.block_height.publish(&self.publisher, height);
-        }
-
-        let epoch_schedule = bank.epoch_schedule();
-        let slot = bank.slot();
-        let epoch = epoch_schedule.get_epoch(slot);
-        let start_slot = epoch_schedule.get_first_slot_in_epoch(epoch);
-        let end_slot = epoch_schedule.get_last_slot_in_epoch(epoch);
-
-        let me = self.ctx.identity();
-        if self.epoch_published != Some((epoch, me, true)) {
-            let current = EpochInfo {
-                // An unknown schedule is published as no leader slots.
-                my_leader_slots: self.leader_slots_in_epoch(bank, epoch).unwrap_or_default(),
-                ..self.epoch_record(bank, epoch)
-            };
-            let known = !current.turns.is_empty();
-
-            // The previous epoch, kept for the server rather than sent: half a megabyte, wanted
-            // only by a page reading back across the boundary.
-            let previous = epoch
-                .checked_sub(1)
-                .map(|before| self.epoch_record(bank, before))
-                .filter(|record| !record.turns.is_empty());
-
-            let mut archive = self.epochs.write().unwrap();
-            archive.clear();
-            archive.extend(previous);
-            archive.push(current.clone());
-            drop(archive);
-
-            self.debounces.epoch.publish(&self.publisher, current);
-            self.epoch_published = Some((epoch, me, known));
-        }
-
-        self.collect_epoch_countdown(bank, epoch, start_slot, end_slot);
-    }
-
-    /// Rounded to the second so the debounce has something to suppress.
-    fn collect_epoch_countdown(
-        &mut self,
-        bank: &Bank,
-        epoch: Epoch,
-        start_slot: Slot,
-        end_slot: Slot,
-    ) {
-        // Nothing has frozen just after startup, and a completed slot of zero would put the end
-        // years out.
-        let completed = self.last_completed_slot.max(bank.slot());
-        let remaining_slots = end_slot.saturating_sub(completed);
-        let slot_nanos = self.clock.slot_nanos(
-            &bank.clock(),
-            start_slot,
-            completed,
-            bank.ns_per_slot_at_slot(completed) as u64,
-        );
-        let ahead = Duration::from_nanos(remaining_slots.saturating_mul(slot_nanos));
-
-        let now = SystemTime::now();
-        let Some(estimate) = now.checked_add(ahead) else {
-            return;
-        };
-        let end = self.clock.epoch_end(epoch, estimate, now);
-
-        let remaining = end.duration_since(now).unwrap_or_default();
-        self.debounces.epoch_remaining_nanos.publish(
-            &self.publisher,
-            remaining.as_secs().saturating_mul(1_000_000_000),
-        );
-    }
-
-    /// With no leader slots of ours, and no turns where the schedule is not derived.
-    fn epoch_record(&self, bank: &Bank, epoch: Epoch) -> EpochInfo {
-        let schedule = bank.epoch_schedule();
-        let start_slot = schedule.get_first_slot_in_epoch(epoch);
-        let slots_in_epoch = schedule.get_slots_in_epoch(epoch);
-        let (leaders, turns) = self.epoch_turns(epoch, slots_in_epoch);
-        let (block_cost_limit, account_cost_limit) = match bank.read_cost_tracker() {
-            Ok(tracker) => (tracker.get_block_limit(), tracker.get_account_limit()),
-            Err(_) => (0, 0),
-        };
-        EpochInfo {
-            epoch,
-            start_slot,
-            end_slot: schedule.get_last_slot_in_epoch(epoch),
-            slots_in_epoch,
-            my_leader_slots: Vec::new(),
-            leaders,
-            turns,
-            block_cost_limit,
-            account_cost_limit,
-        }
-    }
-
-    /// Empty, never partial, if the length is not whole turns.
-    fn epoch_turns(&self, epoch: Epoch, slots_in_epoch: u64) -> (Vec<String>, Vec<u16>) {
-        let Some(schedule) = self
-            .ctx
-            .leader_schedule_cache
-            .get_epoch_leader_schedule(epoch)
-        else {
-            return (Vec::new(), Vec::new());
-        };
-        let stride = NUM_CONSECUTIVE_LEADER_SLOTS.get();
-
-        let mut leaders: Vec<String> = Vec::new();
-        let mut seen: HashMap<Pubkey, u16> = HashMap::new();
-        let mut turns: Vec<u16> = Vec::new();
-        for leader in schedule.get_slot_leaders().step_by(stride) {
-            let index = match seen.get(&leader.id) {
-                Some(index) => *index,
-                None => {
-                    let Ok(index) = u16::try_from(leaders.len()) else {
-                        return (Vec::new(), Vec::new());
-                    };
-                    leaders.push(leader.id.to_string());
-                    seen.insert(leader.id, index);
-                    index
-                }
-            };
-            turns.push(index);
-        }
-
-        let covered = (turns.len() as u64).saturating_mul(stride as u64);
-        if covered != slots_in_epoch {
-            log::warn!(
-                "dashboard: epoch {epoch} leader schedule read as {} turns covering {covered} \
-                 slots, not {slots_in_epoch}; publishing no schedule for it",
-                turns.len()
-            );
-            return (Vec::new(), Vec::new());
-        }
-        (leaders, turns)
-    }
-
-    /// `None` means the schedule is not known yet, which is not an empty list.
-    fn leader_slots_in_epoch(&self, bank: &Bank, epoch: Epoch) -> Option<Vec<Slot>> {
-        let epoch_schedule = bank.epoch_schedule();
-        let start_slot = epoch_schedule.get_first_slot_in_epoch(epoch);
-        let end_slot = epoch_schedule.get_last_slot_in_epoch(epoch);
-
-        // `get_leader_upcoming_slots` yields an endlessly repeating schedule, so
-        // the `take_while` is what bounds it to the epoch asked for.
-        let me = self.ctx.identity();
-        self.ctx
-            .leader_schedule_cache
-            .get_epoch_leader_schedule(epoch)
-            .map(|leaders| {
-                leaders
-                    .get_leader_upcoming_slots(&me, 0)
-                    .map(|index| start_slot.saturating_add(index as Slot))
-                    .take_while(|slot| *slot <= end_slot)
-                    .collect()
-            })
-    }
-
-    /// Returns each validator's stalest vote, which the certificate lists mark delinquency by.
-    fn collect_peers(&mut self, bank: &Bank, peers: &[(ContactInfo, u64)]) -> LastVotes {
-        let rpc_nodes = count_rpc_nodes(&self.ctx.cluster_info, peers);
-        let tally = tally_bank_stake(bank);
-
-        // A validator can be in gossip or the vote accounts without the other, so both are walked.
-        // Versions are kept only for the staked identities they are counted over.
-        let versions: HashMap<Pubkey, String> = peers
-            .iter()
-            .filter(|(contact_info, _)| tally.staked.contains_key(contact_info.pubkey()))
-            .map(|(contact_info, _)| (*contact_info.pubkey(), contact_info.version().to_string()))
-            .collect();
-
-        self.debounces.validator_counts.publish(
-            &self.publisher,
-            ValidatorCounts {
-                total: tally.staked.len(),
-                delinquent: tally.delinquent.len(),
-                rpc_nodes,
-                non_delinquent_stake: tally.non_delinquent_stake,
-                delinquent_stake: tally.delinquent_stake,
-            },
-        );
-
-        self.debounces
-            .versions
-            .publish(&self.publisher, version_shares(&tally.staked, &versions));
-        tally.stalest_votes
-    }
-
-    /// The icon is a third-party URL the client fetches itself.
-    fn peer_display(&self, identity: &Pubkey) -> (Option<String>, Option<String>) {
-        match self.info_cache.read().unwrap().get(identity) {
-            None => (None, None),
-            Some(info) => (info.name.clone(), info.icon_url.clone()),
-        }
-    }
-
-    fn collect_validator_info(&mut self, banks: &[Arc<Bank>], frozen: &[(Slot, Arc<Bank>)]) {
-        // Bank forks repeats a bank every tick; the notification stream sends each once.
-        let repeated = self.frozen_banks.is_none();
-        let mut found = Vec::new();
-        // Banks frozen while the ledger loaded at startup are never notified, so the first sweep
-        // reads bank forks too.
-        if !repeated && self.info_scanned_to == 0 {
-            for (slot, bank) in frozen {
-                if banks.iter().all(|notified| notified.slot() != *slot) {
-                    self.info_scanned_to = self.info_scanned_to.max(*slot);
-                    found.push((*slot, validator_info::scan_slot(bank)));
-                }
-            }
-        }
-        for bank in banks {
-            let slot = bank.slot();
-            if repeated && slot <= self.info_scanned_to {
-                continue;
-            }
-            self.info_scanned_to = self.info_scanned_to.max(slot);
-            found.push((slot, validator_info::scan_slot(bank)));
-        }
-        found.retain(|(_, entries)| !entries.is_empty());
-        if found.is_empty() {
-            return;
-        }
-
-        let mut cache = self.info_cache.write().unwrap();
-        let changed: usize = found
-            .into_iter()
-            .map(|(slot, entries)| cache.merge(slot, entries))
-            .sum();
-        drop(cache);
-        if changed > 0 {
-            log::debug!("dashboard: {changed} validator info entries updated");
-        }
-    }
-
-    /// On the fast path, since the health figures only run with a viewer.
-    fn mark_caught_cluster(&mut self, behind_cluster: Option<u64>) {
-        if self.caught_cluster {
-            return;
-        }
-        let Some(behind) = behind_cluster else {
-            return;
-        };
-        if behind > IN_STEP_SLOTS {
-            if !self.trailed_cluster {
-                self.history.write().unwrap().set_live_from(Slot::MAX);
-            }
-            self.trailed_cluster = true;
-            return;
-        }
-        if !self.trailed_cluster {
-            return;
-        }
-        self.caught_cluster = true;
-        self.history
-            .write()
-            .unwrap()
-            .set_live_from(self.last_completed_slot.saturating_add(1));
-        self.caught_up_millis = Some(timestamp());
-        self.publisher.publish(
-            TOPIC_SUMMARY,
-            "caught_up_time_nanos",
-            &system_time_nanos(SystemTime::now()),
-        );
-    }
-
-    fn collect_health(&mut self) {
-        let vote_slot = self.debounces.vote_slot.last().copied().flatten();
-        let health = assess_health(
-            self.last_completed_at.elapsed(),
-            self.last_completed_slot,
-            self.voting,
-            vote_slot,
-            vote_slot.map(|vote| self.last_completed_slot.saturating_sub(vote)),
-            self.last_vote_advance.elapsed(),
-        );
-        self.debounces.health.publish(&self.publisher, health);
-        let rate =
-            measure_replay_rate(&self.completed_window).map(|rate| (rate * 10.0).round() / 10.0);
-        self.debounces.replay_rate.publish(&self.publisher, rate);
-    }
-
-    /// On the same basis as `solana block-production`, each slot checked once as the root passes
-    /// it.
-    fn collect_skip_rate(&mut self, root_bank: &Bank) {
-        // The root's epoch, not the working bank's: they differ for half a minute
-        // after a rollover.
-        let epoch = root_bank.epoch();
-        // Keyed on the identity too, so a validator that boots on a dummy one and
-        // swaps counts its real slots.
-        let me = self.ctx.identity();
-        let previous = epoch.checked_sub(1);
-        // At a rollover the current walk carries on as the previous epoch's, so its last slots
-        // are still counted.
-        if previous.is_some_and(|previous| self.skip_rate.epoch == Some((previous, me))) {
-            self.previous_slots = std::mem::take(&mut self.skip_rate);
-        }
-        if self.skip_rate.epoch != Some((epoch, me)) {
-            // Latched only once the schedule is in hand. Taking an unknown schedule as
-            // empty would record a permanent zero.
-            let Some(leader_slots) = self.leader_slots_in_epoch(root_bank, epoch) else {
-                return;
-            };
-            self.skip_rate = SkipRateWalk::new(epoch, me, leader_slots);
-        }
-        if let Some(previous) = previous
-            && self.previous_slots.epoch != Some((previous, me))
-        {
-            // After a restart the cache may lack the previous schedule; then there are no counts.
-            self.previous_slots = self
-                .leader_slots_in_epoch(root_bank, previous)
-                .map(|leader_slots| SkipRateWalk::new(previous, me, leader_slots))
-                .unwrap_or_default();
-        }
-
-        let root = root_bank.slot();
-        // Read only when a leader slot has come due: the sysvar is a 128 KB bitmap.
-        if (self.skip_rate.due(root) || self.previous_slots.due(root))
-            && let Some(history) = root_bank.get_slot_history()
-        {
-            self.skip_rate.advance(root, |slot| history.check(slot));
-            self.previous_slots
-                .advance(root, |slot| history.check(slot));
-        }
-        let rate = self.skip_rate.rate();
-        self.debounces
-            .skip_rate
-            .publish(&self.publisher, SkipRate { epoch, rate });
-        let counts = [&self.previous_slots, &self.skip_rate]
-            .into_iter()
-            .filter_map(SkipRateWalk::counts)
-            .collect();
-        self.debounces
-            .leader_slot_counts
-            .publish(&self.publisher, counts);
-    }
-
-    fn collect_startup_progress(&mut self) {
-        let progress = *self.startup_progress.read().unwrap();
-        self.startup.lock().unwrap().publish(
-            &self.publisher,
-            progress,
-            self.metrics_tap.stake_in_gossip(),
-        );
-    }
-}
-
-/// Blocks on the tip's chain that replay has yet to complete, so slots the cluster skipped are not
-/// distance. Past the walk, or below a slot whose parent is unknown, the rest is counted in slots.
-fn blocks_behind(blockstore: &Blockstore, tip: Slot, completed: Slot) -> u64 {
-    let mut slot = tip;
-    let mut blocks = 0u64;
-    while slot > completed && blocks < BEHIND_WALK_BLOCKS {
-        let Some(parent) = blockstore
-            .meta(slot)
-            .ok()
-            .flatten()
-            .and_then(|meta| meta.parent_slot)
-        else {
-            break;
-        };
-        blocks = blocks.saturating_add(1);
-        slot = parent;
-    }
-    blocks.saturating_add(slot.saturating_sub(completed))
-}
-
-fn measure_replay_rate(window: &VecDeque<(Instant, Slot)>) -> Option<f64> {
+pub fn measure_replay_rate(window: &VecDeque<(Instant, Slot)>) -> Option<f64> {
     let (oldest_at, oldest) = window.front()?;
     let (newest_at, newest) = window.back()?;
     let span = newest_at.duration_since(*oldest_at);
@@ -2349,42 +375,7 @@ fn measure_replay_rate(window: &VecDeque<(Instant, Slot)>) -> Option<f64> {
     Some(newest.saturating_sub(*oldest) as f64 / span.as_secs_f64())
 }
 
-fn compute_vote_cost(bank: &Bank, pending: u64) -> VoteCost {
-    if bank.is_alpenglow() {
-        let minimum = bank.minimum_vote_account_balance_for_vat();
-        let rent = bank.get_minimum_balance_for_rent_exemption(VoteStateV4::size_of());
-        return VoteCost::Ticket {
-            lamports: minimum.saturating_sub(rent),
-            minimum,
-            pending,
-        };
-    }
-    let ns_per_slot = bank.ns_per_slot_at_slot(bank.slot()).max(1);
-    let slots_per_day =
-        u64::try_from(NANOS_PER_DAY.checked_div(ns_per_slot).unwrap_or(0)).unwrap_or(u64::MAX);
-    VoteCost::Fees {
-        per_day: slots_per_day.saturating_mul(bank.get_lamports_per_signature()),
-    }
-}
-
-/// Reads only the newest entry, which is the bank's own epoch once the account has voted in it.
-fn count_epoch_credits(view: &solana_vote::vote_state_view::VoteStateView, epoch: Epoch) -> u64 {
-    view.epoch_credits_iter()
-        .last()
-        .filter(|item| item.epoch() == epoch)
-        .map_or(0, |item| item.credits().saturating_sub(item.prev_credits()))
-}
-
-/// Most settled first: the thresholds cross while the commitment cache lags the root at startup.
-/// The country of a validator's gossip address, for one not on the peer table.
-fn country_of(cluster_info: &ClusterInfo, key: &Pubkey) -> Option<&'static str> {
-    cluster_info
-        .lookup_contact_info(key, |contact| contact.gossip())
-        .flatten()
-        .and_then(|addr| geoip::country(addr.ip()))
-}
-
-fn classify_slot(slot: Slot, root: Slot, confirmed: Slot, finalized: Slot) -> SlotLevel {
+pub fn classify_slot(slot: Slot, root: Slot, confirmed: Slot, finalized: Slot) -> SlotLevel {
     if slot <= finalized {
         SlotLevel::Finalized
     } else if slot <= root {
@@ -2398,35 +389,23 @@ fn classify_slot(slot: Slot, root: Slot, confirmed: Slot, finalized: Slot) -> Sl
 
 /// Keyed by identity: several staked vote accounts are one validator.
 #[derive(Debug, Default, PartialEq, Eq)]
-pub(crate) struct StakeTally {
-    pub(crate) staked: HashMap<Pubkey, u64>,
-    delinquent: HashSet<Pubkey>,
+pub struct StakeTally {
+    pub staked: HashMap<Pubkey, u64>,
+    pub delinquent: HashSet<Pubkey>,
     /// The oldest last vote among each validator's staked accounts, `None` where one never voted.
-    stalest_votes: LastVotes,
-    delinquent_stake: u64,
-    non_delinquent_stake: u64,
+    pub stalest_votes: LastVotes,
+    pub delinquent_stake: u64,
+    pub non_delinquent_stake: u64,
 }
 
 /// The cluster's rule: no vote yet, or the last one too far behind the tip.
-pub(crate) fn is_delinquent(last_vote: Option<Slot>, tip: Slot) -> bool {
+pub fn is_delinquent(last_vote: Option<Slot>, tip: Slot) -> bool {
     last_vote
-        .map(|vote| tip.saturating_sub(vote) > DELINQUENT_VALIDATOR_SLOT_DISTANCE)
+        .map(|vote| tip.saturating_sub(vote) >= DELINQUENT_VALIDATOR_SLOT_DISTANCE)
         .unwrap_or(true)
 }
 
-/// The bank's staked vote accounts tallied by identity, against the bank's own slot.
-pub(crate) fn tally_bank_stake(bank: &Bank) -> StakeTally {
-    let accounts = bank.vote_accounts();
-    tally_stake(
-        accounts.iter().map(|(_, (stake, account))| {
-            let last_vote = account.vote_state_view().last_voted_slot();
-            (*account.node_pubkey(), *stake, last_vote)
-        }),
-        bank.slot(),
-    )
-}
-
-fn tally_stake(
+pub fn tally_stake(
     accounts: impl Iterator<Item = (Pubkey, u64, Option<Slot>)>,
     tip: Slot,
 ) -> StakeTally {
@@ -2459,7 +438,7 @@ const REPLAY_STALL_AFTER: Duration = Duration::from_secs(12);
 const VOTE_STALL_AFTER: Duration = Duration::from_secs(60);
 
 /// The two durations sit at either end of the argument list because swapping them compiles.
-fn assess_health(
+pub fn assess_health(
     since_completed: Duration,
     completed_slot: Slot,
     voting: bool,
@@ -2491,107 +470,68 @@ fn assess_health(
     Health { replay, vote }
 }
 
-/// `ClusterInfo::rpc_peers`' filter over a copy of the table, which holds one contact per identity.
-fn count_rpc_nodes(cluster_info: &ClusterInfo, peers: &[(ContactInfo, u64)]) -> usize {
-    let me = cluster_info.id();
-    let space = cluster_info.socket_addr_space();
-    peers
-        .iter()
-        .filter(|(contact, _)| {
-            contact.pubkey() != &me && contact.rpc().is_some_and(|addr| space.check(&addr))
-        })
-        .count()
-}
-
 /// Counted over staked identities so the two cards add up.
-fn version_shares(
+pub fn version_shares(
     staked: &HashMap<Pubkey, u64>,
     versions: &HashMap<Pubkey, String>,
 ) -> Vec<VersionShare> {
-    let mut totals: HashMap<Option<&str>, (usize, u64)> = HashMap::new();
-    for (identity, stake) in staked {
+    let releases = staked.iter().map(|(identity, stake)| {
         let release = versions
             .get(identity)
             .map(|version| strip_prerelease(version));
-        let entry = totals.entry(release).or_insert((0, 0));
-        entry.0 = entry.0.saturating_add(1);
-        entry.1 = entry.1.saturating_add(*stake);
-    }
-
-    let mut shares: Vec<VersionShare> = totals
-        .into_iter()
-        .map(|(version, (validators, stake))| VersionShare {
+        (Some(release), *stake)
+    });
+    // Folded to keep the message a fixed size.
+    let (rows, (folded, validators, stake)) =
+        by_stake(releases, MAX_VERSIONS_REPORTED, |a, b| b.1.cmp(&a.1));
+    rows.into_iter()
+        .map(|row| (row, false))
+        .chain((folded > 0).then_some(((None, validators, stake), true)))
+        .map(|((version, validators, stake), other)| VersionShare {
             version: version.map(str::to_string),
             validators,
             stake,
-            other: false,
+            other,
         })
+        .collect()
+}
+
+/// A key, its validators and their stake.
+type Staked<K> = (K, usize, u64);
+
+/// Validators and their stake by key, the largest stake first and `tie` ordering equal stakes,
+/// cut to the first `shown`. The rest come back summed with those of no key, keyed by how many
+/// keys they held.
+fn by_stake<K: Eq + Hash>(
+    stakes: impl IntoIterator<Item = (Option<K>, u64)>,
+    shown: usize,
+    tie: impl Fn(&Staked<K>, &Staked<K>) -> Ordering,
+) -> (Vec<Staked<K>>, Staked<usize>) {
+    let mut totals: HashMap<K, (usize, u64)> = HashMap::new();
+    let mut unkeyed = (0usize, 0u64);
+    for (key, stake) in stakes {
+        let (validators, total) = match key {
+            Some(key) => totals.entry(key).or_default(),
+            None => &mut unkeyed,
+        };
+        *validators = validators.saturating_add(1);
+        *total = total.saturating_add(stake);
+    }
+    let mut rows: Vec<Staked<K>> = totals
+        .into_iter()
+        .map(|(key, (validators, stake))| (key, validators, stake))
         .collect();
-    shares.sort_by(|a, b| {
-        b.stake
-            .cmp(&a.stake)
-            .then_with(|| b.validators.cmp(&a.validators))
+    rows.sort_by(|a, b| b.2.cmp(&a.2).then_with(|| tie(a, b)));
+    let tail = rows.split_off(shown.min(rows.len()));
+    let (validators, stake) = tail.iter().fold(unkeyed, |(count, sum), row| {
+        (count.saturating_add(row.1), sum.saturating_add(row.2))
     });
-
-    // Folded to keep the message a fixed size.
-    if shares.len() > MAX_VERSIONS_REPORTED {
-        let tail = shares.split_off(MAX_VERSIONS_REPORTED);
-        shares.push(VersionShare {
-            version: None,
-            validators: tail.iter().map(|share| share.validators).sum(),
-            stake: tail.iter().map(|share| share.stake).sum(),
-            other: true,
-        });
-    }
-    shares
-}
-
-/// The error and entry counters are per bank, so only `transactions` and `non_vote` come
-/// differenced.
-fn block_detail(
-    bank: &Bank,
-    transactions: u64,
-    non_vote: u64,
-    tips: Option<u64>,
-    replay_micros: Option<u64>,
-) -> BlockDetail {
-    let (block_cost, block_cost_limit, account_cost_limit) = match bank.read_cost_tracker() {
-        Ok(tracker) => (
-            tracker.block_cost(),
-            tracker.get_block_limit(),
-            tracker.get_account_limit(),
-        ),
-        Err(_) => (0, 0, 0),
-    };
-    let fees = bank.get_collector_fee_details();
-
-    BlockDetail {
-        transactions,
-        non_vote_transactions: non_vote,
-        failed_transactions: bank.transaction_error_count(),
-        entries: bank.transaction_entries_count(),
-        block_cost,
-        block_cost_limit,
-        account_cost_limit,
-        total_fees: fees.total_transaction_fee(),
-        priority_fees: fees.total_priority_fee(),
-        tips,
-        replay_micros,
-    }
-}
-
-impl From<BundleLanding> for Bundles {
-    fn from(bundles: BundleLanding) -> Self {
-        Self {
-            sanitized: bundles.sanitized,
-            executed: bundles.executed,
-        }
-    }
+    (rows, (tail.len(), validators, stake))
 }
 
 /// The span of worker reports that are a block's own, end excluded. A report closes the time it
 /// covers, so inside a turn each goes to the block holding its middle.
-fn execution_window(
+pub fn execution_window(
     start: u64,
     follows_ours: bool,
     next_start: Option<u64>,
@@ -2607,7 +547,7 @@ fn execution_window(
     (from, to)
 }
 
-fn build_execution(
+pub fn build_execution(
     workers: Option<WorkerSum>,
     votes: Option<StageTimes>,
     window_millis: u64,
@@ -2636,15 +576,22 @@ impl From<ShredFill> for ShredArrival {
     }
 }
 
-/// A cluster mid-upgrade reports `4.2.0`, `4.2.0-rc.0` and `4.2.0-rc.1`, which are one release.
-fn strip_prerelease(version: &str) -> &str {
-    match version.find(['-', '+']) {
-        Some(at) => &version[..at],
-        None => version,
+/// As upstream names the cluster in its own output.
+pub fn cluster_name(cluster_type: ClusterType) -> &'static str {
+    match cluster_type {
+        ClusterType::Testnet => "testnet",
+        ClusterType::MainnetBeta => "mainnet-beta",
+        ClusterType::Devnet => "devnet",
+        ClusterType::Development => "development",
     }
 }
 
-pub(crate) fn system_time_nanos(time: SystemTime) -> u64 {
+/// A cluster mid-upgrade reports `4.2.0`, `4.2.0-rc.0` and `4.2.0-rc.1`, which are one release.
+pub fn strip_prerelease(version: &str) -> &str {
+    version.split(['-', '+']).next().unwrap_or(version)
+}
+
+pub fn system_time_nanos(time: SystemTime) -> u64 {
     time.duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos() as u64
@@ -2652,48 +599,24 @@ pub(crate) fn system_time_nanos(time: SystemTime) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use {
-        super::*,
-        crate::{
-            fixture::{Fixture, fixture},
-            snapshot::Writing,
-            startup::StartupPublisher,
-        },
-        solana_core::validator::ValidatorStartProgress,
-        solana_keypair::Keypair,
-        solana_leader_schedule::SlotLeader,
-        solana_ledger::{blockstore::make_slot_entries, get_tmp_ledger_path_auto_delete},
-        solana_net_utils::SocketAddrSpace,
-        solana_signer::Signer,
-        std::net::SocketAddr,
-    };
+    use super::*;
 
     #[test]
     fn test_level_reads_the_thresholds_most_settled_first() {
-        assert_eq!(classify_slot(80, 100, 110, 90), SlotLevel::Finalized);
-        assert_eq!(classify_slot(95, 100, 110, 90), SlotLevel::Rooted);
-        assert_eq!(
-            classify_slot(105, 100, 110, 90),
-            SlotLevel::OptimisticallyConfirmed
-        );
-        assert_eq!(classify_slot(120, 100, 110, 90), SlotLevel::Completed);
-    }
-
-    #[test]
-    fn test_rooted_slot_not_demoted_by_lagging_confirmed() {
+        for (slot, level) in [
+            (80, SlotLevel::Finalized),
+            (90, SlotLevel::Finalized),
+            (95, SlotLevel::Rooted),
+            (100, SlotLevel::Rooted),
+            (105, SlotLevel::OptimisticallyConfirmed),
+            (110, SlotLevel::OptimisticallyConfirmed),
+            (120, SlotLevel::Completed),
+        ] {
+            assert_eq!(classify_slot(slot, 100, 110, 90), level, "{slot}");
+        }
         // During startup the commitment cache trails the root bank, so `confirmed`
         // can sit below a rooted slot.
         assert_eq!(classify_slot(100, 100, 50, 0), SlotLevel::Rooted);
-    }
-
-    #[test]
-    fn test_the_boundaries_are_inclusive() {
-        assert_eq!(classify_slot(90, 100, 110, 90), SlotLevel::Finalized);
-        assert_eq!(classify_slot(100, 100, 110, 90), SlotLevel::Rooted);
-        assert_eq!(
-            classify_slot(110, 100, 110, 90),
-            SlotLevel::OptimisticallyConfirmed
-        );
     }
 
     fn identity(seed: u8) -> Pubkey {
@@ -2720,19 +643,13 @@ mod tests {
         );
         assert_eq!(tally.staked.len(), 1, "one identity is one validator");
         assert_eq!(tally.staked[&identity(1)], 350, "its stake is the sum");
-    }
-
-    #[test]
-    fn test_active_validators_cannot_go_negative() {
         // Counted per vote account, an identity with two delinquent accounts read total 1,
         // delinquent 2.
         let tally = tally_stake(
             [(identity(1), 100, Some(0)), (identity(1), 100, Some(0))].into_iter(),
             TIP,
         );
-        assert_eq!(tally.staked.len(), 1);
-        assert_eq!(tally.delinquent.len(), 1);
-        assert_eq!(tally.staked.len() - tally.delinquent.len(), 0);
+        assert_eq!((tally.staked.len(), tally.delinquent.len()), (1, 1));
     }
 
     #[test]
@@ -2745,19 +662,20 @@ mod tests {
 
     #[test]
     fn test_delinquency_is_decided_at_the_threshold() {
+        // As RPC's getVoteAccounts splits them.
         let at = TIP - DELINQUENT_VALIDATOR_SLOT_DISTANCE;
         assert!(
-            tally_stake([(identity(1), 1, Some(at))].into_iter(), TIP)
+            tally_stake([(identity(1), 1, Some(at + 1))].into_iter(), TIP)
                 .delinquent
                 .is_empty(),
-            "exactly at the limit is still voting"
+            "one slot inside the limit is still voting"
         );
         assert_eq!(
-            tally_stake([(identity(1), 1, Some(at - 1))].into_iter(), TIP)
+            tally_stake([(identity(1), 1, Some(at))].into_iter(), TIP)
                 .delinquent
                 .len(),
             1,
-            "one slot past it is not"
+            "exactly at it is not"
         );
     }
 
@@ -2806,247 +724,6 @@ mod tests {
     }
 
     #[test]
-    fn test_the_turn_array_names_the_leader_the_schedule_names() {
-        // An off-by-one in the stride would name the wrong validator throughout.
-        let harness = fixture();
-        let collector = harness.collector();
-        let bank = harness.working_bank();
-        let schedule = bank.epoch_schedule();
-        let epoch = schedule.get_epoch(bank.slot());
-        let start = schedule.get_first_slot_in_epoch(epoch);
-        let slots_in_epoch = schedule.get_slots_in_epoch(epoch);
-
-        let (leaders, turns) = collector.epoch_turns(epoch, slots_in_epoch);
-        assert!(!turns.is_empty(), "the fixture's own schedule is derivable");
-
-        let stride = NUM_CONSECUTIVE_LEADER_SLOTS.get() as u64;
-        assert_eq!((turns.len() as u64).saturating_mul(stride), slots_in_epoch);
-
-        for (turn, index) in turns.iter().enumerate().take(16) {
-            let slot = start.saturating_add((turn as u64).saturating_mul(stride));
-            let expected = harness
-                .ctx
-                .leader_schedule_cache
-                .slot_leader_at(slot, Some(&bank))
-                .expect("the fixture leads its own schedule");
-            assert_eq!(
-                leaders[*index as usize],
-                expected.id.to_string(),
-                "slot {slot}"
-            );
-        }
-    }
-
-    #[test]
-    fn test_an_epoch_with_no_derived_schedule_carries_no_turns() {
-        // A short array is indistinguishable from a short epoch.
-        let harness = fixture();
-        let collector = harness.collector();
-        let bank = harness.working_bank();
-        let epoch = bank.epoch_schedule().get_epoch(bank.slot());
-
-        let (leaders, turns) = collector.epoch_turns(epoch.saturating_add(500), 432_000);
-        assert!(leaders.is_empty());
-        assert!(turns.is_empty());
-    }
-
-    #[test]
-    fn test_mismatched_stride_publishes_no_schedule() {
-        let harness = fixture();
-        let collector = harness.collector();
-        let bank = harness.working_bank();
-        let epoch = bank.epoch_schedule().get_epoch(bank.slot());
-        let slots_in_epoch = bank.epoch_schedule().get_slots_in_epoch(epoch);
-
-        let (_, turns) = collector.epoch_turns(epoch, slots_in_epoch.saturating_add(4));
-        assert!(turns.is_empty());
-    }
-
-    #[test]
-    fn test_the_epoch_before_this_one_is_kept_rather_than_sent() {
-        let harness = fixture();
-        let mut collector = harness.collector();
-        collector.tick();
-
-        let held = harness.epochs.read().unwrap();
-        let bank = harness.working_bank();
-        let epoch = bank.epoch_schedule().get_epoch(bank.slot());
-        assert!(
-            held.iter().any(|record| record.epoch == epoch),
-            "the current epoch is always among them"
-        );
-        assert!(held.iter().all(|record| record.epoch <= epoch));
-    }
-
-    #[test]
-    fn test_a_kept_past_epoch_carries_no_leader_slots_of_ours() {
-        let harness = fixture();
-        let collector = harness.collector();
-        let bank = harness.working_bank();
-        let epoch = bank.epoch_schedule().get_epoch(bank.slot());
-
-        let record = collector.epoch_record(&bank, epoch);
-        assert!(record.my_leader_slots.is_empty());
-        assert_eq!(record.epoch, epoch);
-    }
-
-    #[test]
-    fn test_the_epoch_message_is_built_once_and_not_at_every_poll() {
-        let harness = fixture();
-        let mut collector = harness.collector();
-        collector.tick();
-        let first = collector.epoch_published;
-        assert!(first.is_some());
-
-        harness.advance_to(8);
-        collector.tick();
-        assert_eq!(collector.epoch_published, first);
-    }
-
-    #[test]
-    fn test_swapped_identity_rebuilds_the_epoch() {
-        let harness = fixture();
-        let mut collector = harness.collector();
-        collector.tick();
-        let first = collector.epoch_published;
-        assert!(first.is_some());
-
-        harness
-            .ctx
-            .cluster_info
-            .set_keypair(Arc::new(Keypair::new()));
-        harness.advance_to(8);
-        collector.tick();
-
-        assert_ne!(
-            collector.epoch_published, first,
-            "the epoch must be rebuilt for whoever this validator is now"
-        );
-    }
-
-    #[test]
-    fn test_the_skip_rate_starts_again_for_a_swapped_identity() {
-        let harness = fixture();
-        let mut collector = harness.collector();
-        collector.tick();
-
-        let stranger = Pubkey::new_unique();
-        collector.skip_rate.epoch = Some((0, stranger));
-        collector.skip_rate.next_index = 99;
-        collector.collect_skip_rate(&harness.working_bank());
-
-        assert_ne!(
-            collector.skip_rate.epoch,
-            Some((0, stranger)),
-            "the latch must not still belong to the identity that has gone"
-        );
-        // Not nought: the reset is followed by a walk over every passed leader slot.
-        let restarted = {
-            let mut control = harness.collector();
-            control.collect_skip_rate(&harness.working_bank());
-            control.skip_rate.next_index
-        };
-        assert_eq!(
-            collector.skip_rate.next_index, restarted,
-            "the walk restarts rather than carrying an index into another schedule"
-        );
-    }
-
-    #[test]
-    fn test_a_produced_block_is_sent_alone_and_the_list_kept_for_a_connecting_client() {
-        let harness = fixture();
-        let mut updates = harness.publisher.subscribe();
-        let mut collector = harness.collector();
-        collector.tick();
-        harness.advance_to(8);
-        collector.tick();
-
-        let mut sent = Vec::new();
-        while let Ok(message) = updates.try_recv() {
-            assert!(
-                !message.contains(r#""key":"produced_blocks""#),
-                "the whole list went to a live client"
-            );
-            if message.contains(r#""key":"produced_block""#) {
-                let frame: serde_json::Value = serde_json::from_str(&message).unwrap();
-                sent.push(frame["value"]["slot"].as_u64().unwrap());
-            }
-        }
-        assert!(!sent.is_empty(), "the fixture leads its own slots");
-
-        let held = harness.published_key("summary", "produced_blocks").unwrap();
-        let held: serde_json::Value = serde_json::from_str(&held).unwrap();
-        let held: Vec<u64> = held["value"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|block| block["slot"].as_u64().unwrap())
-            .collect();
-        assert!(
-            sent.iter().all(|slot| held.contains(slot)),
-            "{sent:?} {held:?}"
-        );
-    }
-
-    #[test]
-    fn test_captured_blocks_can_be_paged_by_the_server() {
-        let harness = fixture();
-        let mut collector = harness.collector();
-        collector.tick();
-        harness.advance_to(8);
-        collector.tick();
-
-        let page = collector.replies.produced.read().unwrap().figures(None);
-        assert!(!page.figures.is_empty(), "the fixture leads its own slots");
-        let detail = collector
-            .replies
-            .produced_detail(0, 8)
-            .expect("the store is readable");
-        assert_eq!(detail.blocks.len(), page.figures.len());
-    }
-
-    #[test]
-    fn test_the_time_from_the_leader_is_published() {
-        let harness = fixture();
-        harness.collector().tick();
-        let published = harness
-            .published_key("summary", "finality_from_leader_micros")
-            .unwrap();
-        assert!(published.contains(r#""value":null"#), "{published}");
-    }
-
-    #[test]
-    fn test_epoch_credits_count_only_the_asked_epoch() {
-        let state = solana_vote_interface::state::VoteStateV3 {
-            epoch_credits: vec![(5, 100, 0), (6, 250, 100), (7, 400, 250)],
-            ..Default::default()
-        };
-        let view = solana_vote::vote_state_view::VoteStateView::from(state);
-        assert_eq!(count_epoch_credits(&view, 7), 150);
-        assert_eq!(count_epoch_credits(&view, 8), 0, "not voted in yet");
-    }
-
-    #[test]
-    fn test_the_vote_account_reports_its_bls_key_and_credits() {
-        let harness = fixture();
-        harness.advance_to(8);
-        harness.collector().tick();
-
-        let bls = harness.published_key("summary", "bls_key").unwrap();
-        assert!(
-            bls.contains(r#""value":true"#) || bls.contains(r#""value":false"#),
-            "{bls}"
-        );
-        let credits = harness.published_key("summary", "vote_credits").unwrap();
-        assert!(credits.contains(r#""credits":0"#), "{credits}");
-        assert!(credits.contains(r#""cluster_max":0"#), "{credits}");
-        // Nobody has earned a credit yet, so there is no median to compare with.
-        assert!(credits.contains(r#""cluster_median":null"#), "{credits}");
-        let admission = harness.published_key("summary", "admission").unwrap();
-        assert!(admission.contains(r#""value":null"#), "{admission}");
-    }
-
-    #[test]
     fn test_blocks_in_a_turn_share_their_boundaries_and_the_last_keeps_its_tail() {
         let first = execution_window(1_000, false, Some(1_150), 1_190);
         let second = execution_window(1_150, true, Some(1_350), 1_390);
@@ -3054,238 +731,6 @@ mod tests {
         assert_eq!(first, (1_000, 1_160));
         assert_eq!(second, (1_160, 1_360));
         assert_eq!(last, (1_360, 1_590));
-    }
-
-    #[test]
-    fn test_a_slot_is_timed_from_the_last_earlier_block_to_fill() {
-        let harness = fixture();
-        let mut collector = harness.collector();
-        let fill = |collector: &mut Collector, slot: Slot, first: u64, full_millis: u64| {
-            collector.slots.update(slot, |entry| {
-                entry.time_millis = Some(first);
-                entry.shreds = Some(ShredArrival {
-                    count: 1,
-                    repaired: 0,
-                    recovered: 0,
-                    full_millis,
-                });
-            });
-        };
-        let duration = |collector: &Collector, slot: Slot| {
-            collector
-                .slots
-                .get(slot)
-                .and_then(|entry| entry.duration_nanos)
-                .map(|nanos| nanos / 1_000_000)
-        };
-        // A turn's short first slot, then a full one; 102 has not filled yet.
-        fill(&mut collector, 100, 1_000, 144);
-        fill(&mut collector, 101, 1_150, 194);
-        fill(&mut collector, 103, 1_700, 150);
-        let mut changed = Vec::new();
-        collector.retime(&[100, 101, 103], &mut changed);
-        assert_eq!(duration(&collector, 100), None, "nothing earlier filled");
-        assert_eq!(duration(&collector, 101), Some(200));
-        assert_eq!(
-            duration(&collector, 103),
-            Some(506),
-            "across the slot still filling"
-        );
-
-        // When 102 fills late it is timed, and so is 103 again from it.
-        fill(&mut collector, 102, 1_400, 200);
-        collector.retime(&[102], &mut changed);
-        assert_eq!(duration(&collector, 102), Some(256));
-        assert_eq!(duration(&collector, 103), Some(250));
-    }
-
-    #[test]
-    fn test_gossip_peers_are_gathered_only_while_asked_for() {
-        let harness = fixture();
-        let mut collector = harness.collector();
-        let bank = harness.working_bank();
-        let peers = harness.ctx.cluster_info.all_peers();
-        let now = timestamp();
-
-        collector.collect_gossip_peers(&bank, bank.slot(), &peers, now);
-        assert_eq!(&**collector.replies.gossip_peers.read().unwrap(), "null");
-
-        collector
-            .replies
-            .gossip_peers_wanted
-            .store(now, Ordering::Relaxed);
-        collector.collect_gossip_peers(&bank, bank.slot(), &peers, now);
-        let json = collector.replies.gossip_peers.read().unwrap().clone();
-        let me = harness.ctx.identity().to_string();
-        assert!(json.contains(&me), "{json}");
-        let list: serde_json::Value = serde_json::from_str(&json).unwrap();
-        let rows = list["identity"].as_array().unwrap().len();
-        for column in [
-            "name",
-            "stake",
-            "client",
-            "ip",
-            "rpc",
-            "heard_ago",
-            "started",
-            "snapshot_full",
-            "snapshot_incremental",
-            "lowest",
-            "finalization",
-            "vote_arrival",
-            "delinquent",
-            "last_vote",
-        ] {
-            assert_eq!(list[column].as_array().unwrap().len(), rows, "{column}");
-        }
-        assert!(
-            list["vote_arrival_epoch"].is_null(),
-            "votor has reported no epoch yet"
-        );
-
-        // A client that stopped asking half a minute ago is no longer served fresh lists.
-        collector.collect_gossip_peers(&bank, bank.slot(), &[], now.saturating_add(31_000));
-        assert_eq!(*collector.replies.gossip_peers.read().unwrap(), json);
-    }
-
-    #[test]
-    fn test_a_peers_vote_arrival_is_found_through_its_vote_account() {
-        let harness = fixture();
-        let mut collector = harness.collector();
-        let bank = harness.working_bank();
-        let peers = harness.ctx.cluster_info.all_peers();
-        let now = timestamp();
-        let mut point = solana_metrics::datapoint::DataPoint::new("consensus_vote_metrics");
-        point.add_tag("address", &harness.ctx.vote_account.to_string());
-        point.add_field_i64("epoch", 3);
-        point.add_field_i64("notar_vote_count", 1_740);
-        point.add_field_i64("notar_vote_us_mean", 151_000);
-        point.add_field_i64("finalize_vote_us_mean", 203_000);
-        collector.metrics_tap.observe_point(&point);
-
-        collector
-            .replies
-            .gossip_peers_wanted
-            .store(now, Ordering::Relaxed);
-        collector.collect_gossip_peers(&bank, bank.slot(), &peers, now);
-        let json = collector.replies.gossip_peers.read().unwrap().clone();
-        let list: serde_json::Value = serde_json::from_str(&json).unwrap();
-        let me = harness.ctx.identity().to_string();
-        let row = list["identity"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .position(|identity| identity == &me)
-            .unwrap();
-        assert_eq!(list["vote_arrival_epoch"], 3);
-        assert_eq!(
-            list["vote_arrival"][row],
-            serde_json::json!([151_000, null, null, 203_000, 1_740])
-        );
-    }
-
-    fn staged(writing: Option<Writing>) -> Option<Snapshots> {
-        Some(Snapshots {
-            full: None,
-            incremental: None,
-            full_interval: None,
-            incremental_interval: None,
-            writing,
-            last_written: None,
-        })
-    }
-
-    #[test]
-    fn test_the_vote_pass_counts_how_far_a_snapshot_write_fell_behind() {
-        let harness = fixture();
-        let mut collector = harness.collector();
-        let writing = Writing {
-            slot: 300,
-            since_millis: 0,
-        };
-        collector.snapshots.observe(staged(Some(writing)), 10, 0);
-        harness.advance_to(64);
-        harness.set_cluster_tip(100);
-        collector.tick();
-        let completed = published_number(&harness, "completed_slot").unwrap();
-
-        let shown = collector
-            .snapshots
-            .observe(staged(None), completed, 0)
-            .unwrap();
-        assert_eq!(
-            shown.last_written.map(|written| written.fell_behind_slots),
-            Some(100 - completed)
-        );
-    }
-
-    #[test]
-    fn test_a_snapshot_write_ends_with_nobody_watching() {
-        let harness = fixture();
-        let mut collector = harness.collector();
-        let writing = Writing {
-            slot: 300,
-            since_millis: 0,
-        };
-        collector.snapshots.observe(staged(Some(writing)), 0, 0);
-        harness.advance_to(1);
-        collector.tick();
-
-        // The fixture generates no snapshots, so the read finds the write over.
-        assert_eq!(
-            collector.snapshots.spans().collect::<Vec<_>>(),
-            [certs::Span {
-                from: 0,
-                to: Some(1),
-            }]
-        );
-    }
-
-    #[test]
-    fn test_the_node_reports_the_client_it_gossips_beside_its_version() {
-        let harness = fixture();
-        harness.collector().publish_static();
-        let client = harness
-            .ctx
-            .cluster_info
-            .my_contact_info()
-            .version()
-            .client()
-            .to_string();
-
-        // Asserting a name would only assert which fork ran the tests.
-        let published = harness.published_key("summary", "client").unwrap();
-        assert!(
-            published.contains(&format!(r#""value":"{client}""#)),
-            "published {published}, which does not carry the client {client}"
-        );
-
-        let version = harness.published_key("summary", "version").unwrap();
-        assert!(
-            !version.contains(&client),
-            "{version} already names the client, so publishing it apart is dead weight"
-        );
-    }
-
-    #[test]
-    fn test_the_node_reports_its_gossip_address() {
-        let harness = fixture();
-        harness.collector().publish_static();
-        let ip = harness
-            .ctx
-            .cluster_info
-            .my_contact_info()
-            .gossip()
-            .unwrap()
-            .ip();
-
-        let published = harness.published_key("summary", "gossip_address").unwrap();
-        let expected = serde_json::to_string(&GossipAddress {
-            ip: ip.to_string(),
-            country: geoip::country(ip),
-        })
-        .unwrap();
-        assert!(published.contains(&expected), "{published}");
     }
 
     fn staked(entries: &[(u8, u64)]) -> HashMap<Pubkey, u64> {
@@ -3326,20 +771,19 @@ mod tests {
     }
 
     #[test]
-    fn test_an_unstaked_gossip_node_is_not_counted() {
-        let shares = version_shares(&staked(&[]), &gossiped(&[(1, "4.2.0")]));
-        assert!(shares.is_empty());
-    }
-
-    #[test]
-    fn test_the_counts_sum_to_the_staked_validator_total() {
-        let staked = staked(&[(1, 10), (2, 10), (3, 10)]);
+    fn test_unstaked_gossip_nodes_are_not_counted() {
+        assert!(version_shares(&staked(&[]), &gossiped(&[(1, "4.2.0")])).is_empty());
+        let staked = staked(&[(1, 30), (2, 20), (3, 10)]);
         let shares = version_shares(
             &staked,
-            &gossiped(&[(1, "4.2.0"), (2, "4.3.0"), (7, "4.3.0"), (8, "4.3.0")]),
+            &gossiped(&[(1, "4.2.0"), (2, "4.3.0"), (7, "4.3.0"), (8, "4.1.0")]),
         );
         let counted: usize = shares.iter().map(|share| share.validators).sum();
         assert_eq!(counted, staked.len());
+        assert_eq!(
+            shares,
+            version_shares(&staked, &gossiped(&[(1, "4.2.0"), (2, "4.3.0")]))
+        );
     }
 
     #[test]
@@ -3356,15 +800,9 @@ mod tests {
 
     #[test]
     fn test_the_tail_folds_into_one_flagged_row() {
-        let peers: Vec<(u8, String)> = (1..=9).map(|seed| (seed, format!("4.{seed}.0"))).collect();
-        let versions = gossiped(
-            &peers
-                .iter()
-                .map(|(seed, version)| (*seed, version.as_str()))
-                .collect::<Vec<_>>(),
-        );
-        let stakes: Vec<(u8, u64)> = (1..=9).map(|seed| (seed, u64::from(seed))).collect();
-        let shares = version_shares(&staked(&stakes), &versions);
+        let stakes = (1..=9).map(|seed| (identity(seed), u64::from(seed)));
+        let versions = (1..=9).map(|seed| (identity(seed), format!("4.{seed}.0")));
+        let shares = version_shares(&stakes.collect(), &versions.collect());
 
         assert_eq!(shares.len(), MAX_VERSIONS_REPORTED + 1);
         let last = shares.last().unwrap();
@@ -3374,112 +812,6 @@ mod tests {
             shares[..MAX_VERSIONS_REPORTED].iter().all(|s| !s.other),
             "only the tail row is flagged"
         );
-    }
-
-    #[test]
-    fn test_unstaked_versions_leave_the_shares_unchanged() {
-        let staked = staked(&[(1, 30), (2, 20), (3, 10)]);
-        let with_unstaked = gossiped(&[(1, "4.2.0"), (2, "4.3.0"), (7, "4.3.0"), (8, "4.1.0")]);
-        let staked_only = gossiped(&[(1, "4.2.0"), (2, "4.3.0")]);
-        assert_eq!(
-            serde_json::to_string(&version_shares(&staked, &with_unstaked)).unwrap(),
-            serde_json::to_string(&version_shares(&staked, &staked_only)).unwrap(),
-        );
-    }
-
-    #[test]
-    fn test_a_scheduled_leader_with_no_stake_keeps_what_gossip_says() {
-        let harness = fixture();
-        let mut collector = harness.collector();
-        collector.tick();
-        let (scheduled, silent, bystander) = (
-            Pubkey::new_unique(),
-            Pubkey::new_unique(),
-            Pubkey::new_unique(),
-        );
-        let socket = SocketAddr::from(([8, 8, 8, 8], 8000));
-        for key in [scheduled, bystander] {
-            harness
-                .ctx
-                .cluster_info
-                .insert_info(ContactInfo::new_with_socketaddr(&key, &socket));
-        }
-        harness
-            .epochs
-            .write()
-            .unwrap()
-            .last_mut()
-            .unwrap()
-            .leaders
-            .extend([scheduled.to_string(), silent.to_string()]);
-
-        let peers = harness.ctx.cluster_info.all_peers();
-        collector.collect_leader_traits(&harness.working_bank(), &peers);
-
-        let map = collector.replies.leader_traits.read().unwrap();
-        let traits = map.get(&scheduled).unwrap();
-        assert!(traits.client.is_some());
-        assert!(traits.version.is_some());
-        assert_eq!(traits.ip.as_deref(), Some("8.8.8.8"));
-        assert_eq!(traits.country, geoip::country(socket.ip()));
-        assert_eq!(traits.stake, 0);
-        assert!(!traits.delinquent);
-        assert!(!map.contains_key(&silent), "not in gossip");
-        assert!(
-            !map.contains_key(&bystander),
-            "neither staked nor scheduled"
-        );
-    }
-
-    #[test]
-    fn test_a_staked_peer_is_published_with_its_release() {
-        // The fixture node is staked and in its own gossip table.
-        let harness = fixture();
-        let mut collector = harness.collector();
-        let peers = harness.ctx.cluster_info.all_peers();
-        collector.collect_peers(&harness.working_bank(), &peers);
-
-        let version = harness
-            .ctx
-            .cluster_info
-            .my_contact_info()
-            .version()
-            .to_string();
-        let release = format!(r#""version":"{}""#, strip_prerelease(&version));
-        let versions = harness.published_key("summary", "versions").unwrap();
-        assert!(versions.contains(&release), "{versions}");
-        assert!(!versions.contains(r#""version":null"#), "{versions}");
-    }
-
-    #[test]
-    fn test_rpc_nodes_are_counted_as_gossip_counts_them() {
-        // Our own contact, a public RPC address, a private one, and none.
-        for (space, expected) in [
-            (SocketAddrSpace::Unspecified, 2),
-            (SocketAddrSpace::Global, 1),
-        ] {
-            let keypair = Arc::new(Keypair::new());
-            let me = SocketAddr::from(([1, 2, 3, 4], 8000));
-            let cluster_info = ClusterInfo::new(
-                ContactInfo::new_with_socketaddr(&keypair.pubkey(), &me),
-                keypair,
-                space,
-            );
-            for ip in [[1, 2, 3, 5], [10, 0, 0, 1]] {
-                let socket = SocketAddr::from((ip, 8000));
-                cluster_info.insert_info(ContactInfo::new_with_socketaddr(
-                    &Pubkey::new_unique(),
-                    &socket,
-                ));
-            }
-            cluster_info.insert_info(ContactInfo::new(Pubkey::new_unique(), timestamp(), 0));
-
-            let peers = cluster_info.all_peers();
-            assert_eq!(peers.len(), 4);
-            let counted = count_rpc_nodes(&cluster_info, &peers);
-            assert_eq!(counted, cluster_info.rpc_peers().len());
-            assert_eq!(counted, expected);
-        }
     }
 
     const FRESH: Duration = Duration::from_secs(1);
@@ -3494,165 +826,37 @@ mod tests {
             assess_health(FRESH, 100, true, Some(99), Some(1), FRESH).replay,
             ReplayHealth::Running
         );
-    }
-
-    #[test]
-    fn test_replay_has_not_started_before_the_first_slot() {
         assert_eq!(
-            assess_health(FRESH, 0, true, None, None, FRESH).replay,
-            ReplayHealth::NotStarted
-        );
-    }
-
-    fn published_number(harness: &Fixture, key: &str) -> Option<u64> {
-        let message = harness.published_key("summary", key)?;
-        let after = message.rsplit_once(r#""value":"#)?.1;
-        let digits: String = after.chars().take_while(char::is_ascii_digit).collect();
-        digits.parse().ok()
-    }
-
-    #[test]
-    fn test_the_cluster_distance_is_measured_against_the_cluster() {
-        // Replay against our own vote reads nought however far back the node is.
-        let harness = fixture();
-        harness.advance_to(64);
-        harness.set_cluster_tip(10_000);
-        harness.collector().tick();
-
-        let completed = published_number(&harness, "completed_slot").unwrap();
-        assert_eq!(
-            published_number(&harness, "behind_cluster"),
-            Some(10_000 - completed),
-            "the distance is the cluster's tip less what this node has replayed"
+            assess_health(FRESH, 100, false, None, None, FRESH).replay,
+            ReplayHealth::Running,
+            "whether or not this node votes"
         );
     }
 
     #[test]
-    fn test_a_node_the_cluster_has_not_outrun_is_not_behind() {
-        // Being ahead of the last certificate seen is ordinary, not a distance.
-        let harness = fixture();
-        harness.advance_to(64);
-        harness.set_cluster_tip(1);
-        harness.collector().tick();
-
-        assert_eq!(published_number(&harness, "behind_cluster"), Some(0));
-    }
-
-    #[test]
-    fn test_a_skipped_turn_is_not_distance() {
-        // The next leader's first shred lands while its parent four slots back is still the last
-        // completed.
-        let harness = fixture();
-        harness.advance_to(64);
-        let (shreds, _) = make_slot_entries(69, 64, 1);
-        harness.ctx.blockstore.insert_shreds(shreds, true).unwrap();
-        harness.collector().tick();
-
-        assert_eq!(published_number(&harness, "behind_cluster"), Some(1));
-    }
-
-    #[test]
-    fn test_blocks_behind_walks_the_tip_chain() {
-        let ledger = get_tmp_ledger_path_auto_delete!();
-        let blockstore = Blockstore::open(ledger.path()).unwrap();
-        // 11 to 14 skipped, 15 and 16 built on 10, 20 a fork off 8.
-        for (slot, parent) in [(10, 9), (15, 10), (16, 15), (20, 8)] {
-            let (shreds, _) = make_slot_entries(slot, parent, 1);
-            blockstore.insert_shreds(shreds, true).unwrap();
-        }
-        assert_eq!(blocks_behind(&blockstore, 15, 10), 1);
-        assert_eq!(blocks_behind(&blockstore, 16, 10), 2);
-        assert_eq!(blocks_behind(&blockstore, 20, 10), 1);
-        assert_eq!(blocks_behind(&blockstore, 10, 10), 0);
-        assert_eq!(blocks_behind(&blockstore, 9, 10), 0);
-        // No shreds at the tip: counted in slots.
-        assert_eq!(blocks_behind(&blockstore, 30, 10), 20);
-        // 9 has no known parent, so the rest down to 4 is counted in slots.
-        assert_eq!(blocks_behind(&blockstore, 16, 4), 8);
-    }
-
-    #[test]
-    fn test_the_replay_rate_is_read_across_the_window() {
+    fn test_the_replay_rate_is_read_across_a_window_worth_reading() {
         let now = Instant::now();
         let at = |secs_ago: u64| now.checked_sub(Duration::from_secs(secs_ago)).unwrap();
         let window: VecDeque<(Instant, Slot)> =
             [(at(20), 1_000), (at(10), 1_400), (at(0), 1_800)].into();
         assert_eq!(measure_replay_rate(&window), Some(40.0));
-    }
-
-    #[test]
-    fn test_the_replay_rate_waits_for_a_span_worth_reading() {
-        let now = Instant::now();
-        let at = |secs_ago: u64| now.checked_sub(Duration::from_secs(secs_ago)).unwrap();
         let window: VecDeque<(Instant, Slot)> = [(at(2), 1_000), (at(0), 1_010)].into();
         assert_eq!(measure_replay_rate(&window), None);
         assert_eq!(measure_replay_rate(&VecDeque::new()), None);
     }
 
     #[test]
-    fn test_under_tower_the_vote_cost_is_a_day_of_fees() {
-        let harness = fixture();
-        harness.collector().tick();
-        let bank = harness.working_bank();
-        let slots_per_day = NANOS_PER_DAY
-            .checked_div(bank.ns_per_slot_at_slot(bank.slot()))
-            .unwrap();
-        let per_day = u64::try_from(slots_per_day)
-            .unwrap()
-            .checked_mul(bank.get_lamports_per_signature())
-            .unwrap();
-
-        let cost = harness.published_key("summary", "vote_cost").unwrap();
-        assert!(cost.contains(r#""kind":"fees""#), "{cost}");
-        assert!(cost.contains(&format!(r#""per_day":{per_day}"#)), "{cost}");
-    }
-
-    #[test]
-    fn test_nothing_is_claimed_before_a_certificate_arrives() {
-        // On a fresh start nought would say this node was in step with a cluster it
-        // has not heard from.
-        let harness = fixture();
-        harness.advance_to(64);
-        harness.collector().tick();
-
-        let published = harness.published_key("summary", "behind_cluster").unwrap();
-        assert!(published.contains(r#""value":null"#), "got {published}");
-    }
-
-    #[test]
-    fn test_a_validator_on_its_backup_identity_is_not_voting() {
-        assert_eq!(
-            assess_health(FRESH, 100, false, Some(99), Some(1), FRESH).vote,
-            VoteHealth::NotVoting
-        );
-    }
-
-    #[test]
     fn test_not_voting_outranks_every_other_reading() {
-        assert_eq!(
-            assess_health(
-                FRESH,
-                100,
-                false,
-                Some(50),
-                Some(VOTE_BEHIND_LIMIT + 1),
-                FRESH
-            )
-            .vote,
-            VoteHealth::NotVoting
-        );
-        assert_eq!(
-            assess_health(FRESH, 100, false, None, None, Duration::from_secs(3_600)).vote,
-            VoteHealth::NotVoting
-        );
-    }
-
-    #[test]
-    fn test_replay_is_reported_whether_or_not_this_node_votes() {
-        assert_eq!(
-            assess_health(FRESH, 100, false, None, None, FRESH).replay,
-            ReplayHealth::Running
-        );
+        for (vote_slot, behind, since_vote_advance) in [
+            (Some(99), Some(1), FRESH),
+            (Some(50), Some(VOTE_BEHIND_LIMIT + 1), FRESH),
+            (None, None, Duration::from_secs(3_600)),
+        ] {
+            assert_eq!(
+                assess_health(FRESH, 100, false, vote_slot, behind, since_vote_advance).vote,
+                VoteHealth::NotVoting
+            );
+        }
     }
 
     #[test]
@@ -3694,123 +898,10 @@ mod tests {
     }
 
     #[test]
-    fn test_upcoming_leaders_hold_the_only_staked_leader() {
-        let harness = fixture();
-        harness.advance_to(8);
-        let collector = harness.collector();
-        let root_bank = harness.bank_forks.read().unwrap().root_bank();
-        let leaders = collector.upcoming_leaders(&root_bank, 8);
-        assert_eq!(leaders, HashSet::from([harness.identity]));
-    }
-
-    #[test]
-    fn test_the_collector_keeps_the_phases_the_boot_thread_timed() {
-        let harness = fixture();
-        let shared = Arc::new(Mutex::new(StartupPublisher::default()));
-        shared.lock().unwrap().publish(
-            &harness.publisher,
-            ValidatorStartProgress::CleaningAccounts,
-            None,
-        );
-        shared
-            .lock()
-            .unwrap()
-            .publish(&harness.publisher, ValidatorStartProgress::Running, None);
-
-        let mut collector = harness.collector_with_startup(shared);
-        collector.tick();
-
-        let last = harness
-            .published()
-            .into_iter()
-            .rfind(|message| message.contains(r#""key":"startup_progress""#))
-            .expect("the collector publishes startup progress");
-        assert!(
-            last.contains(r#""phase":"cleaning_accounts""#),
-            "the collector's own message must carry what the boot thread timed: {last}"
-        );
-    }
-
-    #[test]
-    fn test_stale_tip_is_not_caught_up() {
-        // The blockstore keeps optimistic slots from before a restart, so the first tip read is
-        // stale.
-        let harness = fixture();
-        harness.advance_to(64);
-        let mut collector = harness.collector();
-
-        harness.set_cluster_tip(1);
-        collector.tick();
-        assert!(
-            harness
-                .published_key("summary", "caught_up_time_nanos")
-                .is_none()
-        );
-    }
-
-    #[test]
-    fn test_catching_up_is_stamped_once_a_tip_seen_ahead_is_reached() {
-        let harness = fixture();
-        harness.advance_to(64);
-        let mut collector = harness.collector();
-
-        harness.set_cluster_tip(100);
-        collector.tick();
-        assert!(
-            harness
-                .published_key("summary", "caught_up_time_nanos")
-                .is_none()
-        );
-
-        harness.advance_to(101);
-        collector.tick();
-        assert!(
-            harness
-                .published_key("summary", "caught_up_time_nanos")
-                .is_some()
-        );
-    }
-
-    #[test]
-    fn test_a_tip_a_slot_or_two_ahead_counts_as_caught_up() {
-        // The tip includes the slot still arriving, which replay cannot have finished.
-        let harness = fixture();
-        harness.advance_to(64);
-        let mut collector = harness.collector();
-        harness.set_cluster_tip(100);
-        collector.tick();
-
-        harness.advance_to(97);
-        collector.tick();
-        assert!(
-            harness
-                .published_key("summary", "caught_up_time_nanos")
-                .is_some()
-        );
-    }
-
-    #[test]
-    fn test_slots_count_as_live_only_above_where_the_node_caught_up() {
-        let harness = fixture();
-        harness.advance_to(64);
-        let mut collector = harness.collector();
-        collector.tick();
-        assert_eq!(
-            collector.history.read().unwrap().live_from(),
-            0,
-            "a node that never trailed has nothing to leave out"
-        );
-
-        harness.set_cluster_tip(100);
-        collector.tick();
-        assert_eq!(collector.history.read().unwrap().live_from(), Slot::MAX);
-
-        harness.advance_to(97);
-        collector.tick();
-        assert_eq!(
-            collector.history.read().unwrap().live_from(),
-            collector.last_completed_slot + 1
-        );
+    fn test_cluster_names_are_the_ones_upstream_parses() {
+        for cluster_type in ClusterType::STRINGS.map(|name| name.parse::<ClusterType>().unwrap()) {
+            assert_eq!(cluster_name(cluster_type).parse(), Ok(cluster_type));
+        }
     }
 
     #[test]
@@ -3819,390 +910,8 @@ mod tests {
         assert_eq!(strip_prerelease("0.1102.0-beta.40201"), "0.1102.0");
         assert_eq!(strip_prerelease("4.2.0"), "4.2.0");
         assert_eq!(strip_prerelease("1.18.23+build7"), "1.18.23");
-    }
-
-    #[test]
-    fn test_folding_leaves_strings_that_are_not_semver_alone() {
         assert_eq!(strip_prerelease(""), "");
         assert_eq!(strip_prerelease("unknown"), "unknown");
         assert_eq!(strip_prerelease("-leading"), "");
-    }
-
-    #[test]
-    fn test_a_frozen_bank_arrives_by_notification() {
-        let harness = fixture();
-        let _viewer = harness.publisher.subscribe();
-        let bank = harness.advance_to(8);
-        let mut collector = harness.collector();
-        let (sender, receiver) = crossbeam_channel::unbounded();
-        collector.frozen_banks = Some(receiver);
-
-        collector.tick();
-        assert!(
-            !harness
-                .published()
-                .iter()
-                .any(|message| message.contains(r#""slot":8,"level":"completed""#))
-        );
-
-        sender.send((BankNotification::Frozen(bank), None)).unwrap();
-        collector.overview_retained_at = Instant::now().checked_sub(OVERVIEW_INTERVAL).unwrap();
-        collector.tick();
-        let overview = harness.published_key("slot", "overview").unwrap();
-        assert!(overview.contains(r#""slot":8"#), "{overview}");
-        assert!(overview.contains(r#""transactions":"#), "{overview}");
-        assert!(collector.totals.contains_key(&8));
-    }
-
-    #[test]
-    fn test_a_frozen_bank_adds_its_failures_once() {
-        let harness = fixture();
-        let bank = harness.advance_with_failures(1, 3);
-        let mut collector = harness.collector();
-        let (sender, receiver) = crossbeam_channel::unbounded();
-        collector.frozen_banks = Some(receiver);
-
-        // A duplicate block's slot is frozen again once the cluster's version is repaired.
-        sender
-            .send((BankNotification::Frozen(bank.clone()), None))
-            .unwrap();
-        sender.send((BankNotification::Frozen(bank), None)).unwrap();
-        collector.tick();
-        collector.tick();
-        assert_eq!(harness.failed_total.load(Ordering::Relaxed), 3);
-
-        let child = harness.advance_with_failures(2, 1);
-        sender
-            .send((BankNotification::Frozen(child), None))
-            .unwrap();
-        collector.tick();
-        assert_eq!(harness.failed_total.load(Ordering::Relaxed), 4);
-    }
-
-    #[test]
-    fn test_failures_on_an_abandoned_fork_drop_out_of_the_count() {
-        let harness = fixture();
-        let (sender, receiver) = crossbeam_channel::unbounded();
-        let mut collector = harness.notified_collector(receiver);
-        let parent = harness.advance_with_failures(1, 1);
-        let abandoned = harness.advance_with_failures(2, 3);
-        sender
-            .send((BankNotification::Frozen(parent.clone()), None))
-            .unwrap();
-        sender
-            .send((BankNotification::Frozen(abandoned), None))
-            .unwrap();
-        collector.tick();
-        assert_eq!(harness.failed_total.load(Ordering::Relaxed), 4);
-
-        // Slot 3 is built on slot 1, so the working fork moves off slot 2.
-        let sibling = harness.fork_with_failures(parent, 3, 2);
-        sender
-            .send((BankNotification::Frozen(sibling), None))
-            .unwrap();
-        collector.tick();
-        assert_eq!(harness.failed_total.load(Ordering::Relaxed), 3);
-    }
-
-    #[test]
-    fn test_a_bank_read_from_bank_forks_each_tick_is_counted_once() {
-        let harness = fixture();
-        harness.advance_with_failures(1, 3);
-        // Squashing drops the root's parent, so slot 1 has no counts to difference.
-        harness.bank_forks.write().unwrap().set_root(1, None, None);
-        let mut collector = harness.collector();
-
-        collector.tick();
-        collector.tick();
-        collector.tick();
-        assert_eq!(harness.failed_total.load(Ordering::Relaxed), 3);
-    }
-
-    #[test]
-    fn test_fee_payers_count_our_rooted_block_once() {
-        let harness = fixture();
-        let mut collector = harness.collector();
-        collector.tick();
-        harness.advance_with_failed_entries(1, 3);
-        collector.tick();
-        assert_eq!(
-            collector.fee_payers.summary(),
-            None,
-            "counted before its root"
-        );
-
-        harness.bank_forks.write().unwrap().set_root(1, None, None);
-        harness.ctx.blockstore.set_roots([1].iter()).unwrap();
-        collector.tick();
-        collector.tick();
-        let summary = collector.fee_payers.summary().unwrap();
-        let epoch = &summary.epochs[0];
-        assert_eq!((epoch.blocks, epoch.transactions, epoch.failed), (1, 3, 3));
-        assert_eq!(summary.payers.len(), 1);
-    }
-
-    #[test]
-    fn test_an_unfrozen_working_bank_stores_its_parents_failed_count() {
-        let harness = fixture();
-        let parent = harness.advance_with_failures(1, 3);
-        // Replay inserts a bank into bank forks before it fills and freezes it.
-        let working = Bank::new_from_parent(
-            parent,
-            SlotLeader {
-                id: harness.identity,
-                vote_address: harness.vote_account,
-            },
-            2,
-        );
-        harness.bank_forks.write().unwrap().insert(working);
-        assert!(!harness.working_bank().is_frozen());
-        let mut collector = harness.collector();
-
-        collector.tick();
-        assert_eq!(harness.failed_total.load(Ordering::Relaxed), 3);
-    }
-
-    #[test]
-    fn test_block_height_is_processeds_not_the_working_banks() {
-        let harness = fixture();
-        let processed = harness.advance_to(4);
-        let working = Bank::new_from_parent(
-            processed.clone(),
-            SlotLeader {
-                id: harness.identity,
-                vote_address: harness.vote_account,
-            },
-            5,
-        );
-        harness.bank_forks.write().unwrap().insert(working);
-        assert_ne!(
-            harness.working_bank().block_height(),
-            processed.block_height()
-        );
-        let mut collector = harness.collector();
-
-        collector.tick();
-        assert_eq!(published_number(&harness, "completed_slot"), Some(4));
-        assert_eq!(
-            published_number(&harness, "block_height"),
-            Some(processed.block_height())
-        );
-    }
-
-    #[test]
-    fn test_validator_info_is_read_from_each_notified_bank_with_nobody_watching() {
-        let harness = fixture();
-        let mut collector = harness.collector();
-        let (sender, receiver) = crossbeam_channel::unbounded();
-        collector.frozen_banks = Some(receiver);
-        let parent = harness.advance_to(1);
-        let higher = harness.advance_to(3);
-        // A fork off slot 1 that freezes after slot 3.
-        let identity = Pubkey::new_unique();
-        let lower = Bank::new_from_parent(
-            parent,
-            SlotLeader {
-                id: harness.identity,
-                vote_address: harness.vote_account,
-            },
-            2,
-        );
-        lower.store_account(
-            &Pubkey::new_unique(),
-            &validator_info::info_account(identity, r#"{"name":"Lantern"}"#),
-        );
-        lower.freeze();
-
-        sender
-            .send((BankNotification::Frozen(higher), None))
-            .unwrap();
-        collector.tick();
-        sender
-            .send((BankNotification::Frozen(Arc::new(lower)), None))
-            .unwrap();
-        collector.tick();
-        assert_eq!(
-            collector.peer_display(&identity).0.as_deref(),
-            Some("Lantern")
-        );
-    }
-
-    #[test]
-    fn test_validator_info_is_read_from_banks_frozen_before_replay_started() {
-        let harness = fixture();
-        let identity = Pubkey::new_unique();
-        harness.advance_with(
-            1,
-            &[(
-                Pubkey::new_unique(),
-                validator_info::info_account(identity, r#"{"name":"Lantern"}"#),
-            )],
-        );
-        let mut collector = harness.collector();
-        let (_sender, receiver) = crossbeam_channel::unbounded();
-        collector.frozen_banks = Some(receiver);
-
-        collector.tick();
-        assert_eq!(
-            collector.peer_display(&identity).0.as_deref(),
-            Some("Lantern")
-        );
-    }
-
-    #[test]
-    fn test_validator_info_is_read_from_bank_forks_with_nobody_watching() {
-        let harness = fixture();
-        let mut collector = harness.collector();
-        let identity = Pubkey::new_unique();
-        harness.advance_with(
-            1,
-            &[(
-                Pubkey::new_unique(),
-                validator_info::info_account(identity, r#"{"name":"Lantern"}"#),
-            )],
-        );
-
-        collector.tick();
-        assert_eq!(
-            collector.peer_display(&identity).0.as_deref(),
-            Some("Lantern")
-        );
-    }
-
-    #[test]
-    fn test_the_consensus_is_published() {
-        let harness = fixture();
-        harness.advance_to(8);
-        harness.collector().tick();
-        let message = harness.published_key("summary", "consensus").unwrap();
-        assert!(message.contains(r#""value":"tower""#), "{message}");
-    }
-
-    #[test]
-    fn test_the_overview_is_encoded_once_a_second() {
-        let harness = fixture();
-        let _viewer = harness.publisher.subscribe();
-        let mut collector = harness.collector();
-        harness.advance_to(8);
-        collector.tick();
-        let first = harness.published_key("slot", "overview").unwrap();
-        assert!(first.contains(r#""slot":8"#), "{first}");
-
-        harness.advance_to(9);
-        collector.tick();
-        let held = harness.published_key("slot", "overview").unwrap();
-        assert!(!held.contains(r#""slot":9"#), "encoded inside the interval");
-        assert!(collector.overview_dirty);
-
-        collector.overview_retained_at = Instant::now().checked_sub(OVERVIEW_INTERVAL).unwrap();
-        collector.tick();
-        let refreshed = harness.published_key("slot", "overview").unwrap();
-        assert!(refreshed.contains(r#""slot":9"#), "{refreshed}");
-        assert!(!collector.overview_dirty);
-    }
-
-    #[test]
-    fn test_a_viewer_joining_beside_another_is_sent_the_overview_whole() {
-        let harness = fixture();
-        let _first = harness.publisher.subscribe();
-        let mut collector = harness.collector();
-        harness.advance_to(8);
-        collector.tick();
-        harness.advance_to(9);
-        collector.tick();
-        let held = harness.published_key("slot", "overview").unwrap();
-        assert!(!held.contains(r#""slot":9"#), "encoded inside the interval");
-
-        let mut second = harness.publisher.subscribe();
-        collector.tick();
-        let sent = std::iter::from_fn(|| second.try_recv().ok())
-            .map(|message| message.to_string())
-            .find(|message| message.contains(r#""key":"overview""#))
-            .unwrap();
-        assert!(sent.contains(r#""slot":9"#), "{sent}");
-    }
-
-    #[test]
-    fn test_the_overview_is_dropped_while_unwatched_and_sent_to_the_next_viewer() {
-        let harness = fixture();
-        let mut collector = harness.collector();
-        let watching = harness.publisher.subscribe();
-        harness.advance_to(8);
-        collector.tick();
-        assert!(harness.published_key("slot", "overview").is_some());
-
-        drop(watching);
-        harness.advance_to(9);
-        collector.tick();
-        assert!(
-            harness.published_key("slot", "overview").is_none(),
-            "a stale overview was kept for the next viewer"
-        );
-
-        let mut viewer = harness.publisher.subscribe();
-        harness.advance_to(10);
-        collector.tick();
-        let sent = std::iter::from_fn(|| viewer.try_recv().ok())
-            .find(|message| message.contains(r#""topic":"slot""#))
-            .expect("the next viewer was not sent the overview");
-        assert!(
-            sent.contains(r#""topic":"slot","key":"overview""#),
-            "an update went ahead of the overview: {sent}"
-        );
-        assert!(sent.contains(r#""slot":10"#), "{sent}");
-        assert!(harness.published_key("slot", "overview").is_some());
-
-        harness.advance_to(11);
-        collector.tick();
-        assert!(
-            std::iter::from_fn(|| viewer.try_recv().ok())
-                .any(|message| message.contains(r#""topic":"slot","key":"update""#)),
-            "updates did not resume after the overview"
-        );
-    }
-
-    #[test]
-    fn test_the_produced_list_is_dropped_while_unwatched_and_sent_to_the_next_viewer() {
-        let harness = fixture();
-        let mut collector = harness.collector();
-        let watching = harness.publisher.subscribe();
-        collector.tick();
-        harness.advance_to(4);
-        collector.tick();
-        assert!(
-            harness
-                .published_key("summary", "produced_blocks")
-                .is_some()
-        );
-
-        drop(watching);
-        harness.advance_to(8);
-        collector.tick();
-        assert!(
-            harness
-                .published_key("summary", "produced_blocks")
-                .is_none(),
-            "a stale list was kept for the next viewer"
-        );
-
-        let mut viewer = harness.publisher.subscribe();
-        collector.tick();
-        let sent = std::iter::from_fn(|| viewer.try_recv().ok())
-            .find(|message| message.contains(r#""key":"produced_blocks""#))
-            .expect("the next viewer was not sent the list");
-        let sent: serde_json::Value = serde_json::from_str(&sent).unwrap();
-        assert!(
-            sent["value"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|block| block["slot"].as_u64() == Some(8)),
-            "{sent}"
-        );
-        assert!(
-            harness
-                .published_key("summary", "produced_blocks")
-                .is_some()
-        );
     }
 }

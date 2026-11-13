@@ -20,7 +20,7 @@ export default defineConfig({
   server: {
     proxy: {
       "/websocket": {
-        target: "ws://127.0.0.1:10999",
+        target: "ws://127.0.0.1:11000",
         ws: true,
       },
     },

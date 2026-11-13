@@ -3,29 +3,27 @@
 //! into their block footers.
 
 use {
+    crate::collect::cluster_charts::bin_of,
     agave_votor_messages::reward_certificate::NUM_SLOTS_FOR_REWARD,
+    bitvec::{order::Lsb0, vec::BitVec},
     serde::Serialize,
     solana_clock::{Epoch, Slot},
-    solana_entry::block_component::{
-        BlockComponent, BlockFooterV1, VersionedBlockFooter, VersionedBlockMarker,
-    },
-    solana_ledger::{blockstore::Blockstore, shred::DATA_SHREDS_PER_FEC_BLOCK},
+    solana_entry::block_component::BlockFooterV1,
     solana_pubkey::Pubkey,
-    solana_runtime::bank::Bank,
+    solana_runtime::epoch_stakes::{BLSPubkeyStakeEntry, BLSPubkeyToRankMap},
     solana_signer_store::{Decoded, decode},
-    std::collections::{BTreeMap, HashMap},
+    std::{
+        cmp::Reverse,
+        collections::{BTreeMap, HashMap},
+        sync::Arc,
+    },
 };
-
-/// The footer sits in the second to last FEC set; the last one closes the
-/// block. Reading from there costs two sets of shreds whatever the block holds.
-const FOOTER_SPAN: u64 = 2 * DATA_SHREDS_PER_FEC_BLOCK as u64;
 
 /// Slots from the epoch's first over which the cluster pays out stake
 /// rewards, when every validator misses votes.
 pub const BOUNDARY_SLOTS: Slot = 1_000;
 
 pub const MISS_BINS: usize = 400;
-const LAST_BIN: usize = MISS_BINS - 1;
 
 /// A certificate paying at least this share fewer ranks than the epoch's
 /// median certificate is thin, once `THIN_MIN_CERTIFICATES` have been seen.
@@ -39,6 +37,9 @@ pub const REGULAR_PERCENT: u64 = 90;
 const PENDING_VOTES: usize = 4096;
 
 const LOST_LEADERS: usize = 3;
+
+/// The ranks a reward certificate sets, as `solana_signer_store` decodes them.
+pub type Ranks = BitVec<u8, Lsb0>;
 
 /// The certificate for slot N can only be written by the leader of slot N+8.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -56,7 +57,7 @@ pub struct Mark {
     pub reward: Reward,
     pub rank: usize,
     /// Empty where there was no certificate.
-    pub paid: Vec<bool>,
+    pub paid: Ranks,
     pub notar: u32,
     pub skip: u32,
 }
@@ -67,7 +68,7 @@ impl Mark {
             slot,
             reward: Reward::NoCertificate,
             rank,
-            paid: Vec::new(),
+            paid: Ranks::new(),
             notar: 0,
             skip: 0,
         }
@@ -197,17 +198,17 @@ pub struct WrittenSummary {
     pub unpaid_everywhere: Vec<u64>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct Tally {
-    epoch: Epoch,
+    pub epoch: Epoch,
     since_slot: Slot,
     epoch_start: Slot,
     slots_in_epoch: u64,
     /// Ascending. Empty where the schedule was not known when the tally began,
     /// when those misses fall under the later places.
-    leader_slots: Vec<Slot>,
+    pub leader_slots: Vec<Slot>,
     paid: u64,
-    rewarded: u64,
+    pub rewarded: u64,
     per_rank: Vec<u64>,
     misses: Vec<Miss>,
     by_slot: HashMap<Slot, usize>,
@@ -231,34 +232,13 @@ impl Tally {
             epoch_start,
             slots_in_epoch,
             leader_slots,
-            paid: 0,
-            rewarded: 0,
-            per_rank: Vec::new(),
-            misses: Vec::new(),
-            by_slot: HashMap::new(),
-            paid_ranks: Vec::new(),
-            writer_certs: HashMap::new(),
-            pending_votes: BTreeMap::new(),
-            ours: BTreeMap::new(),
+            ..Self::default()
         }
-    }
-
-    pub fn epoch(&self) -> Epoch {
-        self.epoch
-    }
-
-    pub fn set_leader_slots(&mut self, leader_slots: Vec<Slot>) {
-        self.leader_slots = leader_slots;
-    }
-
-    #[cfg(test)]
-    pub fn leader_slots(&self) -> &[Slot] {
-        &self.leader_slots
     }
 
     /// A slot with no certificate counts for nobody.
     pub fn add(&mut self, mark: &Mark, snapshots: &[Span], detail: Option<MissDetail>) {
-        let paid_ranks = mark.paid.iter().filter(|paid| **paid).count();
+        let paid_ranks = mark.paid.count_ones();
         match mark.reward {
             Reward::Paid => self.paid = self.paid.saturating_add(1),
             Reward::Unpaid => self.miss(mark, paid_ranks, snapshots, detail),
@@ -274,13 +254,6 @@ impl Tally {
             .binary_search(&writer_slot(mark.slot))
             .is_ok()
         {
-            let unpaid = mark
-                .paid
-                .iter()
-                .enumerate()
-                .filter(|(_, paid)| !**paid)
-                .filter_map(|(rank, _)| u16::try_from(rank).ok())
-                .collect();
             self.ours.insert(
                 mark.slot,
                 Written {
@@ -288,7 +261,7 @@ impl Tally {
                     notar: mark.notar,
                     skip: mark.skip,
                     ours_in: matches!(mark.reward, Reward::Paid),
-                    unpaid,
+                    unpaid: unpaid(&mark.paid, None),
                 },
             );
         }
@@ -301,8 +274,8 @@ impl Tally {
         if self.per_rank.len() < mark.paid.len() {
             self.per_rank.resize(mark.paid.len(), 0);
         }
-        for (count, paid) in self.per_rank.iter_mut().zip(&mark.paid) {
-            if *paid {
+        for rank in mark.paid.iter_ones() {
+            if let Some(count) = self.per_rank.get_mut(rank) {
                 *count = count.saturating_add(1);
             }
         }
@@ -326,19 +299,12 @@ impl Tally {
             None
         };
         let detail = detail.unwrap_or_default();
-        let unpaid = mark
-            .paid
-            .iter()
-            .enumerate()
-            .filter(|(rank, paid)| !**paid && *rank != mark.rank)
-            .filter_map(|(rank, _)| u16::try_from(rank).ok())
-            .collect();
         self.by_slot.insert(slot, self.misses.len());
         self.misses.push(Miss {
             slot,
             fixed,
             paid_ranks: u32::try_from(paid_ranks).unwrap_or(u32::MAX),
-            unpaid,
+            unpaid: unpaid(&mark.paid, Some(mark.rank)),
             writer: detail.writer,
             late: detail.late,
             vote: self.pending_votes.remove(&slot),
@@ -356,8 +322,7 @@ impl Tally {
             miss.vote = Some(vote);
             return;
         }
-        self.pending_votes.insert(slot, vote);
-        crate::metrics_tap::keep_newest(&mut self.pending_votes, PENDING_VOTES);
+        crate::metrics_tap::insert_capped(&mut self.pending_votes, slot, vote, PENDING_VOTES);
     }
 
     pub fn writer_certificates(&self, writer: &Pubkey) -> u64 {
@@ -372,9 +337,8 @@ impl Tally {
         let regulars = self.regulars();
         let count = mark
             .paid
-            .iter()
-            .zip(&regulars)
-            .filter(|(paid, regular)| !**paid && **regular)
+            .iter_zeros()
+            .filter(|rank| regulars.get(*rank).is_some_and(|regular| *regular))
             .count();
         Some(u32::try_from(count).unwrap_or(u32::MAX))
     }
@@ -412,10 +376,6 @@ impl Tally {
                 .map(|paid| self.rewarded.saturating_sub(*paid))
                 .collect(),
         }
-    }
-
-    pub fn rewarded(&self) -> u64 {
-        self.rewarded
     }
 
     pub fn ranks(&self) -> u32 {
@@ -494,15 +454,6 @@ impl Tally {
         u32::try_from(median.saturating_sub(shortfall)).ok()
     }
 
-    fn bin_of(&self, slot: Slot) -> usize {
-        let bin = slot
-            .saturating_sub(self.epoch_start)
-            .saturating_mul(MISS_BINS as u64)
-            .checked_div(self.slots_in_epoch)
-            .unwrap_or(0);
-        usize::try_from(bin).unwrap_or(LAST_BIN).min(LAST_BIN)
-    }
-
     /// `name` gives a lost vote's leader a display name.
     pub fn participation(&self, name: impl Fn(&Pubkey) -> Option<String>) -> Participation {
         let thin_below = self.thin_below();
@@ -526,14 +477,13 @@ impl Tally {
                 let count = by_writer.entry(writer).or_default();
                 *count = count.saturating_add(1);
             }
-            if let Some(bin) = miss_bins.get_mut(self.bin_of(miss.slot)) {
+            let offset = miss.slot.saturating_sub(self.epoch_start);
+            if let Some(bin) = miss_bins.get_mut(bin_of(offset, self.slots_in_epoch, MISS_BINS)) {
                 *bin = bin.saturating_add(1);
             }
         }
         let mut leaders: Vec<(Pubkey, u64)> = by_writer.into_iter().collect();
-        leaders.sort_by(|(a_key, a_count), (b_key, b_count)| {
-            b_count.cmp(a_count).then(a_key.cmp(b_key))
-        });
+        leaders.sort_by_key(|(key, count)| (Reverse(*count), *key));
         leaders.truncate(LOST_LEADERS);
         Participation {
             epoch: self.epoch,
@@ -558,11 +508,46 @@ impl Tally {
     }
 }
 
-pub(crate) enum Block {
-    Footer(Box<BlockFooterV1>),
+/// The ranks `paid` leaves out, but `except`.
+fn unpaid(paid: &Ranks, except: Option<usize>) -> Box<[u16]> {
+    paid.iter_zeros()
+        .filter(|rank| Some(*rank) != except)
+        .filter_map(|rank| u16::try_from(rank).ok())
+        .collect()
+}
+
+pub enum Block {
+    Footer(FooterView),
     Missing,
     Pending,
     Opaque,
+}
+
+/// What a walk reads of a block's footer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FooterView {
+    pub producer_time_nanos: u64,
+    pub notar: Option<Vec<u8>>,
+    pub skip: Option<Vec<u8>>,
+    /// Whether its finalization certificate is the one-round fast one.
+    pub fast: Option<bool>,
+}
+
+impl From<&BlockFooterV1> for FooterView {
+    fn from(footer: &BlockFooterV1) -> Self {
+        Self {
+            producer_time_nanos: footer.block_producer_time_nanos,
+            notar: footer
+                .notar_reward_cert
+                .as_ref()
+                .map(|cert| cert.bitmap().to_vec()),
+            skip: footer
+                .skip_reward_cert
+                .as_ref()
+                .map(|cert| cert.to_bitmap().to_vec()),
+            fast: carried_fast(footer),
+        }
+    }
 }
 
 /// What a walk read: the last slot, our marks, and when each block's leader closed it.
@@ -585,26 +570,28 @@ pub struct FooterReading {
     pub fast: Option<bool>,
 }
 
-/// Stops at the first slot past the root. Footers are read whether or not we hold a rank.
-pub fn walk(
-    blockstore: &Blockstore,
-    bank: &Bank,
+/// From any source of blocks and rank maps. Stops at the first slot past the root; footers are
+/// read whether or not we hold a rank.
+pub fn walk_blocks(
+    read: impl Fn(Slot) -> Block,
+    rank_map: impl Fn(Slot) -> Option<Arc<BLSPubkeyToRankMap>>,
     vote_account: &Pubkey,
     from: Slot,
     to: Slot,
 ) -> Walked {
-    let root = bank.slot();
     let mut walked = Walked::default();
     for slot in from..=to {
-        let block = read_block(blockstore, slot, root);
+        let block = read(slot);
         if matches!(block, Block::Pending) {
             break;
         }
         let ranked = rewarded_slot(slot).and_then(|reward_slot| {
-            rank_of(bank, vote_account, reward_slot).map(|rank| (reward_slot, rank))
+            rank_of(&rank_map, vote_account, reward_slot).map(|rank| (reward_slot, rank))
         });
         if let Block::Footer(footer) = &block {
-            walked.readings.push(footer_reading(bank, slot, footer));
+            walked
+                .readings
+                .push(footer_reading(&rank_map, slot, footer));
         }
         let (closed_at, mark) = read_slot(block, ranked);
         if let Some(nanos) = closed_at {
@@ -621,14 +608,15 @@ fn read_slot(block: Block, ranked: Option<(Slot, (usize, usize))>) -> (Option<u6
     match block {
         Block::Footer(footer) => {
             let mark = ranked.and_then(|(reward_slot, (rank, len))| {
-                let notar = footer.notar_reward_cert.as_ref().map(|cert| cert.bitmap());
-                let skip = footer
-                    .skip_reward_cert
-                    .as_ref()
-                    .map(|cert| cert.to_bitmap());
-                build_mark(notar, skip, reward_slot, rank, len)
+                build_mark(
+                    footer.notar.as_deref(),
+                    footer.skip.as_deref(),
+                    reward_slot,
+                    rank,
+                    len,
+                )
             });
-            (Some(footer.block_producer_time_nanos), mark)
+            (Some(footer.producer_time_nanos), mark)
         }
         Block::Missing => (
             None,
@@ -640,15 +628,19 @@ fn read_slot(block: Block, ranked: Option<(Slot, (usize, usize))>) -> (Option<u6
 
 /// A leader writes the highest finalization certificate it holds and prefers the fast one for
 /// the same slot, so fast means 80% of stake notarized in time for it.
-fn footer_reading(bank: &Bank, slot: Slot, footer: &BlockFooterV1) -> FooterReading {
-    let notarized = footer.notar_reward_cert.as_ref().and_then(|cert| {
+fn footer_reading(
+    rank_map: &impl Fn(Slot) -> Option<Arc<BLSPubkeyToRankMap>>,
+    slot: Slot,
+    footer: &FooterView,
+) -> FooterReading {
+    let notarized = footer.notar.as_ref().and_then(|bitmap| {
         let rewarded = rewarded_slot(slot)?;
-        Some((rewarded, notarized_share(bank, rewarded, cert.bitmap())?))
+        Some((rewarded, notarized_share(rank_map, rewarded, bitmap)?))
     });
     FooterReading {
         slot,
         notarized,
-        fast: carried_fast(footer),
+        fast: footer.fast,
     }
 }
 
@@ -662,11 +654,14 @@ fn carried_fast(footer: &BlockFooterV1) -> Option<bool> {
 }
 
 /// The share of the slot's rank map stake set in `bitmap`, in basis points.
-fn notarized_share(bank: &Bank, slot: Slot, bitmap: &[u8]) -> Option<u16> {
-    let map = bank.get_rank_map(slot)?;
-    let paid = decode_paid(bitmap, map.len())?;
-    let notarized = (0..map.len())
-        .filter(|rank| paid.get(*rank) == Some(&true))
+fn notarized_share(
+    rank_map: &impl Fn(Slot) -> Option<Arc<BLSPubkeyToRankMap>>,
+    slot: Slot,
+    bitmap: &[u8],
+) -> Option<u16> {
+    let map = rank_map(slot)?;
+    let notarized = decode_paid(bitmap, map.len())?
+        .iter_ones()
         .filter_map(|rank| map.get_pubkey_stake_entry(rank))
         .fold(0u64, |sum, entry| sum.saturating_add(entry.stake.get()));
     let share = u128::from(notarized)
@@ -675,49 +670,24 @@ fn notarized_share(bank: &Bank, slot: Slot, bitmap: &[u8]) -> Option<u16> {
     u16::try_from(share).ok()
 }
 
+/// The rank map's entries, by rank.
+pub fn rank_entries(map: &BLSPubkeyToRankMap) -> impl Iterator<Item = &BLSPubkeyStakeEntry> {
+    (0..map.len()).filter_map(|rank| map.get_pubkey_stake_entry(rank))
+}
+
 /// `None` where it holds no stake there.
-fn rank_of(bank: &Bank, vote_account: &Pubkey, slot: Slot) -> Option<(usize, usize)> {
-    let map = bank.get_rank_map(slot)?;
+fn rank_of(
+    rank_map: &impl Fn(Slot) -> Option<Arc<BLSPubkeyToRankMap>>,
+    vote_account: &Pubkey,
+    slot: Slot,
+) -> Option<(usize, usize)> {
+    let map = rank_map(slot)?;
     let rank = map.get_rank_for_vote_pubkey(vote_account)?;
     Some((usize::from(*rank), map.len()))
 }
 
-pub(crate) fn read_block(blockstore: &Blockstore, slot: Slot, root: Slot) -> Block {
-    if slot > root {
-        return Block::Pending;
-    }
-    // Blockstore roots are written before bank forks' root moves, so a slot up to the root that
-    // is not one was skipped.
-    if !blockstore.is_root(slot) {
-        return Block::Missing;
-    }
-    let meta = match blockstore.meta(slot) {
-        Ok(Some(meta)) if meta.is_full() => meta,
-        // Rooted but not held, as a downloaded snapshot's slot.
-        _ => return Block::Opaque,
-    };
-    let Some(last) = meta.last_index else {
-        return Block::Opaque;
-    };
-    let start = last.saturating_add(1).saturating_sub(FOOTER_SPAN);
-    let Ok((components, _, _)) = blockstore.get_slot_components_with_shred_info(slot, start, false)
-    else {
-        return Block::Opaque;
-    };
-    components
-        .into_iter()
-        .rev()
-        .find_map(|component| match component {
-            BlockComponent::BlockMarker(VersionedBlockMarker::V1(marker)) => marker
-                .as_block_footer()
-                .map(|VersionedBlockFooter::V1(footer)| footer.clone()),
-            BlockComponent::EntryBatch(_) => None,
-        })
-        .map_or(Block::Opaque, |footer| Block::Footer(Box::new(footer)))
-}
-
-/// Takes each certificate's bitmap. Neither means nobody was paid; `None` where one could not
-/// be read.
+/// Takes each certificate's bitmap. Certificates that set no rank count as none, as the runtime
+/// reads them; `None` where one could not be read.
 fn build_mark(
     notar: Option<&[u8]>,
     skip: Option<&[u8]>,
@@ -725,26 +695,13 @@ fn build_mark(
     rank: usize,
     len: usize,
 ) -> Option<Mark> {
-    if notar.is_none() && skip.is_none() {
+    let (notar, skip) = decode_both(notar, skip, len)?;
+    let set = |ranks: &Ranks| u32::try_from(ranks.count_ones()).unwrap_or(u32::MAX);
+    let (notar_set, skip_set) = (set(&notar), set(&skip));
+    let paid = notar | skip;
+    if paid.not_any() {
         return Some(Mark::no_certificate(slot, rank));
     }
-    let notar_paid = match notar {
-        Some(bitmap) => decode_paid(bitmap, len)?,
-        None => Vec::new(),
-    };
-    let skip_paid = match skip {
-        Some(bitmap) => decode_paid(bitmap, len)?,
-        None => Vec::new(),
-    };
-    let paid: Vec<bool> = (0..len)
-        .map(|rank| {
-            notar_paid.get(rank).copied().unwrap_or(false)
-                || skip_paid.get(rank).copied().unwrap_or(false)
-        })
-        .collect();
-    let set = |bits: &[bool]| {
-        u32::try_from(bits.iter().filter(|paid| **paid).count()).unwrap_or(u32::MAX)
-    };
     let reward = if paid.get(rank).is_some_and(|flag| *flag) {
         Reward::Paid
     } else {
@@ -755,21 +712,32 @@ fn build_mark(
         reward,
         rank,
         paid,
-        notar: set(&notar_paid),
-        skip: set(&skip_paid),
+        notar: notar_set,
+        skip: skip_set,
     })
 }
 
-/// `None` where the bitmap does not decode or uses the two-vector form.
-pub(crate) fn decode_paid(bitmap: &[u8], len: usize) -> Option<Vec<bool>> {
-    let Ok(Decoded::Base2(bits)) = decode(bitmap, len) else {
+/// Each reward certificate's ranks, none set where it is absent; `None` where one does not decode.
+pub(crate) fn decode_both(
+    notar: Option<&[u8]>,
+    skip: Option<&[u8]>,
+    len: usize,
+) -> Option<(Ranks, Ranks)> {
+    let ranks = |bitmap: Option<&[u8]>| match bitmap {
+        Some(bitmap) => decode_paid(bitmap, len),
+        None => Some(Ranks::repeat(false, len)),
+    };
+    Some((ranks(notar)?, ranks(skip)?))
+}
+
+/// `None` where the bitmap does not decode or uses the two-vector form. Ranks past a short bitmap
+/// are unset.
+fn decode_paid(bitmap: &[u8], len: usize) -> Option<Ranks> {
+    let Ok(Decoded::Base2(mut ranks)) = decode(bitmap, len) else {
         return None;
     };
-    let mut paid = vec![false; len];
-    for (flag, bit) in paid.iter_mut().zip(bits.iter().by_vals()) {
-        *flag = bit;
-    }
-    Some(paid)
+    ranks.resize(len, false);
+    Some(ranks)
 }
 
 /// The median of the counts above nought, so validators that earned nothing do not drag it down.
@@ -782,14 +750,8 @@ pub fn median_of(mut counts: Vec<u64>) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use {
-        super::*,
-        solana_entry::block_component::BlockFinalizationCert,
-        solana_keypair::Keypair,
-        solana_ledger::{
-            blockstore::make_slot_entries,
-            get_tmp_ledger_path_auto_delete,
-            shred::{ProcessShredsStats, ReedSolomonCache, Shredder},
-        },
+        super::*, solana_entry::block_component::BlockFinalizationCert,
+        solana_ledger::blockstore::make_slot_entries,
     };
 
     fn bitmap(len: u16, set: &[usize]) -> Vec<u8> {
@@ -804,7 +766,7 @@ mod tests {
         bytes
     }
 
-    fn flags(len: usize, set: &[usize]) -> Vec<bool> {
+    fn flags(len: usize, set: &[usize]) -> Ranks {
         (0..len).map(|rank| set.contains(&rank)).collect()
     }
 
@@ -860,71 +822,13 @@ mod tests {
         assert_eq!(decode_paid(&[7u8, 10, 0, 0, 0], 10), None);
     }
 
-    #[test]
-    fn test_only_a_rooted_block_is_read() {
-        let ledger = get_tmp_ledger_path_auto_delete!();
-        let blockstore = Blockstore::open(ledger.path()).unwrap();
-        // 5 arrived whole and was skipped, 6 was rooted without its shreds, 7 is rooted and whole
-        // with no footer, 9 is the root and ends in a footer, 12 is past the root.
-        for (slot, parent) in [(5, 4), (7, 6), (12, 11)] {
-            let (shreds, _) = make_slot_entries(slot, parent, 4);
-            blockstore.insert_shreds(shreds, true).unwrap();
-        }
-        let (_, entries) = make_slot_entries(9, 8, 4);
-        let hash = entries[0].hash;
-        let footer = BlockFooterV1 {
-            bank_hash: hash,
-            block_producer_time_nanos: 9,
-            block_user_agent: vec![],
-            block_final_cert: None,
-            skip_reward_cert: None,
-            notar_reward_cert: None,
-        };
-        let shredder = Shredder::new(9, 8, 0, 0).unwrap();
-        let keypair = Keypair::new();
-        let shred = |component: BlockComponent, last, chained, index| {
-            shredder
-                .component_to_merkle_shreds_for_tests(
-                    &keypair,
-                    &component,
-                    last,
-                    chained,
-                    index,
-                    index,
-                    &ReedSolomonCache::default(),
-                    &mut ProcessShredsStats::default(),
-                )
-                .0
-        };
-        let mut shreds = shred(BlockComponent::EntryBatch(entries), false, hash, 0);
-        let next = u32::try_from(shreds.len()).unwrap();
-        let chained = shreds.last().unwrap().merkle_root().unwrap();
-        let marker = VersionedBlockMarker::from_block_footer(footer.clone());
-        shreds.extend(shred(
-            BlockComponent::new_block_marker(marker),
-            true,
-            chained,
-            next,
-        ));
-        blockstore.insert_shreds(shreds, true).unwrap();
-        blockstore.set_roots([6, 7, 9].iter()).unwrap();
-        assert!(matches!(read_block(&blockstore, 5, 9), Block::Missing));
-        assert!(matches!(read_block(&blockstore, 6, 9), Block::Opaque));
-        assert!(matches!(read_block(&blockstore, 7, 9), Block::Opaque));
-        assert!(matches!(read_block(&blockstore, 9, 9), Block::Footer(read) if *read == footer));
-        assert!(matches!(read_block(&blockstore, 12, 9), Block::Pending));
-    }
-
     fn footer_closed_at(nanos: u64) -> Block {
-        let (_, entries) = make_slot_entries(1, 0, 1);
-        Block::Footer(Box::new(BlockFooterV1 {
-            bank_hash: entries[0].hash,
-            block_producer_time_nanos: nanos,
-            block_user_agent: vec![],
-            block_final_cert: None,
-            skip_reward_cert: None,
-            notar_reward_cert: None,
-        }))
+        Block::Footer(FooterView {
+            producer_time_nanos: nanos,
+            notar: None,
+            skip: None,
+            fast: None,
+        })
     }
 
     #[test]
@@ -951,10 +855,22 @@ mod tests {
     }
 
     #[test]
-    fn test_a_footer_with_no_reward_certificate_paid_nobody() {
-        let mark = build_mark(None, None, 5, 0, 10).unwrap();
-        assert_eq!(mark.reward, Reward::NoCertificate);
-        assert!(mark.paid.is_empty());
+    fn test_no_certificate_or_one_that_sets_no_rank_is_no_certificate() {
+        let empty = bitmap(10, &[]);
+        for (notar, skip) in [
+            (None, None),
+            (Some(empty.as_slice()), None),
+            (None, Some(empty.as_slice())),
+            (Some(empty.as_slice()), Some(empty.as_slice())),
+        ] {
+            let mark = build_mark(notar, skip, 3_000, 2, 10).unwrap();
+            assert_eq!(mark.reward, Reward::NoCertificate);
+            assert!(mark.paid.is_empty());
+            let mut tally = tally();
+            tally.add(&mark, &[], None);
+            assert_eq!(tally.rewarded, 0, "not counted as rewarded");
+            assert_eq!(misses(&tally), Misses::default(), "nor as a miss");
+        }
     }
 
     fn tally() -> Tally {
@@ -971,6 +887,11 @@ mod tests {
 
     fn detail(writer: Option<Pubkey>, late: bool) -> Option<MissDetail> {
         Some(MissDetail { writer, late })
+    }
+
+    /// A mark paying rank 1, its certificate written by `writer`.
+    fn by(tally: &mut Tally, slot: Slot, reward: Reward, writer: Pubkey, late: bool) {
+        tally.add(&mark(slot, reward, &[1]), &[], detail(Some(writer), late));
     }
 
     fn wide(slot: Slot, reward: Reward, paid: usize) -> Mark {
@@ -1197,11 +1118,11 @@ mod tests {
         let mut tally = tally();
         fill(&mut tally, 1_000);
         let mut alone = wide(3_000, Reward::Unpaid, 20);
-        alone.paid[0] = false;
+        alone.paid.set(0, false);
         tally.add(&alone, &[], None);
         let mut with_others = wide(3_001, Reward::Unpaid, 20);
         for rank in [0, 3, 4, 19] {
-            with_others.paid[rank] = false;
+            with_others.paid.set(rank, false);
         }
         tally.add(&with_others, &[], None);
         let records = tally.records();
@@ -1218,21 +1139,9 @@ mod tests {
     fn test_certificates_are_counted_per_writer_paid_or_not() {
         let mut tally = tally();
         let writer = Pubkey::new_unique();
-        tally.add(
-            &mark(3_000, Reward::Paid, &[0, 1]),
-            &[],
-            detail(Some(writer), false),
-        );
-        tally.add(
-            &mark(3_001, Reward::Unpaid, &[1]),
-            &[],
-            detail(Some(writer), false),
-        );
-        tally.add(
-            &mark(3_002, Reward::NoCertificate, &[]),
-            &[],
-            detail(Some(writer), false),
-        );
+        by(&mut tally, 3_000, Reward::Paid, writer, false);
+        by(&mut tally, 3_001, Reward::Unpaid, writer, false);
+        by(&mut tally, 3_002, Reward::NoCertificate, writer, false);
         assert_eq!(tally.writer_certificates(&writer), 2);
         assert_eq!(tally.writer_certificates(&Pubkey::new_unique()), 0);
     }
@@ -1262,22 +1171,10 @@ mod tests {
         let mut tally = tally();
         let (a, b) = (Pubkey::new_unique(), Pubkey::new_unique());
         for slot in [3_000, 3_001, 3_002] {
-            tally.add(
-                &mark(slot, Reward::Unpaid, &[1]),
-                &[],
-                detail(Some(a), false),
-            );
+            by(&mut tally, slot, Reward::Unpaid, a, false);
         }
-        tally.add(
-            &mark(3_003, Reward::Unpaid, &[1]),
-            &[],
-            detail(Some(b), false),
-        );
-        tally.add(
-            &mark(3_004, Reward::Unpaid, &[1]),
-            &[],
-            detail(Some(b), true),
-        );
+        by(&mut tally, 3_003, Reward::Unpaid, b, false);
+        by(&mut tally, 3_004, Reward::Unpaid, b, true);
         let named = |key: &Pubkey| (*key == a).then(|| "Alpha".to_string());
         let leaders = tally.participation(named).lost_leaders;
         assert_eq!(
@@ -1300,19 +1197,12 @@ mod tests {
     #[test]
     fn test_misses_fall_in_the_bin_for_their_place_in_the_epoch() {
         let mut tally = tally();
-        tally.add(&mark(0, Reward::Unpaid, &[1]), &[], None);
-        tally.add(&mark(2_000, Reward::Unpaid, &[1]), &[], None);
-        tally.add(&mark(2_001, Reward::Unpaid, &[1]), &[], None);
-        tally.add(&mark(3_999, Reward::Unpaid, &[1]), &[], None);
+        // The last is past the epoch, and lands in the last bin.
+        for slot in [0, 2_000, 2_001, 3_999, 9_000] {
+            tally.add(&mark(slot, Reward::Unpaid, &[1]), &[], None);
+        }
         let bins = read(&tally).miss_bins;
         assert_eq!(bins.len(), MISS_BINS);
-        assert_eq!((bins[0], bins[200], bins[MISS_BINS - 1]), (1, 2, 1));
-    }
-
-    #[test]
-    fn test_a_slot_past_the_epoch_lands_in_the_last_bin() {
-        let mut tally = tally();
-        tally.add(&mark(9_000, Reward::Unpaid, &[1]), &[], None);
-        assert_eq!(read(&tally).miss_bins[MISS_BINS - 1], 1);
+        assert_eq!((bins[0], bins[200], bins[MISS_BINS - 1]), (1, 2, 2));
     }
 }

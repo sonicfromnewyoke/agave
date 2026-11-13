@@ -2,7 +2,8 @@
 //! epoch will end.
 
 use {
-    solana_clock::{Clock, Epoch, Slot},
+    crate::metrics_tap::push_capped,
+    solana_clock::{Epoch, Slot},
     std::{
         collections::VecDeque,
         ops::RangeInclusive,
@@ -44,7 +45,7 @@ struct EpochSpan {
 }
 
 #[derive(Debug, Default)]
-pub(super) struct SlotClock {
+pub struct SlotClock {
     /// Advances past skipped slots, which never carry a timestamp.
     timed_to: Option<Slot>,
     last_shred_time: Option<(Slot, u64)>,
@@ -58,11 +59,8 @@ pub(super) struct SlotClock {
 
 impl SlotClock {
     /// The slots not yet timed up to `up_to`, at most `MAX_SLOTS_TIMED_PER_TICK` of them.
-    pub(super) fn slots_to_time(&mut self, up_to: Slot) -> RangeInclusive<Slot> {
-        let from = match self.timed_to {
-            None => up_to,
-            Some(timed_to) => timed_to.saturating_add(1),
-        };
+    pub fn slots_to_time(&mut self, up_to: Slot) -> RangeInclusive<Slot> {
+        let from = self.timed_to.map_or(up_to, |timed| timed.saturating_add(1));
         let from = from.max(up_to.saturating_sub(MAX_SLOTS_TIMED_PER_TICK));
         if from <= up_to {
             self.timed_to = Some(up_to);
@@ -71,23 +69,20 @@ impl SlotClock {
     }
 
     /// Returns the milliseconds since the last slot that had a first shred, if it was earlier.
-    pub(super) fn record(&mut self, slot: Slot, arrived: u64) -> Option<u64> {
+    pub fn record(&mut self, slot: Slot, arrived: u64) -> Option<u64> {
         let elapsed = self
             .last_shred_time
             .filter(|(previous_slot, _)| slot > *previous_slot)
             .map(|(_, previous_arrival)| arrived.saturating_sub(previous_arrival));
         self.last_shred_time = Some((slot, arrived));
-        self.window.push_back((slot, arrived));
         // Skipped slots never enter the window. The mean divides by slot span, not
         // sample count, so they are still accounted for.
-        while self.window.len() > SLOT_TIME_WINDOW_SLOTS {
-            self.window.pop_front();
-        }
+        push_capped(&mut self.window, (slot, arrived), SLOT_TIME_WINDOW_SLOTS);
         elapsed
     }
 
     /// Extends `epoch`'s span with a slot timed after catching up.
-    pub(super) fn record_in_epoch(&mut self, epoch: Epoch, slot: Slot, arrived: u64) {
+    pub fn record_in_epoch(&mut self, epoch: Epoch, slot: Slot, arrived: u64) {
         if !self.caught_up_at.is_some_and(|from| slot >= from) {
             return;
         }
@@ -99,20 +94,18 @@ impl SlotClock {
             }
             Some(span) if span.epoch > epoch => (),
             _ => {
-                self.epoch_spans.push_back(EpochSpan {
+                let span = EpochSpan {
                     epoch,
                     first: (slot, arrived),
                     last: (slot, arrived),
-                });
-                while self.epoch_spans.len() > EPOCH_SPANS_HELD {
-                    self.epoch_spans.pop_front();
-                }
+                };
+                push_capped(&mut self.epoch_spans, span, EPOCH_SPANS_HELD);
             }
         }
     }
 
     /// `epoch`'s mean slot time over the span this node timed, once the span is long enough.
-    pub(super) fn epoch_mean_nanos(&self, epoch: Epoch) -> Option<u64> {
+    pub fn epoch_mean_nanos(&self, epoch: Epoch) -> Option<u64> {
         let span = self.epoch_spans.iter().find(|span| span.epoch == epoch)?;
         let slots = span
             .last
@@ -125,7 +118,7 @@ impl SlotClock {
 
     /// Never cleared: falling behind later is real. `trailing` is read against the cluster's tip,
     /// since bank forks' highest slot is only ever a block past the last frozen one.
-    pub(super) fn mark_caught_up(&mut self, trailing: bool, completed: Slot) {
+    pub fn mark_caught_up(&mut self, trailing: bool, completed: Slot) {
         if self.caught_up_at.is_some() {
             return;
         }
@@ -145,15 +138,16 @@ impl SlotClock {
         log::info!("dashboard: caught up with the cluster, timing slots from {from}");
     }
 
-    pub(super) fn observed_nanos(&self) -> Option<u64> {
+    pub fn observed_nanos(&self) -> Option<u64> {
         windowed_mean_nanos(&self.window, SLOT_READOUT_SPAN_MS)
     }
 
-    /// Slot duration on the best evidence: the arrival window once caught up,
-    /// the epoch's own clock before that, the configured duration before either.
-    pub(super) fn slot_nanos(
+    /// Slot duration on the best evidence: the arrival window once caught up, the seconds since
+    /// the cluster clock's stamp of the epoch's start before that, the configured duration before
+    /// either.
+    pub fn slot_nanos(
         &self,
-        clock: &Clock,
+        epoch_elapsed_secs: Option<i64>,
         start_slot: Slot,
         completed: Slot,
         configured: u64,
@@ -163,18 +157,14 @@ impl SlotClock {
             .and_then(|_| windowed_mean_nanos(&self.window, u64::MAX));
         best_slot_nanos(
             window,
-            epoch_anchored_nanos(clock, start_slot, completed),
+            epoch_elapsed_secs
+                .and_then(|elapsed| epoch_anchored_nanos(elapsed, start_slot, completed)),
             configured,
         )
     }
 
     /// Holds the last estimate of `epoch`'s end until a new one drifts past the allowance.
-    pub(super) fn epoch_end(
-        &mut self,
-        epoch: Epoch,
-        estimate: SystemTime,
-        now: SystemTime,
-    ) -> SystemTime {
+    pub fn epoch_end(&mut self, epoch: Epoch, estimate: SystemTime, now: SystemTime) -> SystemTime {
         let held = self
             .epoch_end
             .filter(|(held_epoch, _)| *held_epoch == epoch)
@@ -224,15 +214,12 @@ fn best_slot_nanos(window: Option<u64>, clock: Option<u64>, configured: u64) -> 
 }
 
 /// `None` until enough slots have run for the clock's whole seconds not to matter.
-fn epoch_anchored_nanos(clock: &Clock, start_slot: Slot, completed: Slot) -> Option<u64> {
+fn epoch_anchored_nanos(elapsed_secs: i64, start_slot: Slot, completed: Slot) -> Option<u64> {
     let slots = completed.saturating_sub(start_slot);
     if slots < EPOCH_RATE_MIN_ELAPSED_SLOTS {
         return None;
     }
-    let elapsed = clock
-        .unix_timestamp
-        .checked_sub(clock.epoch_start_timestamp)?;
-    let elapsed = u64::try_from(elapsed).ok().filter(|secs| *secs > 0)?;
+    let elapsed = u64::try_from(elapsed_secs).ok().filter(|secs| *secs > 0)?;
     elapsed.checked_mul(1_000_000_000)?.checked_div(slots)
 }
 
@@ -312,18 +299,6 @@ mod tests {
     }
 
     #[test]
-    fn test_a_full_window_averages_the_whole_of_it() {
-        let samples = steady_window((100, 1_000), SLOT_TIME_WINDOW_SLOTS as u64, 420);
-        assert_eq!(windowed_mean_nanos(&samples, u64::MAX), Some(420_000_000));
-    }
-
-    #[test]
-    fn test_a_full_window_of_replay_is_still_rejected() {
-        let samples = steady_window((100, 1_000), SLOT_TIME_WINDOW_SLOTS as u64, 10);
-        assert_eq!(windowed_mean_nanos(&samples, u64::MAX), None);
-    }
-
-    #[test]
     fn test_the_readout_span_ignores_samples_older_than_itself() {
         let mut samples = steady_window((100, 1_000), SLOT_TIME_WINDOW_SLOTS as u64, 400);
         let (last_slot, last_arrival) = *samples.back().unwrap();
@@ -348,17 +323,9 @@ mod tests {
             .unwrap()
     }
 
-    fn clock_at(elapsed: i64) -> Clock {
-        Clock {
-            epoch_start_timestamp: 1_700_000_000,
-            unix_timestamp: 1_700_000_000_i64.saturating_add(elapsed),
-            ..Clock::default()
-        }
-    }
-
     #[test]
     fn test_epoch_rate_is_elapsed_time_over_slots() {
-        let nanos = epoch_anchored_nanos(&clock_at(21_600), 100, 60_100);
+        let nanos = epoch_anchored_nanos(21_600, 100, 60_100);
         assert_eq!(nanos, Some(360_000_000));
     }
 
@@ -377,16 +344,12 @@ mod tests {
     }
 
     #[test]
-    fn test_the_epoch_rate_waits_for_the_epoch_to_get_going() {
+    fn test_no_epoch_rate_before_the_epoch_gets_going_or_the_clock_moves() {
         // The cluster clock moves in whole seconds, so early on the error in
         // that second is worth more than the answer.
-        assert_eq!(epoch_anchored_nanos(&clock_at(400), 100, 1_100), None);
-    }
-
-    #[test]
-    fn test_a_clock_that_has_not_moved_yields_no_rate() {
-        assert_eq!(epoch_anchored_nanos(&clock_at(0), 100, 60_100), None);
-        assert_eq!(epoch_anchored_nanos(&clock_at(-10), 100, 60_100), None);
+        assert_eq!(epoch_anchored_nanos(400, 100, 1_100), None);
+        assert_eq!(epoch_anchored_nanos(0, 100, 60_100), None);
+        assert_eq!(epoch_anchored_nanos(-10, 100, 60_100), None);
     }
 
     #[test]
@@ -395,9 +358,9 @@ mod tests {
     }
 
     #[test]
-    fn test_small_drift_does_not_move_the_countdown() {
+    fn test_drift_up_to_the_allowance_does_not_move_the_countdown() {
         let held = at(10_000);
-        for estimate in [at(10_030), at(9_970)] {
+        for estimate in [at(10_030), at(9_970), at(10_060)] {
             assert_eq!(steady_epoch_end(Some(held), estimate, ALLOWANCE), held);
         }
     }
@@ -410,12 +373,6 @@ mod tests {
             at(10_600),
             "ten minutes is the estimate genuinely changing, not noise"
         );
-    }
-
-    #[test]
-    fn test_drift_exactly_at_the_allowance_is_still_held() {
-        let held = at(10_000);
-        assert_eq!(steady_epoch_end(Some(held), at(10_060), ALLOWANCE), held);
     }
 
     #[test]
@@ -504,10 +461,9 @@ mod tests {
     fn test_mean_spans_the_ends_of_the_window() {
         let samples = window(&[(100, 1_000), (105, 3_100), (110, 5_000)]);
         assert_eq!(windowed_mean_nanos(&samples, u64::MAX), Some(400_000_000));
-    }
-
-    #[test]
-    fn test_one_slow_slot_barely_moves_the_mean() {
+        let samples = steady_window((100, 1_000), SLOT_TIME_WINDOW_SLOTS as u64, 420);
+        assert_eq!(windowed_mean_nanos(&samples, u64::MAX), Some(420_000_000));
+        // One slow slot barely moves the mean.
         let steady = 150_u64 * 400;
         assert_eq!(
             windowed_mean_nanos(&window(&[(0, 0), (150, steady + 1_600)]), u64::MAX),
@@ -522,6 +478,8 @@ mod tests {
             windowed_mean_nanos(&window(&[(0, 0), (1_000, 2_000)]), u64::MAX),
             None
         );
+        let samples = steady_window((100, 1_000), SLOT_TIME_WINDOW_SLOTS as u64, 10);
+        assert_eq!(windowed_mean_nanos(&samples, u64::MAX), None);
     }
 
     #[test]

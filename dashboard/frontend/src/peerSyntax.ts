@@ -5,12 +5,10 @@ import { count, countryName, LAMPORTS_PER_SOL } from "./format";
 import { arrivalMicros, filterCounts, PEER_FILTERS, type ArrivalKind, type GossipPeer, type PeerFilter } from "./gossip";
 import {
   compared,
-  gapText,
   LIST_OPS,
   nameHolds,
   NUMBER_OPS,
   OP_LABELS,
-  parseGap,
   versionNamed,
   type Op,
 } from "./scheduleConditions";
@@ -36,24 +34,19 @@ type KeyName =
   | "ip"
   | "stake"
   | "finalization"
-  | "arrival"
-  | "heard"
-  | "up"
-  | "snapshot"
-  | "ledger";
+  | "arrival";
 
-type PeerGroup = "only" | "validator" | "votes" | "node";
+type PeerGroup = "only" | "validator" | "votes";
 
 export const PEER_TITLES: Readonly<Record<PeerGroup, string>> = {
   only: "Only peers that are",
   validator: "Validator",
   votes: "Votes",
-  node: "Node",
 };
 
 interface PeerKey {
   name: KeyName;
-  kind: "list" | "number" | "time";
+  kind: "list" | "number";
   group: PeerGroup;
   label: string;
   unit: string;
@@ -72,24 +65,18 @@ const KEYS: readonly PeerKey[] = [
   { name: "stake", kind: "number", group: "validator", label: "Stake", unit: "SOL", op: ">", example: "1000000", what: "stake, SOL" },
   { name: "finalization", kind: "number", group: "votes", label: "Finalization", unit: "%", op: "<", example: "50", what: "finalization certificates carrying its vote, %" },
   { name: "arrival", kind: "number", group: "votes", label: "Vote arrival", unit: "ms", op: ">", example: "300", what: "vote arrival, ms" },
-  { name: "heard", kind: "time", group: "node", label: "Last heard", unit: "", op: ">", example: "1m", what: "last heard" },
-  { name: "up", kind: "time", group: "node", label: "Up for", unit: "", op: "<", example: "1d", what: "up for" },
-  { name: "snapshot", kind: "number", group: "node", label: "Snapshot", unit: "slots", op: ">", example: "5000", what: "newest snapshot, slots behind our root" },
-  { name: "ledger", kind: "time", group: "node", label: "Ledger from", unit: "", op: "<", example: "1d", what: "how far back it can serve repair" },
 ];
 
 const ONLY_WHAT: Readonly<Record<PeerFilter, string>> = {
   staked: "holds stake",
   rpc: "serves RPC",
-  silent: "not heard for over a minute",
-  restarted: "restarted in the last day",
   delinquent: "staked and not voting now",
 };
 
 export interface PeerCondition {
   key: KeyName;
   op: Op;
-  /** A number in the key's unit, a time in seconds; null for a list. */
+  /** A number in the key's unit; null for a list. */
   value: number | null;
   values: readonly string[];
 }
@@ -119,9 +106,9 @@ function tally(peers: readonly GossipPeer[], of: (peer: GossipPeer) => string | 
   return [...held].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]));
 }
 
-export function peerOffered(peers: GossipPeer[], now: number): PeerOffered {
+export function peerOffered(peers: GossipPeer[]): PeerOffered {
   return {
-    counts: filterCounts(peers, now),
+    counts: filterCounts(peers),
     clients: tally(peers, (peer) => peer.clientName),
     versions: tally(peers, (peer) => peer.version),
     countries: tally(peers, (peer) => peer.country),
@@ -167,9 +154,9 @@ function listValues(key: PeerKey, typed: readonly string[], offered: PeerOffered
 }
 
 function readNumber(key: PeerKey, op: string, text: string): PeerFiltered | string {
-  const value = key.kind === "time" ? parseGap(text) : Number(text.replace(/[,_]/g, "").replace(UNITS, ""));
-  if (value === null || text === "" || !Number.isFinite(value)) {
-    return `${key.name} needs ${key.kind === "time" ? "a time" : "a number"}, e.g. ${key.name}${key.op}${key.example}.`;
+  const value = Number(text.replace(/[,_]/g, "").replace(UNITS, ""));
+  if (text === "" || !Number.isFinite(value)) {
+    return `${key.name} needs a number, e.g. ${key.name}${key.op}${key.example}.`;
   }
   const compare = OPS[op];
   if (!compare) return `${key.name} takes >, >=, <, <= or =.`;
@@ -266,7 +253,6 @@ export function withFilters(
 }
 
 export interface PeerClock {
-  now: number;
   slotMillis: number | null;
   arrivalKind: ArrivalKind;
 }
@@ -282,14 +268,6 @@ function figure(key: KeyName, peer: GossipPeer, clock: PeerClock): number | null
       const micros = arrivalMicros(peer.voteArrival, clock.arrivalKind);
       return micros === null ? null : Math.round(micros / 1000);
     }
-    case "heard":
-      return peer.heardAgo / 1000;
-    case "up":
-      return peer.started > 0 ? (clock.now - peer.started) / 1000 : null;
-    case "snapshot":
-      return peer.incremental ?? peer.full;
-    case "ledger":
-      return peer.ledger === null || !clock.slotMillis ? null : (peer.ledger * clock.slotMillis) / 1000;
     default:
       return null;
   }
@@ -321,16 +299,14 @@ export function peerConditionParts(condition: PeerCondition): { label: string; o
   const value =
     condition.value === null
       ? condition.values.join(", ")
-      : key?.kind === "time"
-        ? gapText(condition.value, " ")
-        : condition.value.toLocaleString("en-US", { maximumFractionDigits: 6 });
+      : condition.value.toLocaleString("en-US", { maximumFractionDigits: 6 });
   return { label: key?.label ?? condition.key, op: OP_LABELS[condition.op], value, unit: key?.unit ?? "" };
 }
 
 /** A condition's value as typed in its pill. */
 export function peerValueText(condition: PeerCondition): string {
   if (condition.value === null) return condition.values.map((value) => (value.includes(",") ? `"${value}"` : value)).join(", ");
-  return keyNamed(condition.key)?.kind === "time" ? gapText(condition.value) : String(condition.value);
+  return String(condition.value);
 }
 
 /** The condition with the value typed in its pill, or why that cannot be read. */

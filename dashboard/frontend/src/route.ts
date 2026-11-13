@@ -12,9 +12,9 @@ import {
 } from "./scheduleConditions";
 import { readOnly, type Only } from "./scheduleFilters";
 
-export type Page = "overview" | "slots" | "schedule" | "gossip" | "cluster";
+export type Page = "overview" | "slots" | "schedule" | "gossip" | "cluster" | "accounts";
 
-const PAGES: Page[] = ["overview", "slots", "schedule", "gossip", "cluster"];
+const PAGES: Page[] = ["overview", "slots", "schedule", "gossip", "cluster", "accounts"];
 
 export interface Route {
   page: Page;
@@ -106,6 +106,8 @@ export function routeAddress(route: Route): string {
       return "/gossip";
     case "cluster":
       return "/cluster";
+    case "accounts":
+      return "/accounts";
   }
 }
 

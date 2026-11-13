@@ -129,6 +129,20 @@ impl Rocks {
                     error_if_log_file_exists,
                 )?
             }
+            AccessType::Secondary => {
+                // Its own log, kept out of the ledger and to what went wrong: a secondary
+                // logs every catch-up.
+                let secondary_path = std::env::temp_dir()
+                    .join(format!("solana-secondary-{}", std::process::id()));
+                db_options.set_log_level(rocksdb::LogLevel::Warn);
+                info!("Opening Rocks as a secondary at {secondary_path:?}");
+                DB::open_cf_descriptors_as_secondary(
+                    &db_options,
+                    &path,
+                    &secondary_path,
+                    cf_descriptors,
+                )?
+            }
         };
 
         // Delete the now unused program_costs column if it is present
@@ -447,6 +461,10 @@ impl Rocks {
     pub(crate) fn is_primary_access(&self) -> bool {
         self.access_type == AccessType::Primary
             || self.access_type == AccessType::PrimaryForMaintenance
+    }
+
+    pub(crate) fn try_catch_up_with_primary(&self) -> Result<()> {
+        Ok(self.db.try_catch_up_with_primary()?)
     }
 
     /// Retrieves the specified RocksDB integer property of the current

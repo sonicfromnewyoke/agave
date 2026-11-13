@@ -99,9 +99,7 @@ const executed: ExecutedStage = {
   blockhash_old: 0,
   already_processed: 0,
   bad_compute_budget: 0,
-  account_data_too_large: 0,
   program_not_executable: 0,
-  program_restricted: 0,
 };
 
 const turn: LeaderTurn = {

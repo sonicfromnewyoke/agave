@@ -160,8 +160,8 @@ export function HostCard(): ReactElement | null {
             <Explain
               text={
                 validatorHeap > 0
-                  ? "Memory in use less the page cache; the bar shows validator heap, other processes, page cache."
-                  : "Memory in use less the page cache, which is the lighter part of the bar."
+                  ? "Memory in use less what the kernel can reclaim; the bar shows validator heap, other processes, reclaimable cache."
+                  : "Memory in use less what the kernel can reclaim, which is the lighter part of the bar."
               }
             >
               Memory in use
@@ -184,7 +184,7 @@ export function HostCard(): ReactElement | null {
             <span className={`tone-${availableTone(memory.available, memory.total)}`}>
               {bytes(memory.available)} available
             </span>
-            , {bytes(memory.reclaimable)} page cache
+            , {bytes(memory.reclaimable)} reclaimable
             {host.process_resident !== null && (
               <>
                 <br />

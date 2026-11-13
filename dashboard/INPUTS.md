@@ -1,10 +1,10 @@
 # What the dashboard reads
 
-This file lists what this build of the dashboard reads from the validator today, with each exact field. The events the dashboard needs from agave's event system are listed in [bola-sol/agave-dashboard-events](https://github.com/bola-sol/agave-dashboard-events). An event that replaces a datapoint needs the fields given here.
+This file lists what `agave-dashboard` reads from the validator, with each exact field: its ledger, its metrics export, its JSON-RPC and admin socket, and the host. Nothing of the dashboard runs inside the validator.
 
 ## Metrics datapoints
 
-The validator reports on itself with `solana_metrics` datapoints. The dashboard installs an observer that matches each point by name and field name. It ignores all other fields. If the validator stops sending a point, the figures that use it stop without an error.
+The validator reports on itself with `solana_metrics` datapoints, which `SOLANA_METRICS_CONFIG` sends to the dashboard's line-protocol listener in batches every ten seconds. The dashboard matches each point by name and field name, times it by the point's own timestamp, and ignores all other fields. If the validator stops sending a point, the figures that use it stop without an error.
 
 ### Per slot
 
@@ -12,8 +12,9 @@ Each of these points carries a slot and describes one block.
 
 | Point | Fields read | Feeds |
 | --- | --- | --- |
-| `replay-slot-stats` | `slot`, `fetch_entries_time`, `confirmation_without_replay_us` or `confirmation_time_us`, `bank_complete_time_us`, `entry_poh_verification_time`, `entry_transaction_verification_time`, `task_submission_us` or `replay_time`, `execute_us`, `execute_details_execute_inner_us`, `execute_details_serialize_us`, `execute_details_deserialize_us`, `execute_details_create_executor_load_elf_us`, `execute_details_create_executor_verify_code_us`, `execute_details_create_executor_jit_compile_us`, `load_us`, `store_us`, `program_cache_us`, `validate_transactions_us`, `validate_fees_us`, `filter_executable_us`, `collect_balances_us`, `collect_logs_us`, `update_stakes_cache_us`, `update_transaction_statuses`, `check_block_limits_us`, `total_transactions` | Replay card: time per slot, and its verify and execute breakdowns. The replay step of the schedule page's slot timeline. When replay finished a block, as the point arrives: the replay stage of Block life. |
+| `replay-slot-stats` | `slot`, `fetch_entries_time`, `confirmation_without_replay_us` or `confirmation_time_us`, `bank_complete_time_us`, `entry_poh_verification_time`, `entry_transaction_verification_time`, `task_submission_us` or `replay_time`, `execute_us`, `execute_details_execute_inner_us`, `execute_details_serialize_us`, `execute_details_deserialize_us`, `execute_details_create_executor_load_elf_us`, `execute_details_create_executor_verify_code_us`, `execute_details_create_executor_jit_compile_us`, `load_us`, `store_us`, `program_cache_us`, `validate_transactions_us`, `validate_fees_us`, `filter_executable_us`, `collect_balances_us`, `collect_logs_us`, `update_stakes_cache_us`, `update_transaction_statuses`, `check_block_limits_us`, `total_transactions` | Replay card: time per slot, and its verify and execute breakdowns. The replay step of the schedule page's slot timeline. When replay finished a block, as the point arrives: the replay stage of Block life. A slot with this point has a frozen bank, which lets its block be shown before the slot is rooted. |
 | `shred_insert_is_full` | `slot`, `last_index`, `num_repaired`, `num_recovered`, `total_time_ms` | Shreds, repaired shreds and shreds recovered from erasure coding per slot. The first shred to full block span on the slot timeline. The last shred, and the point's own time as when the block became full here, for the time from the leader to finalization here. With the first shred time, when each block filled here: a slot's duration is from the last earlier block to fill to this one filling, so it lines up with the slot's own work, and the Cluster page's Slot Time. The minute's mean slot time stays on first shreds, which gives the same mean without needing a block to fill. Block life's first shred, block full and repaired and recovered shares. With the next slot's first shred time, the gap before each leader's turn on Leader Handoff. |
+| `bank-new_from_parent-heights` | `slot`, `block_height` | Sent with `datapoint_info!` for each bank made. The block height shown: the newest frozen block's, counted from the newest bank reported on its chain. |
 | `retransmit-stage-slot-stats` | `num_shreds_received_root`, `num_shreds_received_1st_layer`, `num_shreds_received_2nd_layer`, `num_shreds_received_3rd_layer` | Host network card: shreds by turbine layer, over five minutes |
 | `cost_tracker_stats` | tag `is_leader`; `bank_slot`, `block_cost`, `costliest_account`, `costliest_account_cost`, `number_of_accounts`, `number_of_contended_accounts`, `allocated_accounts_data_size`, `inflight_transaction_count` | Slot details for our blocks: compute used, and the costliest account. The dashboard drops points without the leader tag. |
 | `banking_stage_scheduler_slot_counts` | tag `id`; `slot`, `num_received`, `num_dropped_on_receive`, `num_dropped_on_check_work_queue_full`, `num_dropped_on_parsing_and_sanitization`, `num_dropped_on_validate_locks`, `num_dropped_on_receive_compute_budget`, `num_dropped_on_receive_age`, `num_dropped_on_receive_already_processed`, `num_dropped_on_receive_fee_payer`, `num_dropped_on_filter_key`, `num_dropped_on_nonce_dedup`, `num_buffered`, `num_dropped_on_capacity`, `num_evicted_on_nonce_dedup`, `num_dropped_on_clear`, `num_dropped_on_clean`, `num_scheduled`, `num_unschedulable_conflicts`, `num_unschedulable_threads`, `num_finished`, `num_retryable` | Slot details: the scheduler waterfall for our leader slots. The `id` tag separates our scheduler from BAM's. The two count `num_received` in different units. |
@@ -36,7 +37,6 @@ These points are running counters. The dashboard subtracts the previous reading 
 | `shred_fetch_receiver`, `shred_fetch_repair_receiver` | `packets_count` | "Repaired" in the verdict line. The turbine row of the socket ingest card. |
 | `retransmit-stage` | tag `is_xdp`; `num_shreds_dropped_xdp_full` | Host network card: shreds dropped because the XDP channel was full |
 | `gossip_receiver`, `tpu_vote_receiver` | `packets_count` | Packets delivered on the gossip and vote rows of the socket ingest card |
-| `votor_datagram_server` | `datagrams_received` | Under alpenglow: votes delivered on the votor row of the socket ingest card |
 | `Gossip`, `Repair` (the streamer senders) | `streamer-send-bytes_total`, `streamer-send-sample_duration_ms` | Host network card: bytes the gossip and repair senders sent |
 | `banking_stage_worker_counts`, `banking_stage_worker_error_metrics` | `transactions_attempted_processing_count`, `cost_model_throttled_transactions_count`, `retryable_transaction_count`, `retryable_expired_bank_count`, `processed_transactions_count`, `processed_with_successful_result_count`, `too_many_account_locks`, `account_not_found`, `insufficient_funds`, `invalid_account_for_fee`, `blockhash_not_found`, `blockhash_too_old`, `already_processed`, `invalid_compute_budget`, `max_loaded_accounts_data_size_exceeded`, `invalid_program_for_execution`, `program_execution_temporarily_restricted` | TPU path card: the executed section, summed over the epoch |
 | `tpu-verifier` | `total_packets`, `total_dedup`, `total_dropped_below_priority_floor`, `total_valid_packets`, `eviction_drops` | TPU path card: the verify section, summed over the epoch |
@@ -52,8 +52,11 @@ These points are levels. The dashboard keeps the latest of each. The write cache
 
 | Point | Fields read | Feeds |
 | --- | --- | --- |
-| `accounts_index` | `estimate_mem_bytes` | Host card: the accounts index in the validator's memory split, marked as agave's estimate |
-| `accounts_cache_size` | `total_size` | Host card: the write cache in the validator's memory split |
+| `accounts_index` | `estimate_mem_bytes`; `count`, `capacity_in_mem`, `gets_from_mem`, `gets_missing`, `inserts`, `deletes` | Host card: the accounts index in the validator's memory split, marked as agave's estimate. Accounts page, Index card: entries against the slots of the index's hash maps, its memory, lookups and how many found an account, entries inserted and deleted. Reported every ten seconds. |
+| `accounts_cache_size` | `total_size`; `num_slots`, `total_accounts_count` | Host card: the write cache in the validator's memory split. Accounts page, Caches card: the write cache's size, accounts and slots. |
+| `clean_accounts` | `max_clean_root`, `slots_cleaned`, `num_accounts_removed_from_index` | Accounts page, Clean and shrink card: clean runs, one point each, the index entries and slots they removed, and the root the last one covered |
+| `shrink_stats`, `shrink_ancient_stats` | `num_slots_shrunk`, `accounts_removed`, `bytes_removed`, `bytes_written` | Accounts page, Clean and shrink card: dead bytes reclaimed and live bytes relocated, summed over the two shrinks |
+| `accounts_db_active` | `clean`, `shrink`, `squash_ancient`, `flush` | Accounts page, Clean and shrink card: how long each job ran, from the point at its start to the one at its end; a job still running is counted when it ends |
 | `blockstore_rocksdb_cfs` | tag `cf_name`; `size_all_mem_tables`, `block_cache_usage`, `estimate_table_readers_mem`; `total_sst_files_size` | Host card: the blockstore in the validator's memory split, the latest of each column family summed; How full's ledger parts, the column families grouped into shreds, transaction history and block metadata |
 
 ### Gossip, every two seconds
@@ -78,84 +81,49 @@ Gossip sends these points itself and clears each counter when it sends it. The d
 
 ### Read once, or on change
 
+These are sent once, so the dashboard sees them only when its listener is up before the validator starts.
+
 | Point | Fields read | Feeds |
 | --- | --- | --- |
 | `xdp-network-config` | tags `driver`, `zero_copy`; `vendor`, `model`, `kernel_version` | Host network card: the XDP transmit setup |
 | `wfsm_gossip` | `online_stake`, `total_activated_stake` | The exact stake during the supermajority wait. The validator's own progress value is a whole percent. |
 
-## Frozen banks
+## The ledger
 
-Replay sends a notification for each bank it freezes. The dashboard adds a sender to `ValidatorConfig::extra_bank_notification_senders`. A relay in the validator copies each notification to that sender and to RPC. The relay uses `try_send` on a channel of 512, so a stalled dashboard loses notifications and does not slow replay. Jito has its own fan out for this. The collector reads each bank once, at freeze, before the validator prunes it.
+The dashboard follows the validator's ledger as a RocksDB secondary: it opens the database beside the validator, takes in what the validator has written every 50 ms, and reads. It writes nothing there; its own log goes to the system's temporary directory.
 
-| Read off the bank | Feeds |
-| --- | --- |
-| `slot`, `parent_slot` | The key for each slot. Counts are the difference from the parent's totals. |
-| `transaction_count`, `non_vote_transaction_count_since_restart` | Transactions and votes per block. The Cluster page's Transactions, per run of 20 slots. |
-| `transaction_error_count`, `transaction_entries_count` | Failed transactions and entries per block. Failed transactions for TPS, summed along the working fork, the Cluster page's failed transactions, and the failed figure and filter on the schedule. |
-| `read_cost_tracker`: block cost, block limit, account limit | Compute per block, against its limits. The Cluster page's CU Used. |
-| `get_collector_fee_details`: total and priority fees | Base and priority fees per block. With the tips, what the block earned us. |
-| `get_balance` of the eight tip accounts | Tips per block, as the difference from the parent (jito only) |
-| `last_blockhash` | The blockhash of our blocks on Slot details |
-| `get_program_accounts_modified_since_parent` for the config program | Validator names and icons that the block changed |
-| `vote_accounts`, each ranked account's `last_voted_slot` (alpenglow only) | If the block's finalization certificate carried each validator's vote: a last vote within three slots of the newest. The Gossip page's finalization share and the peers table's Finalization column. |
-| `status_cache`, read with `get_status` by each transaction's message hash and recent blockhash against the bank's `ancestors`; `get_signature_status_slot` for those not found, which are durable nonce transactions | Whether each non-vote transaction failed, for Slot details' fee payers fold and each of our blocks' top fee tables: every transaction in our blocks, and in other leaders' blocks only those of payers seen in ours this epoch. The bank is held until the blockstore has the whole block, and a block counts once its slot is rooted. |
-| `epoch`, `feature_set` | The epoch a block's fee payers count in. The compute budget rules that turn a transaction's instructions into its priority fee; a v1 message states the fee itself. |
+| Read | From | Feeds |
+| --- | --- | --- |
+| Slot metas above the root (`slot_meta_iterator`) | `first_shred_timestamp`, `parent_slot`, `received`, whether the slot is full, `replay_fec_set_index` | Each slot's first shred, for our own leader slots too; each bank's parent; the estimated slot |
+| A full slot's components (`get_slot_components_with_shred_info`), from where an UpdateParent marker moved its start | The entries: the last one's hash, the transactions, the entry count. The footer: the leader's close time, whether the finalization certificate is the fast one, the notarize and skip reward certificates' bitmaps | Each block's blockhash, transactions and entries other than ticks. The newest frozen block: its place in the epoch for the epoch card and countdown, and the transactions along its chain for TPS. Under alpenglow the certificate walk: if our vote was paid, the miss and written lists, vote participation, earnings |
+| `optimistic_slots` rows | The slot votor last finalized, which is what RPC answers as confirmed | The confirmed slot; that slot and its ancestors are frozen |
+| `root` rows (`rooted_slot_iterator`) | Every slot of the rooted chain | The root and finalized slots, the slot levels, skips: a slot the chain passed over |
+| `get_slot_entries` of our produced blocks, once full | | Their non-vote transactions by message version: legacy, v0, v1 |
+| `get_slot_entries` of each rooted block | | Each non-vote transaction's fee payer for the fee payers fold: every transaction in our blocks, and in other leaders' blocks only those of payers seen in ours this epoch |
+| `genesis.bin` | The genesis hash, the slot time, the epoch schedule | The cluster name, slot times, epochs |
+| The snapshot archive directories, through `agave_snapshots::paths` | | The newest full and incremental snapshots, their age, and when the next are due. Read every second. |
 
-The dashboard keeps our blocks for the current epoch. It keeps the previous epoch until a fifth of the new one has passed. An event with these fields, sent when a block completes, removes the need to hold a bank.
+The ledger does not record a bank freezing. A block is shown once its slot is known frozen: it is rooted or confirmed, or the metrics report it replayed, or it is a block of ours and whole (its footer carries the bank's hash, so it is written after the freeze). Another leader's block is therefore shown about a slot after it froze, when it is finalized. The validator can root a block of its own before its last shreds are in the ledger; the root is held back until the block is read.
 
-## Gossip and bank forks before the wait
-
-The supermajority wait runs inside the validator constructor, before the run command has handles. So the constructor sends gossip and bank forks on `ValidatorConfig::gossip_ready_sender` just before the wait. Every 250 ms, the dashboard compares the snapshot bank's staked validators with gossip, with the validator's own rule. It shows each validator's stake, version and gossip contact, and this validator's name.
-
-The validator's own walk logs each node but emits only totals. An event for each node removes the dashboard's walk.
-
-## Bank and bank forks reads
-
-The collector polls every 200 ms and holds the bank forks read lock only to clone handles. The meters read the working bank once a second without the lock.
+## JSON-RPC and the admin socket
 
 | Call | Feeds |
 | --- | --- |
-| `BankForks::root_bank`, `working_bank`, `highest_slot`, `frozen_banks` | The slot readouts. Per slot detail where no notification channel is wired. Once, at attach, validator names from the banks frozen while the ledger loaded, which replay does not notify. |
-| `BankForks::migration_status`, `Bank::is_alpenglow` | The consensus in use, and which cluster tip to read |
-| `Bank::vote_accounts`, with each account's `vote_state_view` | Our stake, commission, BLS key and vote credits this epoch under TowerBFT, against the best and the median. The Cluster card's counts and delinquency. Each validator's delinquency and last vote in the certificate lists, the Gossip page's peers table and the schedule's leader tags and conditions. Stake in the peer table and in the wait's list. |
-| `Bank::get_rank_map` for this epoch and the next, `get_vat_health_for_next_epoch` | Under alpenglow: if our vote account has a seat this epoch and next, and how far it is short of the ticket. The header's "no seat" figure. |
-| `Bank::get_lamports_per_signature`, `minimum_vote_account_balance_for_vat`, `get_minimum_balance_for_rent_exemption`, our vote account's `pending_delegator_rewards` | What voting costs: a day of fees under TowerBFT, the admission ticket under alpenglow, with the delegators' pending rewards the vote account must also hold. The header's balance warnings and the vote balance's runway. The base fee in our blocks' top fee tables. |
-| `Bank::epoch_schedule`, `epoch`, `slot`, `block_height`, `ns_per_slot_at_slot` | This epoch card, block height and the configured slot time. The root bank's epoch also sets how far back our blocks are kept. |
-| `Bank::get_slot_history` on the root bank | The epoch's skip rate, each leader's skip rate for the spread on the Cluster page's Skip Rate, and the produced and skipped counts on Slot details for this epoch and the last. The Cluster page's skips across the epoch, its most skipped leaders, and the previous epoch's share. Unlike the ledger, it survives a restart. |
-| `Bank::cluster_type` on the root bank | The cluster name in the header |
-| `Bank::clock` | The measured slot rate, for the epoch countdown |
-| `Bank::get_rank_map` | Our rank in the BLS rank map, to find our bit in a certificate |
-| `Bank::get_account` for alpenglow's vote reward account, `epoch_stakes` and `epoch_stakes_from_slot` with their rank maps and `total_stake`, our vote account's epoch credits and `inflation_rewards_commission` | Under alpenglow, the This epoch card's reward: the producer bonus our blocks earned, voting as the epoch credits less that bonus, what each lost against the most the epoch pays, and the share our commission keeps. |
-| `Bank::get_rank_map` for the epoch votor last reported | Each ranked validator's stake that epoch, and the total the certificates count against: the weights in the certificate formation |
-| `Bank::get_filtered_indexed_accounts`, `account_indexes_include_key` | Validator names and icons from the config program: before the wait and at attach |
-| `BankForks::sharable_banks`, then `Bank::transaction_count`, `non_vote_transaction_count_since_restart` on its working bank | TPS, as the difference each second |
-| `Bank::is_frozen`, `parent_slot` on the working bank | The working fork's newest frozen bank, whose failed count TPS reads |
-
-## Gossip, blockstore, caches
-
-| Call | Feeds |
-| --- | --- |
-| `ClusterInfo::all_peers`, `my_shred_version`, `my_contact_info`, `id` | Cluster versions. Each peer's client, version and address. Our identity, shred version and ports, which match the socket ingest rows to `/proc/net/udp`. Our gossip address and its country in the header. When we last heard each validator: "no gossip" after five minutes. |
-| `ClusterInfo::all_peers`, with each contact's `rpc`, `outset` and local timestamp, and `gossip.crds` read with `get` for each peer's `SnapshotHashes` and `LowestSlot` | The Gossip page's peers table: RPC port, last heard, start time, snapshot lag behind our root, and ledger depth. Read every five seconds, only while a page asks. |
-| `ClusterInfo::all_peers`, with each contact's `rpc`, and `socket_addr_space` | The RPC node count: peers other than us with an RPC address in our address space |
-| `ClusterInfo::all_peers` and `my_contact_info`, each contact's `gossip` address, with `Bank::vote_accounts` (alpenglow only) | The country of each staked vote account's node and of ours, looked up in the country table every five seconds: the finalization share's median among validators in our country |
-| `ClusterInfo::all_peers` and `my_contact_info`, each contact's `version`, `version().client()` and `gossip` address, with `Bank::vote_accounts` | The Cluster page's stake by client, with each client's main releases, and by country and continent. Read every fifteen seconds, only while the page asks. |
-| `ClusterInfo::lookup_contact_info` for a contact's `gossip` address | The country of each leader on Leader Handoff's late list, of the leader now and of our node, looked up in the country table every few seconds |
-| `ClusterInfo::tvu_peers`, with each contact's wallclock | Who counts as seen during the supermajority wait |
-| `Blockstore::meta`, `is_full`, `lowest_slot`, `ledger_path` | First shred times, and from them each epoch's mean slot time once caught up, the slot length in the certificate formation, and the end of each gap on Leader Handoff. Skipped slots, how far back our blocks can be read, and the ledger's filesystem |
-| `Blockstore::is_root`, and `get_slot_components_with_shred_info` on a rooted block's last two FEC sets | Under alpenglow, the reward certificates in each rooted block's footer, read with the rank map. Our own blocks' footers this epoch, read again after a restart, for the producer bonus. A skipped block paid nobody, and one of ours leaves the produced list. If our vote was paid for each slot, and how many slots each rank was paid this epoch. The cause of each unpaid slot, and the writer of each certificate. The count starts when the dashboard starts. The footer's `block_producer_time_nanos`, the leader's clock when it closed the block, is read for every rooted block, seat or not: the slot strip's time from the leader, and where Block life starts each block. For every rooted block too, the stake in its notarize reward certificate, which pays the slot eight back, and whether the finalization certificate it carries is the fast one: the Cluster page's Notarized Stake and Fast Finalization. |
-| `Blockstore::get_slot_entries` on our slots, once full | Our blocks' non-vote transactions by message version: legacy, v0, v1 |
-| `Blockstore::get_slot_entries` on every frozen bank's slot, once full, and `is_root` | Each non-vote transaction's fee payer, the first account key, for the fee payers fold. Its counts are kept for this epoch and the last and start when the dashboard starts. For our own blocks also each transaction's first signature, and its count of signatures, with those the precompiles verify read from their instruction data: the five payers and five transactions that paid the most, kept as long as the block. |
-| `Blockstore::get_latest_optimistic_slots`, `highest_slot` | The cluster tip under TowerBFT: the last confirmed slot, but not below the highest slot with shreds. After a restart, the confirmed slot is older than the snapshot. The highest slot with shreds is the floor under alpenglow too. |
-| `Blockstore::meta`, each slot's `parent_slot` walked down from the cluster tip | How far behind the cluster this node is, in blocks rather than slots, so slots the cluster skipped are not counted. Thirty-two parents at most each tick; past them, or below a slot whose parent is unknown, the rest is counted in slots. |
-| `BlockCommitmentCache::highest_confirmed_slot`, `highest_super_majority_root`, `root` | The confirmed, rooted and finalized levels on the slot strip |
-| `Validator::highest_finalized` | The cluster tip under alpenglow, from votor's last certificate, but not below the highest slot with shreds: votor's own certificate trails with replay after a restart |
-| `LeaderScheduleCache::slot_leader_at`, `get_epoch_leader_schedule` with `get_leader_upcoming_slots`, `next_leader_slot` | The epoch's leader turns, our leader slots, the validators the peer table lists, and the countdown to our next slot. Each slot's leader and the one before, for Leader Handoff |
-| `ValidatorStartProgress` | The boot phases and their times |
-| The snapshot archive directories, through `agave_snapshots::paths`, and the intervals in `SnapshotConfig` | The newest full and incremental snapshots, their age, and when the next are due. A snapshot being written, and how long the last took. Under alpenglow, the slots each write spanned, which the miss list gives as a cause. Read every second, watched or not. |
-| `solana_version::Version::this_build` | The client, version and commit in the header |
-
-The certificate walk is the only place where the dashboard parses ledger bytes. A per slot event that names the validators each reward certificate paid would replace it. The leader knows this when it writes the footer.
+| admin `pid`, `startTime`, `startProgress`, `rpcAddress`, `contactInfo` | The process the host and thread panels read, uptime, the boot phases, where RPC is, our identity once startup is complete, the shred version, the gossip address and the ingest ports |
+| `getMultipleAccounts` of our identity and vote account at processed, every second | Balances, the BLS key, commission, and the vote credits, read against the ledger's root as it stood before the read |
+| `getLeaderSchedule` for this epoch, the last and the next | Every slot's leader, our leader slots, turns and handoffs |
+| `getVoteAccounts` at processed, every five seconds | Stake, commission, vote credits, last votes and delinquency (judged at the newest frozen block as the read begins), cluster counts and versions, the gossip stake during the wait |
+| Once an epoch begins: `getMinimumBalanceForRentExemption`, `getLatestBlockhash` and `getFeeForMessage`, `getMultipleAccounts` of every feature account, `getAccountInfo` of the Clock sysvar | What voting costs, the base fee in our blocks' fee tables. The slot time and block limits each slot runs under, and the compute budget rules behind priority fees. The epoch's start stamp: the time since it, over the slots since, paces the countdown until the slots' own arrival times can |
+| `getMultipleAccounts` of the staked vote accounts, at the start of each epoch | Under alpenglow, the BLS rank maps the certificates are read with |
+| `getAccountInfo` of the vote reward account, once an epoch begins | Under alpenglow, the epoch's inflation for the earnings card |
+| `getAgGenesisCert`, every five seconds until it answers | The consensus in use |
+| `getAccountInfo` of the SlotHistory sysvar | Skips left open where the dashboard could not read a slot, the skip rate, the Cluster page's skip chart. Read only while needed. |
+| `getProgramAccounts` of the config program, once a minute | Validator names and icons, only where the validator indexes that program |
+| `slotsUpdatesSubscribe` | Each frozen bank's failed transactions and entries, and failures summed along the working fork for TPS |
+| `getSignatureStatuses`, once a second for the blocks rooted since: one read of up to 256 signatures, ending at each block of ours, whose payers the blocks after it are read for | Whether each transaction the fee payer card counts failed |
+| `getClusterNodes`, every ten seconds | The gossip table: each peer's client, version, address, country and RPC port; who counts as seen during the supermajority wait; our own version and our ports for the socket ingest rows. It lists neither when a node was last heard or started, nor its Alpenglow and vote QUIC ports |
+| With `--tip-payment-program`: `accountSubscribe` to the eight tip accounts at processed, and `getMultipleAccounts` of them at confirmed once the subscriptions run | Tips per block: the tip accounts' balances against the parent's, counted from that read. A notification names the slot of the write; one that arrives after its block was shown corrects it |
+| `getIdentity`, every five seconds until the admin socket names the node | The validator's identity during startup |
 
 ## What the pages ask for
 
@@ -179,11 +147,11 @@ A page can ask for data that is too large or too rare to push. Each answer comes
 
 The validator does not own these inputs. The dashboard reads them directly:
 
-- CPU, load and memory: `/proc/stat`, `/proc/loadavg`, `/proc/meminfo`, and `/proc/self/status` for the validator's resident memory (`VmRSS`) and its split into heap, mapped files and shared memory (`RssAnon`, `RssFile`, `RssShmem`).
+- CPU, load and memory: `/proc/stat`, `/proc/loadavg`, `/proc/meminfo`, and `/proc/<pid>/status` for the validator's resident memory (`VmRSS`) and its split into heap, mapped files and shared memory (`RssAnon`, `RssFile`, `RssShmem`).
 - Disks: `/proc/diskstats`, `statvfs` on the ledger, accounts and snapshot paths, and `/sys/dev/block/<major>:<minor>` with its `partition` marker. How full also reads the size of each snapshot archive, the names beside each accounts directory for leftover `*_to_be_deleted` directories, and `st_dev` to match each part to its filesystem.
 - Network: `/proc/net/dev`, `/proc/net/route` for each interface's routes and the IPv4 default route, and `/sys/class/net/<interface>` (`type`, `flags`, `operstate`, `mtu`, `uevent`, the `device`, `bonding`, `bridge` and `tun_flags` entries, and the `master` link). The host total counts the interfaces with a `device` link, leaving out any whose `master` also has one, and counts every interface but loopback where none has one. A container holding both a passed-through NIC and a veth counts only the NIC. Each second, one read of `/proc/net/dev`, with each interface's `device` and `master` links, gives the host total and every interface's traffic over the same interval; `/proc/net/route` and the other `/sys/class/net` entries are read every five seconds.
 - Sockets: `/proc/net/udp` and `udp6`, for drops and queues.
-- Threads: `comm`, `schedstat` and `status` under `/proc/self/task`.
+- Threads: `comm`, `schedstat` and `status` under `/proc/<pid>/task`.
 - CPU governor: `/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor`.
 
 The kernel counts socket drops but not deliveries. The delivered counts come from the datapoints above.

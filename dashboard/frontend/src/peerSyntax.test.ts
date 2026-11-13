@@ -15,9 +15,6 @@ import {
 } from "./peerSyntax";
 import type { GossipPeers } from "./types";
 
-const NOW = 1_790_000_000_000;
-const DAY = 86_400_000;
-
 const LIST: GossipPeers = {
   root: 10_000,
   total_stake: 1_000,
@@ -32,11 +29,6 @@ const LIST: GossipPeers = {
   ip: ["189.1.171.215", "67.202.63.79", "198.51.100.7", null],
   country: ["BR", "US", "US", null],
   rpc: [null, null, 8899, null],
-  heard_ago: [1_000, 2_000, 3_000, 74_000],
-  started: [NOW - 6 * DAY, NOW - 3_600_000, NOW - 840_000, 0],
-  snapshot_full: [6_188, 6_188, null, 0],
-  snapshot_incremental: [9_958, null, null, null],
-  lowest: [9_000, 9_900, 9_990, null],
   finalization: [0.98, 0.254, null, 0.93],
   vote_arrival_epoch: 1_048,
   vote_arrival: [[92_400, 21_000, 388_000, 141_000, 1_802], [412_000, null, null, null, 1], null, [151_000, 34_000, 612_000, 203_000]],
@@ -45,10 +37,10 @@ const LIST: GossipPeers = {
 };
 
 const PEERS = gossipPeers(LIST);
-const OFFERED = peerOffered(PEERS, NOW);
+const OFFERED = peerOffered(PEERS);
 /** Before votor has reported an epoch. */
-const NO_ARRIVALS = peerOffered(PEERS.map((peer) => ({ ...peer, voteArrival: null })), NOW);
-const CLOCK = { now: NOW, slotMillis: 400, arrivalKind: "notarize" as const };
+const NO_ARRIVALS = peerOffered(PEERS.map((peer) => ({ ...peer, voteArrival: null })));
+const CLOCK = { slotMillis: 400, arrivalKind: "notarize" as const };
 
 const number = (key: PeerCondition["key"], op: PeerCondition["op"], value: number): PeerCondition => ({ key, op, value, values: [] });
 const list = (key: PeerCondition["key"], values: string[], op: PeerCondition["op"] = "is"): PeerCondition => ({ key, op, value: null, values });
@@ -60,7 +52,7 @@ describe("peerOffered", () => {
     expect(OFFERED.clients).toEqual([["Agave", 3], ["JitoLabs", 1]]);
     expect(OFFERED.countries).toEqual([["US", 2], ["BR", 1]]);
     expect(OFFERED.names).toEqual(["Northwind", "Harbor, Inc", "Pinecrest"]);
-    expect(OFFERED.counts).toEqual({ staked: 3, rpc: 1, silent: 1, restarted: 2, delinquent: 1 });
+    expect(OFFERED.counts).toEqual({ staked: 3, rpc: 1, delinquent: 1 });
   });
 
   it("offers arrivals only where the table shows them", () => {
@@ -74,13 +66,12 @@ describe("readPeerSearch", () => {
     expect(readPeerSearch("  north  wind ", OFFERED)).toEqual({ words: "north wind", filters: [], errors: [] });
   });
 
-  it("reads numbers, times, lists and kinds beside words", () => {
-    const read = readPeerSearch('finalization<50 harbor up<1d -client:agave geo:de,nl is:staked name:"Harbor, Inc"', OFFERED);
+  it("reads numbers, lists and kinds beside words", () => {
+    const read = readPeerSearch('finalization<50 harbor -client:agave geo:de,nl is:staked name:"Harbor, Inc"', OFFERED);
     expect(read.words).toBe("harbor");
     expect(read.errors).toEqual([]);
     expect(read.filters).toEqual([
       { kind: "condition", condition: number("finalization", "lt", 50) },
-      { kind: "condition", condition: number("up", "lt", 86_400) },
       { kind: "condition", condition: list("client", ["Agave"], "is_not") },
       { kind: "condition", condition: list("geo", ["DE", "NL"]) },
       { kind: "only", only: "staked" },
@@ -92,10 +83,9 @@ describe("readPeerSearch", () => {
     const errors = (text: string) => readPeerSearch(text, OFFERED).errors;
     expect(errors("nope:1")).toEqual(["No filter named nope."]);
     expect(errors("stake>lots")).toEqual(["stake needs a number, e.g. stake>1000000."]);
-    expect(errors("up<soon")).toEqual(["up needs a time, e.g. up<1d."]);
     expect(errors("client:nobody")).toEqual(["No peer runs a client named nobody."]);
     expect(errors("geo:Germany")).toEqual(["Germany is not a country code, e.g. geo:DE."]);
-    expect(errors("is:slow")).toEqual(["is takes staked, rpc, silent, restarted, delinquent."]);
+    expect(errors("is:slow")).toEqual(["is takes staked, rpc, delinquent."]);
     expect(errors("-is:rpc")).toEqual(["is cannot be negated."]);
     expect(errors("-stake>1")).toEqual([`Only name, client, version, geo and ip take a leading "-".`]);
   });
@@ -111,15 +101,6 @@ describe("peerHolds", () => {
     expect(matching(number("stake", "gt", 100))).toEqual(["Big1111", "Mid2222"]);
     expect(matching(number("finalization", "eq", 25))).toEqual(["Mid2222"]);
     expect(matching(number("arrival", "gt", 300))).toEqual(["Mid2222"]);
-    expect(matching(number("heard", "gt", 60))).toEqual(["Old4444"]);
-    expect(matching(number("up", "lt", 86_400))).toEqual(["Mid2222", "Rpc3333"]);
-  });
-
-  it("reads the newest snapshot, and the ledger as a time", () => {
-    expect(matching(number("snapshot", "lt", 100))).toEqual(["Big1111"]);
-    expect(matching(number("snapshot", "gt", 9_000))).toEqual(["Old4444"]);
-    expect(matching(number("ledger", "ge", 400))).toEqual(["Big1111"]);
-    expect(PEERS.filter((peer) => peerHolds(number("ledger", "ge", 0), peer, { ...CLOCK, slotMillis: null }))).toEqual([]);
   });
 
   it("follows a finalize bar's votes when one is picked", () => {
@@ -153,9 +134,7 @@ describe("withFilters", () => {
 describe("pills", () => {
   it("shows a condition's parts and the value to edit", () => {
     expect(peerConditionParts(number("finalization", "lt", 50))).toEqual({ label: "Finalization", op: "<", value: "50", unit: "%" });
-    expect(peerConditionParts(number("up", "lt", 93_600))).toEqual({ label: "Up for", op: "<", value: "1d 2h", unit: "" });
     expect(peerConditionParts(list("geo", ["DE", "NL"], "is_not"))).toEqual({ label: "Country", op: "is not", value: "DE, NL", unit: "" });
-    expect(peerValueText(number("up", "lt", 86_400))).toBe("1d");
     expect(peerValueText(list("name", ["Harbor, Inc", "x"]))).toBe('"Harbor, Inc", x');
   });
 
@@ -168,7 +147,6 @@ describe("pills", () => {
 
   it("takes a typed value, keeping the comparison", () => {
     expect(withPeerValue(number("stake", "lt", 1), "2,000", OFFERED)).toEqual(number("stake", "lt", 2_000));
-    expect(withPeerValue(number("up", "ge", 1), "2 d", OFFERED)).toEqual(number("up", "ge", 172_800));
     expect(withPeerValue(list("geo", ["DE"], "is_not"), "nl, fr", OFFERED)).toEqual(list("geo", ["NL", "FR"], "is_not"));
     expect(withPeerValue(list("name", ["x"]), '"Harbor, Inc"', OFFERED)).toEqual(list("name", ["Harbor, Inc"]));
     expect(withPeerValue(number("stake", "gt", 1), "lots", OFFERED)).toBe("stake needs a number, e.g. stake>1000000.");
@@ -192,7 +170,7 @@ describe("peerSuggest", () => {
       ["client:JitoLabs", "1 peer"],
     ]);
     expect(peerSuggest("geo:u", OFFERED)[0]?.what).toBe("United States, 2 peers");
-    expect(inserts("is:r")).toEqual(["is:rpc", "is:restarted"]);
+    expect(inserts("is:r")).toEqual(["is:rpc"]);
     expect(inserts("geo:US,")).toEqual(["geo:US,BR"]);
     expect(inserts("name:bor")).toEqual(['name:"Harbor, Inc"']);
     expect(inserts("ip:1")).toEqual([]);
@@ -213,7 +191,6 @@ describe("peerBrowse", () => {
     const find = (syntax: string) => rows.find((row) => row.syntax === syntax)?.action;
     expect(find("client:")).toEqual({ kind: "type", text: "client:", from: 7 });
     expect(find("finalization<50")).toEqual({ kind: "condition", condition: number("finalization", "lt", 50) });
-    expect(find("up<1d")).toEqual({ kind: "condition", condition: number("up", "lt", 86_400) });
   });
 
   it("drops a kind already in the box, and keys the table does not show", () => {

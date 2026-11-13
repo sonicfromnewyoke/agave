@@ -297,7 +297,7 @@ body {
   }
 }
 
-/* The key, the figures and the tabs; the tabs take a line of their own below 963px. */
+/* The key, the figures and the tabs; the tabs take a line of their own below 1042px. */
 .figures-row {
   container: figures-row / inline-size;
   display: flex;
@@ -331,7 +331,7 @@ body {
   padding: 10px 0 9px;
 }
 
-@container figures-row (width < 1143px) {
+@container figures-row (width < 1222px) {
   .figures-row .nav-long {
     display: none;
   }
@@ -341,7 +341,7 @@ body {
   }
 }
 
-@container figures-row (width < 963px) {
+@container figures-row (width < 1042px) {
   .figures-row > .nav {
     flex-basis: 100%;
     margin-left: 0;
@@ -6881,6 +6881,45 @@ body {
   color: var(--text-faint);
 }
 
+/* The accounts page: four cards, each a column of figures and levels. */
+.acct {
+  --card-min: 420px;
+}
+
+.acct-body {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.acct-body .meter {
+  margin-top: 0;
+}
+
+/* Four figures across a card half the page wide, two where the cards stack. */
+.acct .cache-figures {
+  grid-template-columns: repeat(auto-fill, minmax(max(140px, (100% - 66px) / 4), 1fr));
+}
+
+.acct .cache-storage-label {
+  white-space: nowrap;
+}
+
+.acct .cache-storage-value {
+  text-align: right;
+}
+
+/* The accounts paths, cut short where the card is narrow. */
+.acct .card-aside {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.acct-empty {
+  color: var(--text-dim);
+}
+
 .cache-footnote {
   margin: 0;
   font-size: 12px;
@@ -10132,8 +10171,8 @@ body {
   color: var(--text);
 }
 
-/* Figures in full colour and their units dimmed, with room between columns, so neighbouring
-   figures do not read as one. */
+/* Figures in full colour, with room between columns, so neighbouring figures do not read as
+   one. */
 .gossip-table.is-peers td.is-num {
   color: var(--text);
 }
@@ -10145,15 +10184,6 @@ body {
 .gossip-table.is-peers th.is-num:not(:first-child),
 .gossip-table.is-peers td.is-num:not(:first-child) {
   padding-left: 20px;
-}
-
-.gossip-unit {
-  margin-left: 1px;
-  color: var(--text-faint);
-}
-
-.gossip-table td.tone-warn .gossip-unit {
-  color: inherit;
 }
 
 /* The name column takes what the others leave, so a long name is cut before the table scrolls. */
@@ -11038,14 +11068,18 @@ body {
   }
 }
 
-/* Five tabs on a phone: the short label, then a narrower gap. */
+/* Six tabs on a phone: the short label, then a narrower gap, and a strip that scrolls where a
+   font runs wider than the gaps allow for. */
 .nav-short {
   display: none;
 }
 
 @media (max-width: 440px) {
   .nav {
-    gap: 16px;
+    gap: 11px;
+    overflow-x: auto;
+    overflow-y: hidden;
+    scrollbar-width: none;
   }
   .nav-long {
     display: none;
@@ -11055,18 +11089,21 @@ body {
   }
 }
 
-@media (max-width: 360px) {
+@media (max-width: 388px) {
   .nav {
-    gap: 12px;
+    gap: 8px;
+  }
+}
+
+@media (max-width: 372px) {
+  .nav-tab {
+    font-size: 12px;
   }
 }
 
 @media (max-width: 350px) {
   .nav {
-    gap: 10px;
-  }
-  .nav-tab {
-    font-size: 12px;
+    gap: 5px;
   }
 }
 

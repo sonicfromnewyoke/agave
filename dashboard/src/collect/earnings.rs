@@ -2,23 +2,19 @@
 //! blocks earn for the votes their reward certificates carry.
 
 use {
-    super::{Collector, count_epoch_credits},
     crate::certs,
-    serde::Serialize,
-    solana_account::ReadableAccount,
-    solana_clock::{Epoch, Slot},
-    solana_entry::block_component::BlockFooterV1,
-    solana_ledger::blockstore::Blockstore,
+    serde::{Deserialize, Serialize},
+    solana_clock::Epoch,
     solana_pubkey::Pubkey,
-    solana_runtime::{bank::Bank, epoch_stakes::BLSPubkeyToRankMap},
+    solana_runtime::epoch_stakes::BLSPubkeyToRankMap,
 };
 
 /// Where the runtime keeps each epoch's inflation: `vote_reward_account` under the alpenglow
 /// feature id.
-const VOTE_REWARD_ACCOUNT: Pubkey =
+pub const VOTE_REWARD_ACCOUNT: Pubkey =
     Pubkey::from_str_const("3vJzniWALu2qGFJ1ZY6JD3Y2ZmA5zWqmVdDX7yBXHgu7");
 
-const BLOCKS_PER_TICK: usize = 64;
+pub const BLOCKS_PER_TICK: usize = 64;
 
 /// Lamports before commission. The maxima are for the whole epoch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -35,39 +31,25 @@ pub struct EpochEarnings {
     pub unread: u32,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct Inflation {
-    reward: u64,
-    slots: u64,
-    epoch: Epoch,
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+pub struct Inflation {
+    pub reward: u64,
+    pub slots: u64,
+    pub epoch: Epoch,
 }
 
 /// The account holds the current epoch's three words, then an optional previous epoch's.
-fn read_inflation(data: &[u8], epoch: Epoch) -> Option<Inflation> {
-    let word = |at: usize| {
-        data.get(at..)?
-            .first_chunk::<8>()
-            .map(|bytes| u64::from_le_bytes(*bytes))
-    };
-    let state = |reward: usize, slots: usize, epoch: usize| {
-        Some(Inflation {
-            reward: word(reward)?,
-            slots: word(slots)?,
-            epoch: word(epoch)?,
-        })
-    };
-    let current = state(0, 8, 16)?;
+pub fn read_inflation(mut data: &[u8], epoch: Epoch) -> Option<Inflation> {
+    let current: Inflation = bincode::deserialize_from(&mut data).ok()?;
     if current.epoch == epoch {
         return Some(current);
     }
-    let previous = (data.get(24) == Some(&1))
-        .then(|| state(25, 33, 41))
-        .flatten()?;
-    (previous.epoch == epoch).then_some(previous)
+    let previous: Option<Inflation> = bincode::deserialize_from(data).ok()?;
+    previous.filter(|previous| previous.epoch == epoch)
 }
 
 /// The runtime's reward for one slot's vote by `stake`, before the voter and leader halves.
-fn slot_reward(inflation: &Inflation, total: u64, stake: u64) -> u64 {
+pub fn slot_reward(inflation: &Inflation, total: u64, stake: u64) -> u64 {
     let numerator = u128::from(inflation.reward).saturating_mul(u128::from(stake));
     let denominator = u128::from(inflation.slots).saturating_mul(u128::from(total));
     numerator
@@ -76,7 +58,7 @@ fn slot_reward(inflation: &Inflation, total: u64, stake: u64) -> u64 {
         .unwrap_or(0)
 }
 
-fn voter_half(reward: u64) -> u64 {
+pub fn voter_half(reward: u64) -> u64 {
     reward / 2
 }
 
@@ -85,7 +67,7 @@ fn leader_half(reward: u64) -> u64 {
 }
 
 /// What a certificate paid its leader, and what one carrying every rank would have.
-fn block_bonus(
+pub fn block_bonus(
     stakes: impl Iterator<Item = (u64, bool)>,
     inflation: &Inflation,
     total: u64,
@@ -97,192 +79,14 @@ fn block_bonus(
     })
 }
 
-fn rank_stakes(map: &BLSPubkeyToRankMap) -> impl Iterator<Item = u64> + '_ {
-    (0..map.len()).map(|rank| {
-        map.get_pubkey_stake_entry(rank)
-            .map_or(0, |entry| entry.stake.get())
-    })
+pub fn rank_stakes(map: &BLSPubkeyToRankMap) -> impl Iterator<Item = u64> + '_ {
+    certs::rank_entries(map).map(|entry| entry.stake.get())
 }
 
 /// Ranks in either reward certificate; `None` where one does not decode.
-fn paid_ranks(footer: &BlockFooterV1, len: usize) -> Option<Vec<bool>> {
-    let mut paid = vec![false; len];
-    let mut mark = |ranks: Vec<bool>| {
-        for (flag, set) in paid.iter_mut().zip(ranks) {
-            *flag |= set;
-        }
-    };
-    if let Some(cert) = &footer.notar_reward_cert {
-        mark(certs::decode_paid(cert.bitmap(), len)?);
-    }
-    if let Some(cert) = &footer.skip_reward_cert {
-        mark(certs::decode_paid(cert.to_bitmap(), len)?);
-    }
-    Some(paid)
-}
-
-enum BlockRead {
-    Pending,
-    Unread,
-    Counted { got: u64, full: u64 },
-}
-
-/// A skipped block of ours earns nothing of what its certificate could have paid.
-fn read_bonus(
-    blockstore: &Blockstore,
-    bank: &Bank,
-    slot: Slot,
-    inflation: &Inflation,
-    held_from: Slot,
-) -> BlockRead {
-    // Under the ledger's first slot a block that is no root may only have been cleaned up.
-    if slot < held_from {
-        return BlockRead::Unread;
-    }
-    let block = certs::read_block(blockstore, slot, bank.slot());
-    let footer = match block {
-        certs::Block::Pending => return BlockRead::Pending,
-        certs::Block::Opaque => return BlockRead::Unread,
-        certs::Block::Missing => None,
-        certs::Block::Footer(footer) => Some(footer),
-    };
-    // The cluster's first slots have no slot to reward.
-    let Some(rewarded) = certs::rewarded_slot(slot) else {
-        return BlockRead::Counted { got: 0, full: 0 };
-    };
-    let Some(stakes) = bank.epoch_stakes_from_slot(rewarded) else {
-        return BlockRead::Unread;
-    };
-    let map = stakes.bls_pubkey_to_rank_map();
-    let paid = match &footer {
-        Some(footer) => match paid_ranks(footer, map.len()) {
-            Some(paid) => paid,
-            None => return BlockRead::Unread,
-        },
-        None => vec![false; map.len()],
-    };
-    let (got, full) = block_bonus(rank_stakes(map).zip(paid), inflation, stakes.total_stake());
-    BlockRead::Counted { got, full }
-}
-
-/// One epoch's pay rates, fixed for the epoch.
-#[derive(Debug, Clone, Copy)]
-struct Rates {
-    inflation: Inflation,
-    /// Our voter half for one slot.
-    voter_slot: u64,
-    /// The bonus of a block whose certificate carries every rank.
-    full_block: u64,
-}
-
-#[derive(Debug, Default)]
-pub(super) struct EarningsWalk {
-    /// The epoch and identity the walk is for; a swapped identity starts it again.
-    key: Option<(Epoch, Pubkey)>,
-    /// `None` when we hold no rank or the inflation is unknown, until the next epoch.
-    rates: Option<Rates>,
-    leader_slots: Vec<Slot>,
-    next: usize,
-    bonus: u64,
-    bonus_lost: u64,
-    unread: u32,
-}
-
-impl Collector {
-    pub(super) fn collect_earnings(&mut self, root_bank: &Bank) {
-        let earnings = self.read_earnings(root_bank);
-        self.debounces
-            .epoch_earnings
-            .publish(&self.publisher, earnings);
-    }
-
-    /// `None` until every block of ours the root has passed is read.
-    fn read_earnings(&mut self, bank: &Bank) -> Option<EpochEarnings> {
-        if !bank.is_alpenglow() {
-            return None;
-        }
-        let epoch = bank.epoch();
-        let me = self.ctx.identity();
-        if self.earnings.key != Some((epoch, me)) {
-            self.earnings = self.start_earnings(bank, epoch, me)?;
-        }
-        let rates = self.earnings.rates?;
-        let inflation = rates.inflation;
-        let root = bank.slot();
-        let walk = &mut self.earnings;
-        let mut read = 0usize;
-        let mut held_from = None;
-        while let Some(slot) = walk.leader_slots.get(walk.next).copied() {
-            if slot > root || read == BLOCKS_PER_TICK {
-                break;
-            }
-            let held_from = *held_from.get_or_insert_with(|| self.ctx.blockstore.lowest_slot());
-            match read_bonus(&self.ctx.blockstore, bank, slot, &inflation, held_from) {
-                BlockRead::Pending => break,
-                BlockRead::Unread => walk.unread = walk.unread.saturating_add(1),
-                BlockRead::Counted { got, full } => {
-                    walk.bonus = walk.bonus.saturating_add(got);
-                    walk.bonus_lost = walk.bonus_lost.saturating_add(full.saturating_sub(got));
-                }
-            }
-            walk.next = walk.next.saturating_add(1);
-            read = read.saturating_add(1);
-        }
-        if walk
-            .leader_slots
-            .get(walk.next)
-            .is_some_and(|slot| *slot <= root)
-        {
-            return None;
-        }
-
-        let vote_accounts = bank.vote_accounts();
-        let (_, account) = vote_accounts.get(&self.ctx.vote_account)?;
-        let view = account.vote_state_view();
-        let voting = count_epoch_credits(view, epoch).saturating_sub(walk.bonus);
-        let start = bank.epoch_schedule().get_first_slot_in_epoch(epoch);
-        let passed = root.saturating_sub(start).saturating_add(1);
-        let blocks = u64::try_from(walk.leader_slots.len()).unwrap_or(u64::MAX);
-        Some(EpochEarnings {
-            epoch,
-            voting,
-            voting_lost: passed
-                .saturating_mul(rates.voter_slot)
-                .saturating_sub(voting),
-            voting_max: inflation.slots.saturating_mul(rates.voter_slot),
-            bonus: walk.bonus,
-            bonus_lost: walk.bonus_lost,
-            bonus_max: blocks.saturating_mul(rates.full_block),
-            commission_bps: view.inflation_rewards_commission(),
-            unread: walk.unread,
-        })
-    }
-
-    /// Latched once the schedule is in hand; reading it walks the whole epoch.
-    fn start_earnings(&self, bank: &Bank, epoch: Epoch, me: Pubkey) -> Option<EarningsWalk> {
-        Some(EarningsWalk {
-            key: Some((epoch, me)),
-            rates: self.read_rates(bank, epoch),
-            leader_slots: self.leader_slots_in_epoch(bank, epoch)?,
-            ..EarningsWalk::default()
-        })
-    }
-
-    fn read_rates(&self, bank: &Bank, epoch: Epoch) -> Option<Rates> {
-        let inflation = read_inflation(bank.get_account(&VOTE_REWARD_ACCOUNT)?.data(), epoch)?;
-        let stakes = bank.epoch_stakes(epoch)?;
-        let total = stakes.total_stake();
-        let map = stakes.bls_pubkey_to_rank_map();
-        let rank = *map.get_rank_for_vote_pubkey(&self.ctx.vote_account)?;
-        let ours = map.get_pubkey_stake_entry(usize::from(rank))?.stake.get();
-        let all_paid = rank_stakes(map).map(|stake| (stake, true));
-        let (_, full_block) = block_bonus(all_paid, &inflation, total);
-        Some(Rates {
-            inflation,
-            voter_slot: voter_half(slot_reward(&inflation, total, ours)),
-            full_block,
-        })
-    }
+pub fn paid_ranks(footer: &certs::FooterView, len: usize) -> Option<certs::Ranks> {
+    let (notar, skip) = certs::decode_both(footer.notar.as_deref(), footer.skip.as_deref(), len)?;
+    Some(notar | skip)
 }
 
 #[cfg(test)]
@@ -291,13 +95,6 @@ mod tests {
 
     /// The account as mainnet held it in epoch 1079.
     const MAINNET: &str = "a7c2e02f9c3800008097060000000000370400000000000001fbf0833fa138000080970600000000003604000000000000";
-
-    fn bytes(hex: &str) -> Vec<u8> {
-        (0..hex.len())
-            .step_by(2)
-            .map(|at| u8::from_str_radix(&hex[at..at.saturating_add(2)], 16).unwrap())
-            .collect()
-    }
 
     #[test]
     fn test_the_address_is_the_runtimes() {
@@ -309,19 +106,8 @@ mod tests {
     }
 
     #[test]
-    fn test_a_block_under_the_ledgers_first_slot_is_unread_not_skipped() {
-        let fixture = crate::fixture::fixture();
-        let bank = fixture.advance_to(20);
-        let inflation = read_inflation(&bytes(MAINNET), 1079).unwrap();
-        let read =
-            |held_from| read_bonus(&fixture.ctx.blockstore, &bank, 12, &inflation, held_from);
-        assert!(matches!(read(0), BlockRead::Counted { got: 0, .. }));
-        assert!(matches!(read(13), BlockRead::Unread));
-    }
-
-    #[test]
     fn test_reads_either_epoch_and_no_other() {
-        let data = bytes(MAINNET);
+        let data = hex::decode(MAINNET).unwrap();
         let current = read_inflation(&data, 1079).unwrap();
         assert_eq!(current.reward, 62_243_469_312_679);
         assert_eq!(current.slots, 432_000);
@@ -351,7 +137,6 @@ mod tests {
         assert_eq!(slot_reward(&inflation, total, 280_041_995_582_784), 92_773);
         assert_eq!(slot_reward(&inflation, 0, 1), 0);
     }
-
     #[test]
     fn test_block_bonus_counts_only_paid_ranks() {
         let inflation = Inflation {

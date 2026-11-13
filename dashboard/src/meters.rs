@@ -5,31 +5,30 @@
 use {
     crate::{
         collect::{CATCH_UP_SLOTS_PER_SECOND, FAILED_UNREAD, system_time_nanos},
-        context::{DashboardContext, StartProgress},
-        host_stats::{self, CpuUse, HostSnapshot, ResidentKinds},
+        host_stats::{self, CpuUse, Filesystem, HostSnapshot, ResidentKinds},
+        meter_source::{HostPaths, IngestAddresses, WorkingReading},
         metrics_tap::{
-            AccountsFiles, AccountsTotals, BundleTotals, ExecutedTotals, GOSSIP_ENTRY_TYPES,
-            GossipEntryTotals, GossipTotals, LedgerFiles, MemoryParts, MetricsTap,
-            ProgramCacheTotals, QuicLevels, QuicTotals, ReplaySlotTimes, TapCounters, VerifyTotals,
-            WindowedCounters, XdpConfig,
+            AccountsFiles, AccountsTotals, AccountsUpkeepLevels, AccountsUpkeepTotals,
+            BundleTotals, ExecutedTotals, GOSSIP_ENTRY_TYPES, GossipEntryTotals, GossipTotals,
+            LedgerFiles, MemoryParts, MetricsTap, NetworkTotals, ProgramCacheTotals, QuicLevels,
+            QuicTotals, ReplaySlotTimes, TapCounters, VerifyTotals, WindowedCounters, XdpConfig,
+            push_capped,
         },
-        net_ifaces::{self, InterfaceKind, InterfaceReading},
+        net_ifaces::{self, InterfaceReading},
         net_stats::{self, Counted, InterfaceCounters, NetCounters, NetReading},
-        proto::{Debounced, Publisher, TOPIC_SUMMARY},
+        proto::{Publisher, TOPIC_SUMMARY},
+        remote::Shared,
         snapshot::{self, ArchiveBytes},
         thread_stats::{self, ThreadGroup, ThreadReading},
         udp_drops::{self, PortCounters, PortWindow},
     },
-    agave_snapshots::snapshot_config::SnapshotConfig,
     serde::Serialize,
     solana_clock::{Epoch, Slot},
     solana_core::validator::ValidatorStartProgress,
-    solana_gossip::contact_info::{ContactInfo, Protocol},
     solana_ledger::blockstore_options::BLOCKSTORE_DIRECTORY_ROCKS_LEVEL,
     solana_program_runtime::loaded_programs::MAX_LOADED_ENTRY_COUNT,
-    solana_runtime::{bank::Bank, bank_forks::SharableBanks},
     std::{
-        collections::{BTreeMap, HashMap, HashSet, VecDeque},
+        collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque},
         net::SocketAddr,
         path::{Path, PathBuf},
         sync::{
@@ -113,38 +112,32 @@ pub struct AccountsDisk {
     pub storages: u64,
 }
 
+/// The index and write cache as they stand, and what clean, shrink and the index did over the
+/// window.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct AccountsDb {
+    #[serde(flatten)]
+    pub levels: AccountsUpkeepLevels,
+    #[serde(flatten)]
+    pub totals: AccountsUpkeepTotals,
+    pub window_seconds: f64,
+}
+
 /// The counters reset per bank, so `looked_up` is the window's own total.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct ProgramCache {
     pub looked_up: u64,
-    pub hits: u64,
-    pub misses: u64,
+    #[serde(flatten)]
+    pub totals: ProgramCacheTotals,
     pub hit_rate: f64,
-    pub evictions: u64,
-    pub reloads: u64,
-    pub insertions: u64,
-    pub lost_insertions: u64,
-    pub replacements: u64,
-    pub one_hit_wonders: u64,
-    pub prunes_orphan: u64,
-    pub prunes_environment: u64,
     pub peak_entries: Option<u64>,
     pub entry_limit: u64,
 }
 
 /// `None` while nothing has been asked, so an idle cache does not read as failing.
-fn cache_rate(window: &VecDeque<(u64, u64, u64)>) -> Option<(u64, f64, u64)> {
-    let mut hits = 0u64;
-    let mut misses = 0u64;
-    let mut evictions = 0u64;
-    for (sample_hits, sample_misses, sample_evictions) in window {
-        hits = hits.saturating_add(*sample_hits);
-        misses = misses.saturating_add(*sample_misses);
-        evictions = evictions.saturating_add(*sample_evictions);
-    }
-
-    let asked = hits.saturating_add(misses);
-    (asked > 0).then(|| (asked, hits as f64 / asked as f64, evictions))
+fn cache_rate(totals: &AccountsTotals) -> Option<(u64, f64)> {
+    let asked = totals.cache_hits.saturating_add(totals.cache_misses);
+    (asked > 0).then(|| (asked, totals.cache_hits as f64 / asked as f64))
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -164,7 +157,7 @@ pub struct TpsSample {
 }
 
 /// In bytes per second.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
 pub struct Network {
     pub received_per_second: u64,
     pub sent_per_second: u64,
@@ -172,17 +165,10 @@ pub struct Network {
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct NetInterface {
-    pub name: String,
-    pub kind: InterfaceKind,
-    pub up: bool,
-    pub mtu: Option<u32>,
-    pub routes: u32,
+    #[serde(flatten)]
+    pub reading: InterfaceReading,
     /// The most routes it carried in any hour of the last day, this one included.
     pub routes_peak: u32,
-    /// The interface it is a port of (its master), such as a bond, bridge or team.
-    pub member_of: Option<String>,
-    /// On a tunnel, the interface holding the default route, which carries its packets.
-    pub inside: Option<String>,
     /// `None` until a second reading is in, or after a counter went backwards.
     pub received_per_second: Option<u64>,
     pub sent_per_second: Option<u64>,
@@ -225,9 +211,8 @@ pub struct Swap {
 pub struct FilesystemUsage {
     pub name: String,
     pub path: String,
-    pub total: u64,
-    pub available: u64,
-    pub reserved: u64,
+    #[serde(flatten)]
+    pub usage: Filesystem,
     pub parts: Vec<DiskPart>,
     /// Directories named `*_to_be_deleted`, which only the thread that renamed them removes.
     pub leftovers: Vec<String>,
@@ -289,8 +274,7 @@ pub struct IngestPath {
     /// reporting one; `Some(0)` where the validator logs below info.
     pub received_recent: Option<u64>,
     pub received_total: Option<u64>,
-    /// False where the receiver counts messages, as votor counts votes, so a share of packets
-    /// would be off.
+    /// Always true: each receiver here counts packets, which the page takes its shares against.
     pub received_in_packets: bool,
 
     pub quic: bool,
@@ -328,14 +312,6 @@ pub struct EpochSpan {
     pub slots_in_epoch: u64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct EpochPosition {
-    epoch: Epoch,
-    slot: Slot,
-    start_slot: Slot,
-    slots_in_epoch: u64,
-}
-
 #[derive(Debug, Clone, Copy, Default)]
 struct LeaderTotals {
     epoch: Option<Epoch>,
@@ -348,7 +324,7 @@ struct LeaderTotals {
 impl LeaderTotals {
     fn add(
         &mut self,
-        at: EpochPosition,
+        at: WorkingReading,
         verify: VerifyTotals,
         executed: ExecutedTotals,
         bundles: BundleTotals,
@@ -367,13 +343,13 @@ impl LeaderTotals {
 
     /// `from_slot` is clamped to the epoch's first slot, since a bank read can land before the one
     /// that turned it.
-    fn span(&self, at: EpochPosition) -> EpochSpan {
-        let from_slot = self.from_slot.max(at.start_slot);
+    fn span(&self, at: WorkingReading) -> EpochSpan {
+        let from_slot = self.from_slot.max(at.epoch_start_slot);
         EpochSpan {
             epoch: at.epoch,
             elapsed_slots: at
                 .slot
-                .saturating_sub(at.start_slot)
+                .saturating_sub(at.epoch_start_slot)
                 .saturating_add(1)
                 .min(at.slots_in_epoch),
             counted_slots: at
@@ -459,30 +435,7 @@ struct IngestPort {
     name: &'static str,
     port: u16,
     received: Option<u64>,
-    received_in_packets: bool,
     quic: bool,
-}
-
-/// `errors` is the collector's running count of failed transactions along the working fork.
-#[derive(Clone, Copy)]
-struct TxnCounters {
-    slot: Slot,
-    total: u64,
-    non_vote: u64,
-    errors: u64,
-    sampled_at: Instant,
-}
-
-impl TxnCounters {
-    fn read(bank: &Bank, errors: u64) -> Self {
-        Self {
-            slot: bank.slot(),
-            total: bank.transaction_count(),
-            non_vote: bank.non_vote_transaction_count_since_restart(),
-            errors,
-            sampled_at: Instant::now(),
-        }
-    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -517,14 +470,32 @@ struct DiskLayout {
     incremental: Option<u64>,
 }
 
-fn resolve_disk_layout(ctx: &DashboardContext) -> DiskLayout {
-    let rocksdb = ctx
-        .blockstore
-        .ledger_path()
-        .join(BLOCKSTORE_DIRECTORY_ROCKS_LEVEL);
+/// Where the blockstore lives: its rocksdb directory, which can be a mount of its own, named as the
+/// ledger directory where it is not.
+fn blockstore_path(ledger: &Path) -> Option<(PathBuf, u64)> {
+    let ledger_id = host_stats::filesystem_id(ledger).ok();
+    let rocksdb = ledger.join(BLOCKSTORE_DIRECTORY_ROCKS_LEVEL);
+    match host_stats::filesystem_id(&rocksdb) {
+        Ok(id) if ledger_id != Some(id) => Some((rocksdb, id)),
+        _ => Some((ledger.to_path_buf(), ledger_id?)),
+    }
+}
+
+/// The filesystems the card lists, one row each, which of them each part of a row's split lives
+/// on, and the device of the snapshot archives.
+fn resolve_disks(host: &HostPaths) -> (Vec<HostPath>, DiskLayout, Option<String>) {
+    let mut paths = Vec::new();
+    let mut seen = HashSet::new();
+    let blockstore = blockstore_path(&host.ledger);
+    if let Some((path, id)) = blockstore.clone() {
+        seen.insert(id);
+        paths.push(HostPath::new("ledger".to_owned(), path, id));
+    }
+
+    let mut accounts = Vec::new();
     let mut account_ids = HashSet::new();
     let mut account_parents = Vec::new();
-    for path in &ctx.account_paths {
+    for path in &host.accounts {
         let Ok(id) = host_stats::filesystem_id(path) else {
             continue;
         };
@@ -534,21 +505,43 @@ fn resolve_disk_layout(ctx: &DashboardContext) -> DiskLayout {
         {
             account_parents.push((id, parent));
         }
+        if seen.insert(id) {
+            accounts.push((path.clone(), id));
+        }
     }
-    let archives = |dir: fn(&SnapshotConfig) -> &PathBuf| {
-        let config = ctx.snapshot_config.as_ref()?;
-        host_stats::filesystem_id(dir(config)).ok()
-    };
-    DiskLayout {
-        ledger: host_stats::filesystem_id(&rocksdb).ok(),
+    let numbered = accounts.len() > 1;
+    for (index, (path, id)) in accounts.into_iter().enumerate() {
+        let ordinal = index.saturating_add(1);
+        let name = if numbered {
+            format!("accounts {ordinal}")
+        } else {
+            "accounts".to_owned()
+        };
+        paths.push(HostPath::new(name, path, id));
+    }
+
+    let config = &host.snapshot_config;
+    let full = host_stats::filesystem_id(&config.full_snapshot_archives_dir).ok();
+    if let Some(id) = full
+        && seen.insert(id)
+    {
+        let archives = config.full_snapshot_archives_dir.clone();
+        paths.push(HostPath::new("snapshots".to_owned(), archives, id));
+    }
+    let layout = DiskLayout {
+        ledger: blockstore.map(|(_, id)| id),
         accounts: match account_ids.len() {
             1 => account_ids.into_iter().next(),
             _ => None,
         },
         account_parents,
-        full: archives(|config| &config.full_snapshot_archives_dir),
-        incremental: archives(|config| &config.incremental_snapshot_archives_dir),
-    }
+        full,
+        incremental: host_stats::filesystem_id(&config.incremental_snapshot_archives_dir).ok(),
+    };
+    let snapshot_device = host_stats::device_for(&config.full_snapshot_archives_dir)
+        .ok()
+        .flatten();
+    (paths, layout, snapshot_device)
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
@@ -608,49 +601,6 @@ fn read_leftovers(layout: &DiskLayout) -> Vec<(u64, String)> {
     leftovers
 }
 
-fn resolve_host_paths(ctx: &DashboardContext) -> Vec<HostPath> {
-    let mut paths = Vec::new();
-    let mut seen = HashSet::new();
-
-    let ledger = ctx.blockstore.ledger_path().clone();
-    if let Ok(id) = host_stats::filesystem_id(&ledger) {
-        seen.insert(id);
-        paths.push(HostPath::new("ledger".to_owned(), ledger, id));
-    }
-
-    let mut accounts = Vec::new();
-    for path in &ctx.account_paths {
-        let Ok(id) = host_stats::filesystem_id(path) else {
-            continue;
-        };
-        if seen.insert(id) {
-            accounts.push((path.clone(), id));
-        }
-    }
-    let numbered = accounts.len() > 1;
-    for (index, (path, id)) in accounts.into_iter().enumerate() {
-        let ordinal = index.saturating_add(1);
-        let name = if numbered {
-            format!("accounts {ordinal}")
-        } else {
-            "accounts".to_owned()
-        };
-        paths.push(HostPath::new(name, path, id));
-    }
-
-    if let Some(archives) = ctx
-        .snapshot_config
-        .as_ref()
-        .map(|config| &config.full_snapshot_archives_dir)
-        && let Ok(id) = host_stats::filesystem_id(archives)
-        && seen.insert(id)
-    {
-        paths.push(HostPath::new("snapshots".to_owned(), archives.clone(), id));
-    }
-
-    paths
-}
-
 fn device_loads(
     paths: &[HostPath],
     current: &HostSnapshot,
@@ -687,10 +637,12 @@ fn device_loads(
         .collect()
 }
 
-fn num_cpus() -> usize {
-    std::thread::available_parallelism()
-        .map(std::num::NonZeroUsize::get)
-        .unwrap_or(1)
+/// How many cores the process `pid` may run on.
+fn num_cpus_of(pid: u32) -> usize {
+    thread_stats::cores_allowed(u64::from(pid)).map_or_else(
+        || std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get),
+        |cores| cores.len(),
+    )
 }
 
 /// Gossip reports every two seconds, so rates are read over several reports.
@@ -793,32 +745,27 @@ fn gossip_packets(totals: &GossipTotals) -> u64 {
         .saturating_add(totals.sent_prune)
 }
 
-struct GossipMeter {
-    window: VecDeque<GossipTotals>,
-    entries: VecDeque<GossipEntryTotals>,
-    published: Debounced<Option<Gossip>>,
+debounced_keys! {
+    struct GossipMeter {
+        published: Option<Gossip> = (TOPIC_SUMMARY, "gossip"),
+        ;
+        window: VecDeque<GossipTotals> = VecDeque::with_capacity(GOSSIP_MINUTE),
+        entries: VecDeque<GossipEntryTotals> = VecDeque::with_capacity(GOSSIP_RATE_WINDOW),
+    }
 }
 
 impl GossipMeter {
-    fn new() -> Self {
-        Self {
-            window: VecDeque::with_capacity(GOSSIP_MINUTE),
-            entries: VecDeque::with_capacity(GOSSIP_RATE_WINDOW),
-            published: Debounced::new(TOPIC_SUMMARY, "gossip"),
-        }
-    }
-
     /// Publishes nothing while no report has arrived for the rate window: gossip's points are
     /// info-level, so the page can say why rather than show zeros.
     fn tick(&mut self, previous: &TapCounters, current: &TapCounters, publisher: &Publisher) {
-        self.window
-            .push_back(current.gossip.since(&previous.gossip));
-        while self.window.len() > GOSSIP_MINUTE {
-            self.window.pop_front();
-        }
+        let minute = sum_window(
+            &mut self.window,
+            current.gossip.totals.since(&previous.gossip.totals),
+            GOSSIP_MINUTE,
+        );
         let entries = sum_window(
             &mut self.entries,
-            current.gossip_entries.since(&previous.gossip_entries),
+            current.gossip.entries.since(&previous.gossip.entries),
             GOSSIP_RATE_WINDOW,
         );
         let recent = self.window.len().min(GOSSIP_RATE_WINDOW);
@@ -827,16 +774,12 @@ impl GossipMeter {
             .iter()
             .skip(self.window.len().saturating_sub(recent))
             .fold(GossipTotals::default(), |total, sample| total.plus(sample));
-        let minute = self
-            .window
-            .iter()
-            .fold(GossipTotals::default(), |total, sample| total.plus(sample));
 
         let gossip = (rates.reports > 0).then(|| {
             let seconds = recent as f64 * METER_INTERVAL.as_secs_f64();
             let per_second = |count: u64| count as f64 / seconds;
             let millis = |micros: u64| micros as f64 / 1_000.0 / seconds;
-            let levels = &current.gossip_levels;
+            let levels = &current.gossip.levels;
             let handled = rates
                 .push_us
                 .saturating_add(rates.pull_requests_us)
@@ -935,12 +878,13 @@ impl GossipMeter {
 }
 
 pub struct Meters {
-    ctx: DashboardContext,
-    /// The working bank without bank forks' lock.
-    sharable_banks: SharableBanks,
-    publisher: Arc<Publisher>,
-    startup_progress: StartProgress,
+    remote: Shared,
+    host_paths: HostPaths,
+    /// The validator's process, whose `/proc` entries the host and thread panels read.
+    pid: u32,
+    /// Where the uptime counts from until the admin socket has given the validator's start.
     started: SystemTime,
+    publisher: Arc<Publisher>,
     metrics_tap: Arc<MetricsTap>,
     last_tap: Option<TapCounters>,
 
@@ -949,9 +893,7 @@ pub struct Meters {
     interfaces: InterfaceMeter,
     host: HostMeter,
     sockets: SocketMeter,
-    shreds: ShredMeter,
-    turbine: TurbineMeter,
-    egress: EgressMeter,
+    traffic: TrafficMeter,
     accounts: AccountsMeter,
     program_cache: ProgramCacheMeter,
     tpu: TpuMeter,
@@ -960,69 +902,74 @@ pub struct Meters {
 }
 
 impl Meters {
+    /// The meters reading the validator process `pid`, as the pollers keep it in `remote`.
     pub fn new(
-        ctx: DashboardContext,
+        remote: Shared,
+        host_paths: HostPaths,
+        pid: u32,
         publisher: Arc<Publisher>,
-        startup_progress: StartProgress,
-        started: SystemTime,
         metrics_tap: Arc<MetricsTap>,
         failed_total: Arc<AtomicU64>,
     ) -> Self {
-        let sharable_banks = ctx.bank_forks.read().unwrap().sharable_banks();
         Self {
-            ctx,
-            sharable_banks,
+            remote,
+            host_paths,
+            pid,
+            started: SystemTime::now(),
             publisher,
-            startup_progress,
-            started,
             metrics_tap,
             last_tap: None,
             throughput: Throughput::new(failed_total),
             network: NetworkMeter::default(),
             interfaces: InterfaceMeter::default(),
             host: HostMeter::default(),
-            sockets: SocketMeter::new(),
-            shreds: ShredMeter::new(),
-            turbine: TurbineMeter::new(),
-            egress: EgressMeter::default(),
-            accounts: AccountsMeter::new(),
-            program_cache: ProgramCacheMeter::new(),
-            tpu: TpuMeter::new(),
+            sockets: SocketMeter::default(),
+            traffic: TrafficMeter::default(),
+            accounts: AccountsMeter::default(),
+            program_cache: ProgramCacheMeter::default(),
+            tpu: TpuMeter::default(),
             threads: ThreadMeter::default(),
-            gossip: GossipMeter::new(),
+            gossip: GossipMeter::default(),
         }
     }
 
     pub fn tick(&mut self) {
         self.collect_clock();
 
-        let alpenglow = {
-            let working_bank = self.sharable_banks.working();
-            self.throughput.tick(&working_bank, &self.publisher);
-            self.tpu.note_epoch(&working_bank);
-            working_bank.is_alpenglow()
-        };
+        let working = self.remote.read().unwrap().working;
+        if let Some(working) = &working {
+            self.throughput.tick(working, &self.publisher);
+            self.tpu.epoch_now = Some(*working);
+        }
+        let alpenglow = working.is_some_and(|working| working.alpenglow);
 
         let interface_rates = self.network.tick(&self.publisher);
         // Read whether or not anyone watches, so the route peak covers the whole day.
         self.interfaces.tick(&self.publisher, interface_rates);
-        self.tpu.collect_xdp(&self.metrics_tap, &self.publisher);
+        self.tpu
+            .xdp
+            .publish(&self.publisher, self.metrics_tap.xdp());
         // The `/proc` walks run only while somebody is watching. The rest is
         // cheap and keeps the charts whole for a viewer connecting.
         let watched = self.publisher.subscriber_count() > 0;
         if watched {
-            self.host
-                .tick(&self.ctx, &self.metrics_tap, &self.publisher);
-            self.threads.tick(&self.publisher);
+            self.host.tick(
+                &self.host_paths,
+                self.pid,
+                &self.metrics_tap,
+                &self.publisher,
+            );
+            self.threads.tick(self.pid, &self.publisher);
         }
         // Until startup ends whether or not anyone watches, so the totals begin there.
         if watched || self.sockets.drops_baseline.is_none() {
-            let running = matches!(
-                *self.startup_progress.read().unwrap(),
-                ValidatorStartProgress::Running
-            );
+            let (addresses, running) = {
+                let remote = self.remote.read().unwrap();
+                let running = matches!(remote.progress, Some(ValidatorStartProgress::Running));
+                (remote.ingest_addresses(), running)
+            };
             self.sockets.tick(
-                &self.ctx,
+                addresses,
                 &self.metrics_tap.counters(),
                 running,
                 alpenglow,
@@ -1036,8 +983,9 @@ impl Meters {
         let now = SystemTime::now();
         self.publisher
             .publish(TOPIC_SUMMARY, "server_time_nanos", &system_time_nanos(now));
+        let started = self.remote.read().unwrap().started;
         let uptime = now
-            .duration_since(self.started)
+            .duration_since(started.unwrap_or(self.started))
             .unwrap_or_default()
             .as_nanos() as u64;
         self.publisher
@@ -1049,9 +997,7 @@ impl Meters {
         let Some(previous) = self.last_tap.replace(current) else {
             return;
         };
-        self.shreds.tick(&previous, &current, &self.publisher);
-        self.turbine.tick(&previous, &current, &self.publisher);
-        self.egress.tick(&previous, &current, &self.publisher);
+        self.traffic.tick(&previous, &current, &self.publisher);
         self.collect_waterfall(&previous, &current);
         self.program_cache
             .tick(&previous, &current, &self.publisher);
@@ -1075,7 +1021,9 @@ impl Meters {
 }
 
 struct Throughput {
-    last_counters: Option<TxnCounters>,
+    /// The working bank last read, the running count of failed transactions along the working
+    /// fork then, and when.
+    last: Option<(WorkingReading, u64, Instant)>,
     failed_total: Arc<AtomicU64>,
     history: Vec<TpsSample>,
 }
@@ -1083,47 +1031,49 @@ struct Throughput {
 impl Throughput {
     fn new(failed_total: Arc<AtomicU64>) -> Self {
         Self {
-            last_counters: None,
+            last: None,
             failed_total,
             history: Vec::with_capacity(CHART_HISTORY),
         }
     }
 
-    fn tick(&mut self, working_bank: &Bank, publisher: &Publisher) {
+    fn tick(&mut self, working: &WorkingReading, publisher: &Publisher) {
         let errors = self.failed_total.load(Ordering::Relaxed);
-        // The collector's first count spans every bank drained at attach, so it is a baseline only.
+        // Until a count is in there is no baseline.
         if errors == FAILED_UNREAD {
             return;
         }
-        let current = TxnCounters::read(working_bank, errors);
-        let Some(previous) = self.last_counters.replace(current) else {
+        let now = Instant::now();
+        let Some((previous, previous_errors, sampled_at)) =
+            self.last.replace((*working, errors, now))
+        else {
             return;
         };
         // A fork switch or a restart makes the counters incomparable; the same bank's are not.
-        if current.slot < previous.slot
-            || current.total < previous.total
-            || current.errors < previous.errors
+        if working.slot < previous.slot
+            || working.transaction_count < previous.transaction_count
+            || errors < previous_errors
         {
             return;
         }
-        let seconds = current
-            .sampled_at
-            .duration_since(previous.sampled_at)
-            .as_secs_f64();
+        let seconds = now.duration_since(sampled_at).as_secs_f64();
         if seconds <= 0.0 {
             return;
         }
 
         // While catching up, replay chews through slots far faster than the cluster
         // produces them, and one such sample would pin the chart's scale.
-        let slots_per_second = current.slot.saturating_sub(previous.slot) as f64 / seconds;
-        if slots_per_second > CATCH_UP_SLOTS_PER_SECOND {
+        let per_second = |now: u64, before: u64| now.saturating_sub(before) as f64 / seconds;
+        if per_second(working.slot, previous.slot) > CATCH_UP_SLOTS_PER_SECOND {
             return;
         }
 
-        let total = current.total.saturating_sub(previous.total) as f64 / seconds;
-        let non_vote = current.non_vote.saturating_sub(previous.non_vote) as f64 / seconds;
-        let failed = current.errors.saturating_sub(previous.errors) as f64 / seconds;
+        let total = per_second(working.transaction_count, previous.transaction_count);
+        let non_vote = per_second(
+            working.non_vote_transaction_count,
+            previous.non_vote_transaction_count,
+        );
+        let failed = per_second(errors, previous_errors);
         let tps = Tps {
             total,
             vote: (total - non_vote).max(0.0),
@@ -1132,7 +1082,7 @@ impl Throughput {
         };
 
         let sample = TpsSample {
-            slot: current.slot,
+            slot: working.slot,
             timestamp_nanos: system_time_nanos(SystemTime::now()),
             tps,
         };
@@ -1153,26 +1103,21 @@ struct NetworkMeter {
     last: Option<(NetReading, Instant)>,
     history: Vec<NetworkSample>,
     /// Each interface's bytes a second over the same interval as the host total.
-    interface_rates: HashMap<String, (u64, u64)>,
+    interface_rates: HashMap<String, Network>,
     unavailable: bool,
 }
 
 impl NetworkMeter {
     /// Returns each interface's rates over the same interval as the host total it published.
-    fn tick(&mut self, publisher: &Publisher) -> &HashMap<String, (u64, u64)> {
-        if self.unavailable {
-            return &self.interface_rates;
-        }
-        let rates = match net_stats::read() {
-            Ok(reading) => self.note(reading, Instant::now()),
-            Err(err) => {
-                self.give_up();
-                log::info!("dashboard: network counters unavailable, panel disabled: {err}");
-                None
+    fn tick(&mut self, publisher: &Publisher) -> &HashMap<String, Network> {
+        let failed = "network counters unavailable, panel disabled";
+        match unless_failed(&mut self.unavailable, failed, net_stats::read) {
+            Some(reading) => {
+                if let Some(rates) = self.note(reading, Instant::now()) {
+                    self.publish(publisher, rates);
+                }
             }
-        };
-        if let Some(rates) = rates {
-            self.publish(publisher, rates);
+            None => self.give_up(),
         }
         &self.interface_rates
     }
@@ -1219,8 +1164,20 @@ impl NetworkMeter {
     }
 }
 
-/// Bytes a second since the previous reading; none where a counter went backwards or the reading
-/// switched between the cards and every interface, as when the cards vanish.
+/// Bytes a second between two readings; none where a counter went backwards.
+fn rates(before: NetCounters, after: NetCounters, seconds: f64) -> Option<Network> {
+    // Counters are unsigned and wrap or reset when an interface goes down,
+    // so a decrease is discarded rather than read as negative throughput.
+    let received = after.received.checked_sub(before.received)?;
+    let sent = after.sent.checked_sub(before.sent)?;
+    Some(Network {
+        received_per_second: (received as f64 / seconds) as u64,
+        sent_per_second: (sent as f64 / seconds) as u64,
+    })
+}
+
+/// The host total's rates since the previous reading; none where a counter went backwards or the
+/// reading switched between the cards and every interface, as when the cards vanish.
 fn network_rates(
     (previous, previous_counted): (NetCounters, Counted),
     (current, counted): (NetCounters, Counted),
@@ -1230,14 +1187,7 @@ fn network_rates(
     if seconds <= 0.0 || counted != previous_counted {
         return None;
     }
-    // Counters are unsigned and wrap or reset when an interface goes down,
-    // so a decrease is discarded rather than read as negative throughput.
-    let received = current.received.checked_sub(previous.received)?;
-    let sent = current.sent.checked_sub(previous.sent)?;
-    Some(Network {
-        received_per_second: (received as f64 / seconds) as u64,
-        sent_per_second: (sent as f64 / seconds) as u64,
-    })
+    rates(previous, current, seconds)
 }
 
 /// Each interface's kind, state and routes are read this often. Its traffic comes every second,
@@ -1259,7 +1209,7 @@ struct InterfaceMeter {
 
 impl InterfaceMeter {
     /// Published every second with the host total's interface rates, so the two agree.
-    fn tick(&mut self, publisher: &Publisher, rates: &HashMap<String, (u64, u64)>) {
+    fn tick(&mut self, publisher: &Publisher, rates: &HashMap<String, Network>) {
         if self.unavailable {
             return;
         }
@@ -1269,13 +1219,10 @@ impl InterfaceMeter {
             .as_ref()
             .is_none_or(|(at, _)| now.duration_since(*at) >= INTERFACE_INTERVAL)
         {
-            let readings = match net_ifaces::read() {
-                Ok(readings) => readings,
-                Err(err) => {
-                    self.unavailable = true;
-                    log::info!("dashboard: network interfaces unavailable: {err}");
-                    return;
-                }
+            let failed = "network interfaces unavailable";
+            let Some(readings) = unless_failed(&mut self.unavailable, failed, net_ifaces::read)
+            else {
+                return;
             };
             self.described = Some((now, self.note_peaks(now, readings)));
         }
@@ -1339,22 +1286,15 @@ fn interface_rates(
     before: &InterfaceCounters,
     after: &InterfaceCounters,
     elapsed: Duration,
-) -> HashMap<String, (u64, u64)> {
+) -> HashMap<String, Network> {
     let seconds = elapsed.as_secs_f64();
     if seconds <= 0.0 {
         return HashMap::new();
     }
     after
         .iter()
-        .filter_map(|(name, (received, sent))| {
-            let (received_before, sent_before) = before.get(name)?;
-            Some((
-                name.clone(),
-                (
-                    (received.checked_sub(*received_before)? as f64 / seconds) as u64,
-                    (sent.checked_sub(*sent_before)? as f64 / seconds) as u64,
-                ),
-            ))
+        .filter_map(|(name, counters)| {
+            Some((name.clone(), rates(*before.get(name)?, *counters, seconds)?))
         })
         .collect()
 }
@@ -1363,23 +1303,18 @@ fn interface_rates(
 fn interface_shown(
     reading: &InterfaceReading,
     routes_peak: u32,
-    rates: Option<(u64, u64)>,
+    rates: Option<Network>,
 ) -> Option<NetInterface> {
-    let quiet = rates.is_none_or(|(received, sent)| received == 0 && sent == 0);
+    let quiet =
+        rates.is_none_or(|rates| rates.received_per_second == 0 && rates.sent_per_second == 0);
     if !reading.up && reading.routes == 0 && quiet {
         return None;
     }
     Some(NetInterface {
-        name: reading.name.clone(),
-        kind: reading.kind,
-        up: reading.up,
-        mtu: reading.mtu,
-        routes: reading.routes,
+        reading: reading.clone(),
         routes_peak,
-        member_of: reading.member_of.clone(),
-        inside: reading.inside.clone(),
-        received_per_second: rates.map(|(received, _)| received),
-        sent_per_second: rates.map(|(_, sent)| sent),
+        received_per_second: rates.map(|rates| rates.received_per_second),
+        sent_per_second: rates.map(|rates| rates.sent_per_second),
     })
 }
 
@@ -1387,42 +1322,23 @@ fn interface_shown(
 struct HostMeter {
     last: Option<(HostSnapshot, Instant)>,
     unavailable: bool,
-    paths: Option<Vec<HostPath>>,
-    layout: Option<DiskLayout>,
+    disks: Option<(Vec<HostPath>, DiskLayout, Option<String>)>,
     resident: VecDeque<(Instant, u64)>,
-    snapshot_device: Option<Option<String>>,
 }
 
 const RESIDENT_HISTORY: Duration = Duration::from_secs(3600);
 const RESIDENT_HOUR_AGO: Duration = Duration::from_secs(3300);
 
 impl HostMeter {
-    fn tick(&mut self, ctx: &DashboardContext, tap: &MetricsTap, publisher: &Publisher) {
-        if self.unavailable {
+    fn tick(&mut self, host: &HostPaths, pid: u32, tap: &MetricsTap, publisher: &Publisher) {
+        let failed = "host counters unavailable, panel disabled";
+        let Some(current) = unless_failed(&mut self.unavailable, failed, host_stats::read) else {
             return;
-        }
-        let current = match host_stats::read() {
-            Ok(snapshot) => snapshot,
-            Err(err) => {
-                self.unavailable = true;
-                log::info!("dashboard: host counters unavailable, panel disabled: {err}");
-                return;
-            }
         };
         let now = Instant::now();
-        let paths = self.paths.get_or_insert_with(|| resolve_host_paths(ctx));
-        let snapshot_device = self
-            .snapshot_device
-            .get_or_insert_with(|| {
-                ctx.snapshot_config
-                    .as_ref()
-                    .and_then(|config| {
-                        host_stats::device_for(&config.full_snapshot_archives_dir).ok()
-                    })
-                    .flatten()
-            })
-            .clone();
-        let process_memory = host_stats::process_memory().ok();
+        let (paths, layout, snapshot_device) =
+            self.disks.get_or_insert_with(|| resolve_disks(host));
+        let process_memory = host_stats::process_memory_of(pid).ok();
         let process_resident = process_memory.map(|memory| memory.resident);
         if let Some(resident) = process_resident {
             self.resident.push_back((now, resident));
@@ -1455,18 +1371,14 @@ impl HostMeter {
             .memory
             .swap_total
             .saturating_sub(current.memory.swap_free);
-        let layout = self.layout.get_or_insert_with(|| resolve_disk_layout(ctx));
         let readings = DiskReadings {
             ledger: tap.ledger_files(),
             accounts: tap.accounts_files(),
-            archives: ctx
-                .snapshot_config
-                .as_ref()
-                .and_then(snapshot::archive_bytes),
+            archives: snapshot::archive_bytes(&host.snapshot_config),
         };
         let leftovers = read_leftovers(layout);
         let host = Host {
-            cores: num_cpus(),
+            cores: num_cpus_of(pid),
             load_one: current.load.one,
             load_five: current.load.five,
             load_fifteen: current.load.fifteen,
@@ -1489,17 +1401,14 @@ impl HostMeter {
             process_resident_hour_ago,
             process_kinds: process_memory.and_then(|memory| memory.kinds),
             memory_parts: tap.memory_parts(),
-            snapshot_device,
+            snapshot_device: snapshot_device.clone(),
             filesystems: paths
                 .iter()
                 .filter_map(|path| {
-                    let usage = host_stats::filesystem(&path.path).ok()?;
                     Some(FilesystemUsage {
                         name: path.name.clone(),
                         path: path.path.to_string_lossy().into_owned(),
-                        total: usage.total,
-                        available: usage.available,
-                        reserved: usage.reserved,
+                        usage: host_stats::filesystem(&path.path).ok()?,
                         parts: disk_parts(path.filesystem, layout, &readings),
                         leftovers: leftovers
                             .iter()
@@ -1519,19 +1428,15 @@ impl HostMeter {
 #[derive(Default)]
 struct ThreadMeter {
     last: Option<(HashMap<u64, ThreadReading>, Instant)>,
-    pinning: HashMap<u64, Option<String>>,
+    pinning: HashMap<u64, Option<BTreeSet<usize>>>,
     recent: VecDeque<Vec<(String, f64)>>,
-    /// When every thread's name was last read.
     named_at: Option<Instant>,
     history: Vec<ThreadsSample>,
     unavailable: bool,
 }
 
 impl ThreadMeter {
-    fn tick(&mut self, publisher: &Publisher) {
-        if self.unavailable {
-            return;
-        }
+    fn tick(&mut self, pid: u32, publisher: &Publisher) {
         let refresh_names = self
             .named_at
             .is_none_or(|at| at.elapsed() >= THREAD_NAMES_REFRESH);
@@ -1540,22 +1445,19 @@ impl ThreadMeter {
         } else {
             self.last.as_ref().map(|(by_tid, _)| by_tid)
         };
-        let current = match thread_stats::read(known) {
-            Ok(threads) => threads,
-            Err(err) => {
-                self.unavailable = true;
-                log::info!("dashboard: thread counters unavailable, panel disabled: {err}");
-                return;
-            }
+        let failed = "thread counters unavailable, panel disabled";
+        let Some(current) = unless_failed(&mut self.unavailable, failed, || {
+            thread_stats::read_of(pid, known)
+        }) else {
+            return;
         };
         if refresh_names {
             self.named_at = Some(Instant::now());
         }
-        let cores = num_cpus();
+        let cores = num_cpus_of(pid);
         for thread in &current {
             self.pinning.entry(thread.tid).or_insert_with(|| {
-                thread_stats::cores_allowed(thread.tid)
-                    .filter(|list| thread_stats::cores_in(list) < cores)
+                thread_stats::cores_allowed(thread.tid).filter(|allowed| allowed.len() < cores)
             });
         }
 
@@ -1587,15 +1489,11 @@ impl ThreadMeter {
             return;
         };
 
-        self.recent.push_back(
-            groups
-                .iter()
-                .map(|group| (group.name.clone(), group.on_cpu))
-                .collect(),
-        );
-        while self.recent.len() > THREADS_HISTORY {
-            self.recent.pop_front();
-        }
+        let shares = groups
+            .iter()
+            .map(|group| (group.name.clone(), group.on_cpu))
+            .collect();
+        push_capped(&mut self.recent, shares, THREADS_HISTORY);
         let means = thread_stats::window_means(&self.recent);
         let sample = ThreadsSample {
             timestamp_nanos: system_time_nanos(SystemTime::now()),
@@ -1613,66 +1511,51 @@ impl ThreadMeter {
     }
 }
 
-struct SocketMeter {
-    drops_window: PortWindow,
-    quic_drops_window: PortWindow,
-    kernel_drops: HashMap<&'static str, u64>,
-    /// Per-port drops when the validator finished starting, so the startup burst is not carried for
-    /// the life of the process.
-    drops_baseline: Option<HashMap<u16, u64>>,
-    received_window: PortWindow,
-    received_baseline: Option<HashMap<u16, u64>>,
-    /// Last counters seen per reported port: `/proc/net/udp` is not read atomically, so a bound
-    /// socket can drop out of one snapshot.
-    known_sockets: HashMap<u16, PortCounters>,
-    unavailable: bool,
-    /// Set once the table has been read, so an empty table before then does not say the TPU port is
-    /// bound elsewhere.
-    sampled: bool,
-    published: Debounced<IngestSummary>,
+debounced_keys! {
+    struct SocketMeter {
+        published: IngestSummary = (TOPIC_SUMMARY, "ingest_paths"),
+        ;
+        drops_window: PortWindow = PortWindow::new(DROPS_WINDOW),
+        quic_drops_window: PortWindow =
+            PortWindow::new(Duration::from_secs(WATERFALL_WINDOW as u64)),
+        kernel_drops: HashMap<&'static str, u64> = HashMap::new(),
+        /// Per-port drops when the validator finished starting, so the startup burst is not
+        /// carried for the life of the process.
+        drops_baseline: Option<HashMap<u16, u64>> = None,
+        received_window: PortWindow = PortWindow::new(DROPS_WINDOW),
+        received_baseline: Option<HashMap<u16, u64>> = None,
+        /// Last counters seen per reported port: `/proc/net/udp` is not read atomically, so a
+        /// bound socket can drop out of one snapshot.
+        known_sockets: HashMap<u16, PortCounters> = HashMap::new(),
+        unavailable: bool = false,
+        /// Set once the table has been read, so an empty table before then does not say the TPU
+        /// port is bound elsewhere.
+        sampled: bool = false,
+    }
 }
 
 impl SocketMeter {
-    fn new() -> Self {
-        Self {
-            drops_window: PortWindow::new(DROPS_WINDOW),
-            quic_drops_window: PortWindow::new(Duration::from_secs(WATERFALL_WINDOW as u64)),
-            kernel_drops: HashMap::new(),
-            drops_baseline: None,
-            received_window: PortWindow::new(DROPS_WINDOW),
-            received_baseline: None,
-            known_sockets: HashMap::new(),
-            unavailable: false,
-            sampled: false,
-            published: Debounced::new(TOPIC_SUMMARY, "ingest_paths"),
-        }
-    }
-
     fn tick(
         &mut self,
-        ctx: &DashboardContext,
+        addresses: Option<IngestAddresses>,
         tap: &TapCounters,
         running: bool,
         alpenglow: bool,
         publisher: &Publisher,
     ) {
-        if self.unavailable {
+        let Some(addresses) = addresses else {
             return;
-        }
-        let current = match udp_drops::read() {
-            Ok(ports) => ports,
-            Err(err) => {
-                self.unavailable = true;
-                // Emptied: this latches, and a reading kept here would show on the TPU path
-                // card as current for the rest of the process.
-                self.kernel_drops.clear();
-                log::info!("dashboard: socket counters unavailable, panel disabled: {err}");
-                return;
-            }
+        };
+        let failed = "socket counters unavailable, panel disabled";
+        let Some(current) = unless_failed(&mut self.unavailable, failed, udp_drops::read) else {
+            // Emptied: this latches, and a reading kept here would show on the TPU path
+            // card as current for the rest of the process.
+            self.kernel_drops.clear();
+            return;
         };
         self.sampled = true;
         let now = Instant::now();
-        let ports = ingest_ports(&ctx.cluster_info.my_contact_info(), tap, alpenglow);
+        let ports = ingest_ports_at(&addresses, tap, alpenglow);
 
         for port in &ports {
             if let Some(counters) = current.get(&port.port) {
@@ -1727,7 +1610,7 @@ impl SocketMeter {
                         .received
                         .map(|total| self.received_window.since(port.port, total)),
                     received_total: port.received.map(|total| total.saturating_sub(received_by)),
-                    received_in_packets: port.received_in_packets,
+                    received_in_packets: true,
                     quic: port.quic,
                 })
             })
@@ -1750,53 +1633,37 @@ impl SocketMeter {
     }
 }
 
-/// Under alpenglow votes reach votor's port and nothing reaches the TPU vote ports, so the one
-/// replaces the other.
-fn ingest_ports(info: &ContactInfo, tap: &TapCounters, alpenglow: bool) -> Vec<IngestPort> {
-    let port = |name, addr: Option<SocketAddr>, received, received_in_packets, quic| {
+fn ingest_ports_at(info: &IngestAddresses, tap: &TapCounters, alpenglow: bool) -> Vec<IngestPort> {
+    let port = |name, addr: Option<SocketAddr>, received, quic| {
         Some(IngestPort {
             name,
             port: addr?.port(),
             received,
-            received_in_packets,
             quic,
         })
     };
-    let datagrams = |name, addr, received| port(name, addr, received, true, false);
-    let quic = |name, addr| port(name, addr, None, true, true);
-
-    let mut ports = vec![
+    let network = &tap.network;
+    [
         // Everything arriving on the TVU port is a shred, so the count the
         // shred receiver keeps is the count of what the port delivered.
-        datagrams("turbine", info.tvu(Protocol::UDP), Some(tap.shreds_turbine)),
-        quic("tpu", info.tpu(Protocol::QUIC)),
-        quic("tpu forwards", info.tpu_forwards(Protocol::QUIC)),
-    ];
-    if alpenglow {
-        ports.push(port(
-            "votor",
-            info.alpenglow(),
-            Some(tap.votes_votor),
-            false,
-            false,
-        ));
-    } else {
-        ports.push(datagrams(
+        port("turbine", info.tvu_udp, Some(network.shreds_turbine), false),
+        port("tpu", info.tpu_quic, None, true),
+        port("tpu forwards", info.tpu_forwards_quic, None, true),
+        // Under alpenglow votes no longer arrive on it.
+        port(
             "tpu vote",
-            info.tpu_vote(Protocol::UDP),
-            Some(tap.packets_tpu_vote),
-        ));
-        ports.push(quic("tpu vote quic", info.tpu_vote(Protocol::QUIC)));
-    }
-    ports.push(datagrams("gossip", info.gossip(), Some(tap.packets_gossip)));
-    // The one port that could have a count and does not: its receiver keeps
-    // counters nothing reports. Reaching them means a change to `core`.
-    ports.push(datagrams(
-        "serve repair",
-        info.serve_repair(Protocol::UDP),
-        None,
-    ));
-    ports.into_iter().flatten().collect()
+            info.tpu_vote_udp.filter(|_| !alpenglow),
+            Some(network.packets_tpu_vote),
+            false,
+        ),
+        port("gossip", info.gossip, Some(network.packets_gossip), false),
+        // The one port that could have a count and does not: its receiver keeps
+        // counters nothing reports. Reaching them means a change to `core`.
+        port("serve repair", info.serve_repair_udp, None, false),
+    ]
+    .into_iter()
+    .flatten()
+    .collect()
 }
 
 /// In bytes per second; `None` until a sender has reported.
@@ -1806,259 +1673,162 @@ struct EgressSplit {
     repair_per_second: Option<u64>,
 }
 
-struct EgressMeter {
-    split: EgressSplit,
-    published: Debounced<EgressSplit>,
-}
-
-impl Default for EgressMeter {
-    fn default() -> Self {
-        Self {
-            split: EgressSplit::default(),
-            published: Debounced::new(TOPIC_SUMMARY, "network_egress"),
-        }
+debounced_keys! {
+    /// Shreds received and repaired, turbine's layers, and the bytes gossip and repair sent.
+    struct TrafficMeter {
+        shreds: Option<Shreds> = (TOPIC_SUMMARY, "shreds"),
+        turbine: Option<Turbine> = (TOPIC_SUMMARY, "turbine"),
+        egress: EgressSplit = (TOPIC_SUMMARY, "network_egress"),
+        ;
+        window: VecDeque<NetworkTotals> = VecDeque::with_capacity(SHREDS_WINDOW),
     }
 }
 
-impl EgressMeter {
+impl TrafficMeter {
     fn tick(&mut self, previous: &TapCounters, current: &TapCounters, publisher: &Publisher) {
-        let rate = |bytes: u64, millis: u64, was: Option<u64>| {
-            (millis > 0)
-                .then(|| bytes.saturating_mul(1000).checked_div(millis))
-                .flatten()
-                .or(was)
-        };
-        self.split = EgressSplit {
-            gossip_per_second: rate(
-                current
-                    .gossip_sent_bytes
-                    .saturating_sub(previous.gossip_sent_bytes),
-                current
-                    .gossip_sent_millis
-                    .saturating_sub(previous.gossip_sent_millis),
-                self.split.gossip_per_second,
-            ),
-            repair_per_second: rate(
-                current
-                    .repair_sent_bytes
-                    .saturating_sub(previous.repair_sent_bytes),
-                current
-                    .repair_sent_millis
-                    .saturating_sub(previous.repair_sent_millis),
-                self.split.repair_per_second,
-            ),
-        };
-        self.published.publish(publisher, self.split);
-    }
-}
-
-struct ShredMeter {
-    window: VecDeque<(u64, u64)>,
-    published: Debounced<Option<Shreds>>,
-}
-
-impl ShredMeter {
-    fn new() -> Self {
-        Self {
-            window: VecDeque::with_capacity(SHREDS_WINDOW),
-            published: Debounced::new(TOPIC_SUMMARY, "shreds"),
-        }
-    }
-
-    fn tick(&mut self, previous: &TapCounters, current: &TapCounters, publisher: &Publisher) {
-        self.window.push_back((
-            current
-                .shreds_turbine
-                .saturating_sub(previous.shreds_turbine),
-            current.shreds_repair.saturating_sub(previous.shreds_repair),
-        ));
-        while self.window.len() > SHREDS_WINDOW {
-            self.window.pop_front();
-        }
-
-        let mut turbine = 0u64;
-        let mut repaired = 0u64;
-        for (sample_turbine, sample_repair) in &self.window {
-            turbine = turbine.saturating_add(*sample_turbine);
-            repaired = repaired.saturating_add(*sample_repair);
-        }
-
-        let received = turbine.saturating_add(repaired);
+        let sample = current.network.since(&previous.network);
+        let sum = sum_window(&mut self.window, sample, SHREDS_WINDOW);
+        let repaired = sum.shreds_repair;
+        let received = sum.shreds_turbine.saturating_add(repaired);
         let shreds = (received > 0).then(|| Shreds {
             received,
             repaired,
             repair_rate: repaired as f64 / received as f64,
         });
-        self.published.publish(publisher, shreds);
-    }
-}
+        self.shreds.publish(publisher, shreds);
 
-struct TurbineMeter {
-    window: VecDeque<[u64; 5]>,
-    published: Debounced<Option<Turbine>>,
-}
-
-impl TurbineMeter {
-    fn new() -> Self {
-        Self {
-            window: VecDeque::with_capacity(SHREDS_WINDOW),
-            published: Debounced::new(TOPIC_SUMMARY, "turbine"),
-        }
-    }
-
-    fn tick(&mut self, previous: &TapCounters, current: &TapCounters, publisher: &Publisher) {
-        self.window.push_back([
-            current.turbine_root.saturating_sub(previous.turbine_root),
-            current
-                .turbine_layer_1
-                .saturating_sub(previous.turbine_layer_1),
-            current
-                .turbine_layer_2
-                .saturating_sub(previous.turbine_layer_2),
-            current
-                .turbine_layer_3
-                .saturating_sub(previous.turbine_layer_3),
-            current.xdp_dropped.saturating_sub(previous.xdp_dropped),
-        ]);
-        while self.window.len() > SHREDS_WINDOW {
-            self.window.pop_front();
-        }
-
-        let mut sum = [0u64; 5];
-        for sample in &self.window {
-            for (total, part) in sum.iter_mut().zip(sample) {
-                *total = total.saturating_add(*part);
-            }
-        }
-        let [root, layer_1, layer_2, layer_3, xdp_dropped] = sum;
-
-        let reported = current.retransmit_xdp.is_some()
-            || root
-                .saturating_add(layer_1)
-                .saturating_add(layer_2)
-                .saturating_add(layer_3)
-                > 0;
-        let turbine = reported.then_some(Turbine {
-            root,
-            layer_1,
-            layer_2,
-            layer_3,
-            xdp_dropped,
+        let turbine = Turbine {
+            root: sum.turbine_root,
+            layer_1: sum.turbine_layer_1,
+            layer_2: sum.turbine_layer_2,
+            layer_3: sum.turbine_layer_3,
+            xdp_dropped: sum.xdp_dropped,
             xdp: current.retransmit_xdp,
-        });
-        self.published.publish(publisher, turbine);
+        };
+        let reported = turbine.xdp.is_some()
+            || turbine
+                .root
+                .saturating_add(turbine.layer_1)
+                .saturating_add(turbine.layer_2)
+                .saturating_add(turbine.layer_3)
+                > 0;
+        self.turbine.publish(publisher, reported.then_some(turbine));
+
+        let last = self.egress.last().copied().unwrap_or_default();
+        let rate = |bytes: u64, millis: u64, was: Option<u64>| {
+            bytes.saturating_mul(1000).checked_div(millis).or(was)
+        };
+        let egress = EgressSplit {
+            gossip_per_second: rate(
+                sample.gossip_sent_bytes,
+                sample.gossip_sent_millis,
+                last.gossip_per_second,
+            ),
+            repair_per_second: rate(
+                sample.repair_sent_bytes,
+                sample.repair_sent_millis,
+                last.repair_per_second,
+            ),
+        };
+        self.egress.publish(publisher, egress);
     }
 }
 
-struct AccountsMeter {
-    cache_window: VecDeque<(u64, u64, u64)>,
-    window: VecDeque<AccountsTotals>,
-    published: Debounced<Option<AccountsCache>>,
+debounced_keys! {
+    struct AccountsMeter {
+        published: Option<AccountsCache> = (TOPIC_SUMMARY, "accounts_cache"),
+        upkeep: Option<AccountsDb> = (TOPIC_SUMMARY, "accounts_db"),
+        ;
+        window: VecDeque<AccountsTotals> = VecDeque::with_capacity(ACCOUNTS_CACHE_WINDOW),
+        upkeep_window: VecDeque<AccountsUpkeepTotals> =
+            VecDeque::with_capacity(ACCOUNTS_CACHE_WINDOW),
+    }
 }
 
 impl AccountsMeter {
-    fn new() -> Self {
-        Self {
-            cache_window: VecDeque::with_capacity(ACCOUNTS_CACHE_WINDOW),
-            window: VecDeque::with_capacity(ACCOUNTS_CACHE_WINDOW),
-            published: Debounced::new(TOPIC_SUMMARY, "accounts_cache"),
-        }
-    }
-
     fn tick(&mut self, previous: &TapCounters, current: &TapCounters, publisher: &Publisher) {
-        self.cache_window.push_back((
-            current
-                .accounts_cache_hits
-                .saturating_sub(previous.accounts_cache_hits),
-            current
-                .accounts_cache_misses
-                .saturating_sub(previous.accounts_cache_misses),
-            current
-                .accounts_cache_evicts
-                .saturating_sub(previous.accounts_cache_evicts),
-        ));
-        while self.cache_window.len() > ACCOUNTS_CACHE_WINDOW {
-            self.cache_window.pop_front();
-        }
-
         let totals = sum_window(
             &mut self.window,
-            current.accounts.since(&previous.accounts),
+            current.accounts.totals.since(&previous.accounts.totals),
             ACCOUNTS_CACHE_WINDOW,
         );
         // What the window actually spans, not what it will span once full. A
         // rate taken against the full minute would read low for the first one.
-        let window_seconds = self.cache_window.len() as f64 * METER_INTERVAL.as_secs_f64();
+        let window_seconds = self.window.len() as f64 * METER_INTERVAL.as_secs_f64();
 
-        let disk = (current.accounts_storage_bytes > 0).then(|| AccountsDisk {
-            used: current.accounts_storage_alive_bytes,
-            allocated: current.accounts_storage_bytes,
-            fragmented: current
-                .accounts_storage_bytes
-                .saturating_sub(current.accounts_storage_alive_bytes),
-            storages: current.accounts_storage_count,
+        let levels = current.accounts.levels;
+        let disk = (levels.storage_bytes > 0).then(|| AccountsDisk {
+            used: levels.storage_alive_bytes,
+            allocated: levels.storage_bytes,
+            fragmented: levels
+                .storage_bytes
+                .saturating_sub(levels.storage_alive_bytes),
+            storages: levels.storage_count,
         });
 
-        let rate =
-            cache_rate(&self.cache_window).map(|(read, hit_rate, evictions)| AccountsCache {
-                read,
-                hit_rate,
-                evictions,
-                cache_bytes: current.accounts_cache_bytes,
-                cache_entries: current.accounts_cache_entries,
-                from_write_cache: totals.loaded_from_write_cache,
-                from_read_cache: totals.loaded_from_read_cache,
-                from_storage: totals.loaded_from_storage,
-                stored_accounts: totals.stored_accounts,
-                stored_bytes: totals.stored_bytes,
-                window_seconds,
-                disk,
-            });
+        let rate = cache_rate(&totals).map(|(read, hit_rate)| AccountsCache {
+            read,
+            hit_rate,
+            evictions: totals.cache_evicts,
+            cache_bytes: levels.cache_bytes,
+            cache_entries: levels.cache_entries,
+            from_write_cache: totals.loaded_from_write_cache,
+            from_read_cache: totals.loaded_from_read_cache,
+            from_storage: totals.loaded_from_storage,
+            stored_accounts: totals.stored_accounts,
+            stored_bytes: totals.stored_bytes,
+            window_seconds,
+            disk,
+        });
         self.published.publish(publisher, rate);
+
+        let totals = sum_window(
+            &mut self.upkeep_window,
+            current
+                .accounts_upkeep
+                .totals
+                .since(&previous.accounts_upkeep.totals),
+            ACCOUNTS_CACHE_WINDOW,
+        );
+        let levels = current.accounts_upkeep.levels;
+        // The index reports first, ten seconds after the validator has started.
+        let upkeep = (levels.index_entries > 0).then_some(AccountsDb {
+            levels,
+            totals,
+            window_seconds,
+        });
+        self.upkeep.publish(publisher, upkeep);
     }
 }
 
-struct ProgramCacheMeter {
-    window: VecDeque<ProgramCacheTotals>,
-    levels: VecDeque<u64>,
-    published: Debounced<Option<ProgramCache>>,
+debounced_keys! {
+    struct ProgramCacheMeter {
+        published: Option<ProgramCache> = (TOPIC_SUMMARY, "program_cache"),
+        ;
+        window: VecDeque<ProgramCacheTotals> = VecDeque::with_capacity(PROGRAM_CACHE_WINDOW),
+        levels: VecDeque<u64> = VecDeque::with_capacity(PROGRAM_CACHE_WINDOW),
+    }
 }
 
 impl ProgramCacheMeter {
-    fn new() -> Self {
-        Self {
-            window: VecDeque::with_capacity(PROGRAM_CACHE_WINDOW),
-            levels: VecDeque::with_capacity(PROGRAM_CACHE_WINDOW),
-            published: Debounced::new(TOPIC_SUMMARY, "program_cache"),
-        }
-    }
-
     fn tick(&mut self, previous: &TapCounters, current: &TapCounters, publisher: &Publisher) {
-        let sample = current.program_cache.since(&previous.program_cache);
+        let sample = current
+            .program_cache
+            .totals
+            .since(&previous.program_cache.totals);
         let totals = sum_window(&mut self.window, sample, PROGRAM_CACHE_WINDOW);
 
-        // The level is not differenced — it is where the cache stood, not what
-        // happened — so it is kept as its own window and read as a peak.
-        self.levels.push_back(current.program_cache_water_level);
-        while self.levels.len() > PROGRAM_CACHE_WINDOW {
-            self.levels.pop_front();
-        }
+        // The level is not differenced: it is where the cache stood, not what
+        // happened, so it is kept as its own window and read as a peak.
+        let level = current.program_cache.water_level;
+        push_capped(&mut self.levels, level, PROGRAM_CACHE_WINDOW);
         let peak_entries = self.levels.iter().copied().max().filter(|peak| *peak > 0);
 
         let looked_up = totals.hits.saturating_add(totals.misses);
         let cache = (looked_up > 0).then(|| ProgramCache {
             looked_up,
-            hits: totals.hits,
-            misses: totals.misses,
+            totals,
             hit_rate: totals.hits as f64 / looked_up as f64,
-            evictions: totals.evictions,
-            reloads: totals.reloads,
-            insertions: totals.insertions,
-            lost_insertions: totals.lost_insertions,
-            replacements: totals.replacements,
-            one_hit_wonders: totals.one_hit_wonders,
-            prunes_orphan: totals.prunes_orphan,
-            prunes_environment: totals.prunes_environment,
             peak_entries,
             entry_limit: MAX_LOADED_ENTRY_COUNT as u64,
         });
@@ -2066,63 +1836,29 @@ impl ProgramCacheMeter {
     }
 }
 
-struct TpuMeter {
-    quic_window: VecDeque<QuicTotals>,
-    quic_forwards_window: VecDeque<QuicTotals>,
-    quic_vote_window: VecDeque<QuicTotals>,
-    quic_paths: Debounced<Option<QuicPaths>>,
-    /// The vote port is listed from its first connection until an epoch
-    /// passes without another: under alpenglow votes leave it for good.
-    vote_quiet: bool,
-    vote_offered_at_epoch: Option<(Epoch, u64)>,
-    xdp: Debounced<Option<XdpConfig>>,
-    epoch_now: Option<EpochPosition>,
-    leader_totals: LeaderTotals,
-    epoch_span: Debounced<Option<EpochSpan>>,
-    verify: Debounced<Option<VerifyTotals>>,
-    executed: Debounced<Option<ExecutedTotals>>,
-    bundles: Debounced<Option<BundleTotals>>,
-    slot_lists_seen: Option<u64>,
-    replay: Debounced<Option<ReplayWindow>>,
+debounced_keys! {
+    struct TpuMeter {
+        quic_paths: Option<QuicPaths> = (TOPIC_SUMMARY, "quic_paths"),
+        xdp: Option<XdpConfig> = (TOPIC_SUMMARY, "xdp"),
+        epoch_span: Option<EpochSpan> = (TOPIC_SUMMARY, "epoch_span"),
+        verify: Option<VerifyTotals> = (TOPIC_SUMMARY, "verify"),
+        executed: Option<ExecutedTotals> = (TOPIC_SUMMARY, "executed"),
+        bundles: Option<BundleTotals> = (TOPIC_SUMMARY, "bundles"),
+        replay: Option<ReplayWindow> = (TOPIC_SUMMARY, "replay"),
+        ;
+        quic_windows: [VecDeque<QuicTotals>; 3] =
+            std::array::from_fn(|_| VecDeque::with_capacity(WATERFALL_WINDOW)),
+        /// The vote port is listed from its first connection until an epoch
+        /// passes without another: under alpenglow votes leave it for good.
+        vote_quiet: bool = true,
+        vote_offered_at_epoch: Option<(Epoch, u64)> = None,
+        epoch_now: Option<WorkingReading> = None,
+        leader_totals: LeaderTotals = LeaderTotals::default(),
+        slot_lists_seen: Option<u64> = None,
+    }
 }
 
 impl TpuMeter {
-    fn new() -> Self {
-        Self {
-            quic_window: VecDeque::with_capacity(WATERFALL_WINDOW),
-            quic_forwards_window: VecDeque::with_capacity(WATERFALL_WINDOW),
-            quic_vote_window: VecDeque::with_capacity(WATERFALL_WINDOW),
-            quic_paths: Debounced::new(TOPIC_SUMMARY, "quic_paths"),
-            vote_quiet: true,
-            vote_offered_at_epoch: None,
-            xdp: Debounced::new(TOPIC_SUMMARY, "xdp"),
-            epoch_now: None,
-            leader_totals: LeaderTotals::default(),
-            epoch_span: Debounced::new(TOPIC_SUMMARY, "epoch_span"),
-            verify: Debounced::new(TOPIC_SUMMARY, "verify"),
-            executed: Debounced::new(TOPIC_SUMMARY, "executed"),
-            bundles: Debounced::new(TOPIC_SUMMARY, "bundles"),
-            slot_lists_seen: None,
-            replay: Debounced::new(TOPIC_SUMMARY, "replay"),
-        }
-    }
-
-    fn note_epoch(&mut self, working_bank: &Bank) {
-        let schedule = working_bank.epoch_schedule();
-        let slot = working_bank.slot();
-        let epoch = schedule.get_epoch(slot);
-        self.epoch_now = Some(EpochPosition {
-            epoch,
-            slot,
-            start_slot: schedule.get_first_slot_in_epoch(epoch),
-            slots_in_epoch: schedule.get_slots_in_epoch(epoch),
-        });
-    }
-
-    fn collect_xdp(&mut self, tap: &MetricsTap, publisher: &Publisher) {
-        self.xdp.publish(publisher, tap.xdp());
-    }
-
     fn tick(
         &mut self,
         tap: &MetricsTap,
@@ -2132,11 +1868,11 @@ impl TpuMeter {
         tpu_offhost: bool,
         publisher: &Publisher,
     ) {
-        if current.quic_vote.offered > previous.quic_vote.offered {
+        if current.quic_vote.totals.offered > previous.quic_vote.totals.offered {
             self.vote_quiet = false;
         }
         if let Some(at) = self.epoch_now {
-            let offered = current.quic_vote.offered;
+            let offered = current.quic_vote.totals.offered;
             match self.vote_offered_at_epoch {
                 Some((epoch, before)) if epoch != at.epoch => {
                     self.vote_quiet = offered == before;
@@ -2150,38 +1886,21 @@ impl TpuMeter {
 
         // Present once any port has taken a connection, not within the window: behind a proxy the
         // only inbound QUIC is votes in leader slots.
-        let ports: Vec<QuicPort> = [
-            (
-                "tpu",
-                &mut self.quic_window,
-                current.quic.since(&previous.quic),
-                current.quic_levels,
-            ),
-            (
-                "tpu forwards",
-                &mut self.quic_forwards_window,
-                current.quic_forwards.since(&previous.quic_forwards),
-                current.quic_forwards_levels,
-            ),
-            (
-                "tpu vote quic",
-                &mut self.quic_vote_window,
-                current.quic_vote.since(&previous.quic_vote),
-                current.quic_vote_levels,
-            ),
-        ]
-        .into_iter()
-        .map(|(name, window, sample, levels)| QuicPort {
-            name,
-            counts: sum_window(window, sample, WATERFALL_WINDOW),
-            levels,
-            kernel_drops: kernel_drops.get(name).copied(),
-        })
-        .filter(|port| port.name != "tpu vote quic" || !vote_quiet)
-        .collect();
-        let ever_offered = current.quic.offered > 0
-            || current.quic_forwards.offered > 0
-            || current.quic_vote.offered > 0;
+        let quic = [current.quic, current.quic_forwards, current.quic_vote];
+        let quic_before = [previous.quic, previous.quic_forwards, previous.quic_vote];
+        let ports: Vec<QuicPort> = ["tpu", "tpu forwards", "tpu vote quic"]
+            .into_iter()
+            .zip(&mut self.quic_windows)
+            .zip(quic.iter().zip(&quic_before))
+            .map(|((name, window), (now, before))| QuicPort {
+                name,
+                counts: sum_window(window, now.totals.since(&before.totals), WATERFALL_WINDOW),
+                levels: now.levels,
+                kernel_drops: kernel_drops.get(name).copied(),
+            })
+            .filter(|port| port.name != "tpu vote quic" || !vote_quiet)
+            .collect();
+        let ever_offered = quic.iter().any(|port| port.totals.offered > 0);
         self.quic_paths.publish(
             publisher,
             ever_offered.then_some(QuicPaths { ports, tpu_offhost }),
@@ -2251,11 +1970,26 @@ impl TpuMeter {
     }
 }
 
-fn sum_window<T: WindowedCounters>(window: &mut VecDeque<T>, sample: T, span: usize) -> T {
-    window.push_back(sample);
-    while window.len() > span {
-        window.pop_front();
+/// What `read` gives, until it fails: the failure is logged once as `failed`, and from then on
+/// nothing is read.
+fn unless_failed<T>(
+    unavailable: &mut bool,
+    failed: &str,
+    read: impl FnOnce() -> std::io::Result<T>,
+) -> Option<T> {
+    if *unavailable {
+        return None;
     }
+    read()
+        .inspect_err(|err| {
+            *unavailable = true;
+            log::info!("dashboard: {failed}: {err}");
+        })
+        .ok()
+}
+
+fn sum_window<T: WindowedCounters>(window: &mut VecDeque<T>, sample: T, span: usize) -> T {
+    push_capped(window, sample, span);
     window
         .iter()
         .fold(T::default(), |total, sample| total.plus(sample))
@@ -2276,10 +2010,7 @@ fn push_history<T: Serialize>(
     key: &'static str,
 ) {
     history.push(sample);
-    if history.len() > keep {
-        let excess = history.len().saturating_sub(keep);
-        history.drain(..excess);
-    }
+    history.drain(..history.len().saturating_sub(keep));
     publisher.retain_only(TOPIC_SUMMARY, key, history);
 }
 
@@ -2287,28 +2018,123 @@ fn push_history<T: Serialize>(
 mod tests {
     use {
         super::*,
-        crate::fixture::fixture,
+        crate::{collect::FAILED_UNREAD, net_ifaces::InterfaceKind, remote::Remote},
+        agave_snapshots::snapshot_config::SnapshotConfig,
         solana_metrics::datapoint::DataPoint,
-        solana_pubkey::Pubkey,
-        solana_rpc::optimistically_confirmed_bank_tracker::BankNotification,
-        std::{net::Ipv4Addr, thread::sleep},
+        std::{net::Ipv4Addr, sync::RwLock, thread::sleep, time::UNIX_EPOCH},
     };
 
+    /// Every port a validator advertises.
+    fn advertised() -> IngestAddresses {
+        let at = |port| Some(SocketAddr::from((Ipv4Addr::LOCALHOST, port)));
+        IngestAddresses {
+            tvu_udp: at(8001),
+            tpu_quic: at(8002),
+            tpu_forwards_quic: at(8003),
+            tpu_vote_udp: at(8004),
+            gossip: at(8007),
+            serve_repair_udp: at(8008),
+        }
+    }
+
+    /// The validator as the meters read it; a test moves its working bank.
+    struct Fixture {
+        remote: Shared,
+        publisher: Arc<Publisher>,
+        failed_total: Arc<AtomicU64>,
+    }
+
+    fn fixture() -> Fixture {
+        let remote = Remote {
+            working: Some(at(0, 0)),
+            ingest: Some(advertised()),
+            progress: Some(ValidatorStartProgress::Running),
+            started: Some(UNIX_EPOCH),
+            ..Remote::default()
+        };
+        Fixture {
+            remote: Arc::new(RwLock::new(remote)),
+            publisher: Arc::new(Publisher::new()),
+            failed_total: Arc::new(AtomicU64::new(FAILED_UNREAD)),
+        }
+    }
+
+    impl Fixture {
+        /// With a tap of its own rather than the process-wide one, which carries whatever the
+        /// rest of the suite measured.
+        fn meters(&self) -> Meters {
+            let host_paths = HostPaths {
+                ledger: PathBuf::from("/nonexistent"),
+                accounts: Vec::new(),
+                snapshot_config: SnapshotConfig::default(),
+            };
+            Meters::new(
+                self.remote.clone(),
+                host_paths,
+                std::process::id(),
+                self.publisher.clone(),
+                Arc::new(MetricsTap::default()),
+                self.failed_total.clone(),
+            )
+        }
+
+        fn published_key(&self, topic: &str, key: &str) -> Option<String> {
+            let needle = format!(r#""topic":"{topic}","key":"{key}""#);
+            self.publisher
+                .snapshot()
+                .iter()
+                .map(|message| message.to_string())
+                .find(|message| message.contains(&needle))
+        }
+
+        /// The value retained under `summary.{key}`.
+        fn published_value(&self, key: &str) -> Option<serde_json::Value> {
+            let message = self.published_key("summary", key)?;
+            let mut message: serde_json::Value = serde_json::from_str(&message).unwrap();
+            Some(message["value"].take())
+        }
+
+        /// The working bank moves to `slot`, having processed nothing on the way.
+        fn advance_to(&self, slot: Slot) -> WorkingReading {
+            let mut remote = self.remote.write().unwrap();
+            let working = remote.working.as_mut().unwrap();
+            working.slot = slot;
+            *working
+        }
+    }
+
     /// The newest sample of the retained chart series.
-    fn last_tps(harness: &crate::fixture::Fixture) -> Option<serde_json::Value> {
-        let message = harness.published_key("summary", "tps_history")?;
-        let history: serde_json::Value = serde_json::from_str(&message).unwrap();
-        history["value"].as_array()?.last().cloned()
+    fn last_tps(harness: &Fixture) -> Option<serde_json::Value> {
+        harness
+            .published_value("tps_history")?
+            .as_array()?
+            .last()
+            .cloned()
+    }
+
+    /// The newest throughput sample after a tick, then another `apart` later with the working bank
+    /// at `slot` and the failed count moved from `failed.0` to `failed.1`.
+    fn rate_after(failed: (u64, u64), slot: Slot, apart: Duration) -> Option<serde_json::Value> {
+        let harness = fixture();
+        let mut meters = harness.meters();
+        harness.failed_total.store(failed.0, Ordering::Relaxed);
+        meters.tick();
+        assert_eq!(
+            last_tps(&harness),
+            None,
+            "a rate was reported from one reading"
+        );
+        sleep(apart);
+        harness.advance_to(slot);
+        harness.failed_total.store(failed.1, Ordering::Relaxed);
+        meters.tick();
+        last_tps(&harness)
     }
 
     fn quic_tap(offered: u64) -> TapCounters {
-        TapCounters {
-            quic: QuicTotals {
-                offered,
-                ..QuicTotals::default()
-            },
-            ..TapCounters::default()
-        }
+        let mut counters = TapCounters::default();
+        counters.quic.totals.offered = offered;
+        counters
     }
 
     const LEDGER_DISK: u64 = 1;
@@ -2332,12 +2158,13 @@ mod tests {
         }
     }
 
-    fn disk_keys(parts: &[DiskPart]) -> Vec<DiskPartKey> {
-        parts.iter().map(|part| part.key).collect()
+    fn split(parts: &[DiskPart]) -> Vec<(DiskPartKey, u64)> {
+        parts.iter().map(|part| (part.key, part.bytes)).collect()
     }
 
     #[test]
     fn test_disk_parts_land_on_the_filesystem_each_lives_on() {
+        use DiskPartKey::*;
         let layout = DiskLayout {
             ledger: Some(LEDGER_DISK),
             accounts: Some(ACCOUNTS_DISK),
@@ -2347,30 +2174,12 @@ mod tests {
         };
         let readings = disk_readings();
         assert_eq!(
-            disk_keys(&disk_parts(LEDGER_DISK, &layout, &readings)),
-            [
-                DiskPartKey::Shreds,
-                DiskPartKey::History,
-                DiskPartKey::Metadata,
-                DiskPartKey::Full,
-            ]
+            split(&disk_parts(LEDGER_DISK, &layout, &readings)),
+            [(Shreds, 10), (History, 20), (Metadata, 30), (Full, 60)]
         );
         assert_eq!(
-            disk_parts(ACCOUNTS_DISK, &layout, &readings),
-            [
-                DiskPart {
-                    key: DiskPartKey::Live,
-                    bytes: 40,
-                },
-                DiskPart {
-                    key: DiskPartKey::Fragmented,
-                    bytes: 50,
-                },
-                DiskPart {
-                    key: DiskPartKey::Incremental,
-                    bytes: 70,
-                },
-            ]
+            split(&disk_parts(ACCOUNTS_DISK, &layout, &readings)),
+            [(Live, 40), (Fragmented, 50), (Incremental, 70)]
         );
     }
 
@@ -2382,7 +2191,7 @@ mod tests {
             ..DiskLayout::default()
         };
         assert_eq!(
-            disk_keys(&disk_parts(ACCOUNTS_DISK, &layout, &disk_readings())),
+            split(&disk_parts(ACCOUNTS_DISK, &layout, &disk_readings())),
             []
         );
     }
@@ -2400,6 +2209,43 @@ mod tests {
             disk_parts(LEDGER_DISK, &layout, &DiskReadings::default()),
             []
         );
+    }
+
+    #[test]
+    fn test_the_ledger_row_is_the_blockstores_filesystem() {
+        let ledger = tempfile::TempDir::new().unwrap();
+        let host = HostPaths {
+            ledger: ledger.path().to_path_buf(),
+            accounts: Vec::new(),
+            snapshot_config: SnapshotConfig::default(),
+        };
+        let row = |host: &HostPaths| {
+            let (paths, layout, _) = resolve_disks(host);
+            assert_eq!(
+                layout.ledger,
+                Some(paths[0].filesystem),
+                "its split is drawn on it"
+            );
+            (
+                paths[0].name.clone(),
+                paths[0].path.clone(),
+                paths[0].filesystem,
+            )
+        };
+        // On the ledger's own filesystem it is named as the ledger, made yet or not.
+        let id = host_stats::filesystem_id(&host.ledger).unwrap();
+        let named = ("ledger".to_owned(), host.ledger.clone(), id);
+        assert_eq!(row(&host), named);
+        let rocksdb = host.ledger.join(BLOCKSTORE_DIRECTORY_ROCKS_LEVEL);
+        std::fs::create_dir(&rocksdb).unwrap();
+        assert_eq!(row(&host), named);
+        // `/dev` stands in for a mount of its own.
+        std::fs::remove_dir(&rocksdb).unwrap();
+        std::os::unix::fs::symlink("/dev", &rocksdb).unwrap();
+        let mount = host_stats::filesystem_id(&rocksdb).unwrap();
+        if mount != id {
+            assert_eq!(row(&host), ("ledger".to_owned(), rocksdb, mount));
+        }
     }
 
     #[test]
@@ -2459,19 +2305,33 @@ mod tests {
         }
     }
 
+    fn counters(received: u64, sent: u64) -> NetCounters {
+        NetCounters { received, sent }
+    }
+
+    fn per_second(received_per_second: u64, sent_per_second: u64) -> Network {
+        Network {
+            received_per_second,
+            sent_per_second,
+        }
+    }
+
     #[test]
     fn test_rates_per_interface_and_none_for_a_counter_that_went_backwards() {
         let before = HashMap::from([
-            ("eno1".to_string(), (1_000, 2_000)),
-            ("eno2".to_string(), (9_000, 9_000)),
+            ("eno1".to_string(), counters(1_000, 2_000)),
+            ("eno2".to_string(), counters(9_000, 9_000)),
         ]);
         let after = HashMap::from([
-            ("eno1".to_string(), (6_000, 12_000)),
-            ("eno2".to_string(), (500, 9_000)),
-            ("doublezero0".to_string(), (1, 1)),
+            ("eno1".to_string(), counters(6_000, 12_000)),
+            ("eno2".to_string(), counters(500, 9_000)),
+            ("doublezero0".to_string(), counters(1, 1)),
         ]);
         let rates = interface_rates(&before, &after, Duration::from_secs(5));
-        assert_eq!(rates, HashMap::from([("eno1".to_string(), (1_000, 2_000))]));
+        assert_eq!(
+            rates,
+            HashMap::from([("eno1".to_string(), per_second(1_000, 2_000))])
+        );
         assert!(interface_rates(&before, &after, Duration::ZERO).is_empty());
     }
 
@@ -2479,11 +2339,11 @@ mod tests {
     fn test_the_interfaces_get_their_rates_from_the_readings_the_host_total_used() {
         // One card carries everything, so its rate and the host's must match at every reading.
         let at = |received: u64, sent: u64, tunnel: u64, counted| NetReading {
-            total: NetCounters { received, sent },
+            total: counters(received, sent),
             counted,
             interfaces: HashMap::from([
-                ("eno1".to_string(), (received, sent)),
-                ("doublezero0".to_string(), (tunnel, tunnel)),
+                ("eno1".to_string(), counters(received, sent)),
+                ("doublezero0".to_string(), counters(tunnel, tunnel)),
             ]),
         };
         let mut meter = NetworkMeter::default();
@@ -2501,11 +2361,8 @@ mod tests {
         let host = meter
             .note(at(22_500, 55_640, 1_007, Counted::Cards), second)
             .unwrap();
-        assert_eq!(
-            meter.interface_rates["eno1"],
-            (host.received_per_second, host.sent_per_second)
-        );
-        assert_eq!(meter.interface_rates["doublezero0"], (997, 997));
+        assert_eq!(meter.interface_rates["eno1"], host);
+        assert_eq!(meter.interface_rates["doublezero0"], per_second(997, 997));
 
         // A reading that summed other interfaces has no host total, but each interface still moves.
         let third = second + Duration::from_secs(1);
@@ -2513,7 +2370,10 @@ mod tests {
             meter.note(at(30_000, 60_000, 2_007, Counted::Every), third),
             None
         );
-        assert_eq!(meter.interface_rates["doublezero0"], (1_000, 1_000));
+        assert_eq!(
+            meter.interface_rates["doublezero0"],
+            per_second(1_000, 1_000)
+        );
 
         meter.give_up();
         assert!(
@@ -2522,7 +2382,6 @@ mod tests {
         );
     }
 
-    #[cfg(target_os = "linux")]
     #[test]
     fn test_the_interfaces_are_sent_every_tick_with_the_rates_handed_to_them() {
         let Some(name) = net_ifaces::read()
@@ -2532,16 +2391,10 @@ mod tests {
         else {
             return;
         };
-        let publisher = Publisher::new();
-        let sent_for = |publisher: &Publisher| {
-            let message = publisher
-                .snapshot()
-                .iter()
-                .map(|message| message.to_string())
-                .find(|message| message.contains(r#""key":"net_interfaces""#))
-                .unwrap();
-            let value: serde_json::Value = serde_json::from_str(&message).unwrap();
-            value["value"]
+        let harness = fixture();
+        let sent_for = || {
+            let interfaces = harness.published_value("net_interfaces").unwrap();
+            interfaces
                 .as_array()
                 .unwrap()
                 .iter()
@@ -2549,55 +2402,41 @@ mod tests {
                 .map(|interface| interface["received_per_second"].clone())
         };
         let mut meter = InterfaceMeter::default();
-        meter.tick(&publisher, &HashMap::from([(name.clone(), (10, 20))]));
-        assert_eq!(sent_for(&publisher), Some(serde_json::json!(10)));
+        meter.tick(
+            &harness.publisher,
+            &HashMap::from([(name.clone(), per_second(10, 20))]),
+        );
+        assert_eq!(sent_for(), Some(serde_json::json!(10)));
         // Well inside the five seconds between readings of the interfaces themselves.
-        meter.tick(&publisher, &HashMap::from([(name.clone(), (30, 40))]));
-        assert_eq!(sent_for(&publisher), Some(serde_json::json!(30)));
+        meter.tick(
+            &harness.publisher,
+            &HashMap::from([(name.clone(), per_second(30, 40))]),
+        );
+        assert_eq!(sent_for(), Some(serde_json::json!(30)));
     }
 
     #[test]
     fn test_only_an_interface_down_with_no_routes_and_no_traffic_is_left_out() {
         let idle = reading("docker0", false, 0);
-        assert_eq!(interface_shown(&idle, 0, Some((0, 0))), None);
+        let quiet = Some(per_second(0, 0));
+        assert_eq!(interface_shown(&idle, 0, quiet), None);
         assert_eq!(interface_shown(&idle, 0, None), None);
-        assert!(interface_shown(&reading("docker0", false, 1), 1, Some((0, 0))).is_some());
-        assert!(interface_shown(&idle, 0, Some((10, 0))).is_some());
+        assert!(interface_shown(&reading("docker0", false, 1), 1, quiet).is_some());
+        assert!(interface_shown(&idle, 0, Some(per_second(10, 0))).is_some());
         let shown = interface_shown(&reading("doublezero0", true, 2), 115, None).unwrap();
-        assert_eq!((shown.routes, shown.routes_peak), (2, 115));
+        assert_eq!((shown.reading.routes, shown.routes_peak), (2, 115));
         assert_eq!(shown.received_per_second, None);
-    }
-
-    #[test]
-    fn test_a_port_and_a_tunnel_keep_where_they_sit() {
-        let port = InterfaceReading {
-            member_of: Some("bond0".to_string()),
-            ..reading("eno1", true, 0)
-        };
         let tunnel = InterfaceReading {
             kind: InterfaceKind::Tunnel,
+            member_of: Some("bond0".to_string()),
             inside: Some("bond0".to_string()),
             ..reading("doublezero0", true, 115)
         };
-        assert_eq!(
-            interface_shown(&port, 0, None)
-                .unwrap()
-                .member_of
-                .as_deref(),
-            Some("bond0")
-        );
-        assert_eq!(
-            interface_shown(&tunnel, 115, None)
-                .unwrap()
-                .inside
-                .as_deref(),
-            Some("bond0")
-        );
+        assert_eq!(interface_shown(&tunnel, 115, None).unwrap().reading, tunnel);
     }
 
     #[test]
     fn test_host_rates_skip_a_reading_that_summed_other_interfaces() {
-        let counters = |received, sent| NetCounters { received, sent };
         let second = Duration::from_secs(1);
         let cards = (counters(1_000, 2_000), Counted::Cards);
         assert_eq!(
@@ -2621,8 +2460,21 @@ mod tests {
         assert_eq!(network_rates(cards, cards, Duration::ZERO), None);
     }
 
-    fn window(samples: &[(u64, u64, u64)]) -> VecDeque<(u64, u64, u64)> {
-        samples.iter().copied().collect()
+    /// Each second's cache hits, misses and evictions, summed over the window.
+    fn window(samples: &[(u64, u64, u64)]) -> AccountsTotals {
+        let mut window = VecDeque::new();
+        samples.iter().fold(
+            AccountsTotals::default(),
+            |_, &(cache_hits, cache_misses, cache_evicts)| {
+                let sample = AccountsTotals {
+                    cache_hits,
+                    cache_misses,
+                    cache_evicts,
+                    ..AccountsTotals::default()
+                };
+                sum_window(&mut window, sample, ACCOUNTS_CACHE_WINDOW)
+            },
+        )
     }
 
     fn replayed(set: impl Fn(&mut ReplaySlotTimes)) -> ReplaySlotTimes {
@@ -2689,15 +2541,16 @@ mod tests {
     fn test_the_rate_is_taken_over_the_whole_window() {
         // Taken one at a time the rate is 100%, 50%, 0; over the window it is the six
         // in nine it was.
-        let (asked, rate, _) = cache_rate(&window(&[(4, 0, 0), (1, 1, 0), (1, 2, 0)])).unwrap();
+        let (asked, rate) = cache_rate(&window(&[(4, 0, 0), (1, 1, 0), (1, 2, 0)])).unwrap();
         assert_eq!(asked, 9);
         assert!((rate - 6.0 / 9.0).abs() < f64::EPSILON, "{rate}");
     }
 
     #[test]
     fn test_evictions_are_summed_alongside() {
-        let (_, _, evictions) = cache_rate(&window(&[(10, 1, 2), (10, 1, 3)])).unwrap();
-        assert_eq!(evictions, 5);
+        let totals = window(&[(10, 1, 2), (10, 1, 3)]);
+        assert!(cache_rate(&totals).is_some());
+        assert_eq!(totals.cache_evicts, 5);
     }
 
     #[test]
@@ -2708,109 +2561,39 @@ mod tests {
     }
 
     #[test]
-    fn test_received_figure_only_on_datagram_ports() {
-        // Only this join knows `shred_fetch_receiver` is the socket gossip advertises as `tvu`.
-        let harness = fixture();
-        let counted = ingest_ports(
-            &harness.ctx.cluster_info.my_contact_info(),
-            &TapCounters {
+    fn test_each_advertised_port_is_listed_with_what_its_receiver_counts() {
+        let tap = TapCounters {
+            network: NetworkTotals {
                 shreds_turbine: 900,
                 packets_gossip: 40,
                 packets_tpu_vote: 70,
-                ..TapCounters::default()
+                ..NetworkTotals::default()
             },
-            false,
-        );
-        let by_name: HashMap<&str, Option<u64>> = counted
-            .iter()
-            .map(|port| (port.name, port.received))
-            .collect();
-
-        assert_eq!(by_name["turbine"], Some(900));
-        assert_eq!(by_name["gossip"], Some(40));
-        assert_eq!(by_name["tpu vote"], Some(70));
-
-        // Nothing rather than nought: no packets received alongside any drops works
-        // out to every packet lost.
-        assert_eq!(
-            by_name["tpu"], None,
-            "QUIC counts transactions, not packets"
-        );
-        assert_eq!(by_name["tpu forwards"], None);
-        assert_eq!(
-            by_name["serve repair"], None,
-            "its receiver keeps counters that nothing reports"
-        );
-    }
-
-    #[test]
-    fn test_the_quic_ports_are_flagged_and_the_udp_vote_port_is_not() {
-        let harness = fixture();
-        let ports = ingest_ports(
-            &harness.ctx.cluster_info.my_contact_info(),
-            &TapCounters::default(),
-            false,
-        );
-        let quic: HashMap<&str, bool> = ports.iter().map(|port| (port.name, port.quic)).collect();
-
-        assert_eq!(quic.get("tpu"), Some(&true));
-        assert_eq!(quic.get("tpu forwards"), Some(&true));
-        assert_eq!(quic.get("tpu vote"), Some(&false));
-        assert_eq!(quic.get("turbine"), Some(&false));
-        assert_eq!(quic.get("gossip"), Some(&false));
-        assert_eq!(quic.get("serve repair"), Some(&false));
-        assert_ne!(quic.get("tpu vote quic"), Some(&false));
-    }
-
-    #[test]
-    fn test_under_alpenglow_votor_takes_the_place_of_the_vote_ports() {
-        let mut info = ContactInfo::new_localhost(&Pubkey::new_unique(), 0);
-        info.set_alpenglow((Ipv4Addr::LOCALHOST, 8011)).unwrap();
-        let tap = TapCounters {
-            packets_tpu_vote: 70,
-            votes_votor: 400,
             ..TapCounters::default()
         };
-        let names = |ports: &[IngestPort]| ports.iter().map(|port| port.name).collect::<Vec<_>>();
-
-        let tower = ingest_ports(&info, &tap, false);
-        assert_eq!(
-            names(&tower),
-            [
-                "turbine",
-                "tpu",
-                "tpu forwards",
-                "tpu vote",
-                "tpu vote quic",
-                "gossip",
-                "serve repair"
-            ]
-        );
-        assert!(tower.iter().all(|port| port.received_in_packets));
-
-        let alpenglow = ingest_ports(&info, &tap, true);
-        assert_eq!(
-            names(&alpenglow),
-            [
-                "turbine",
-                "tpu",
-                "tpu forwards",
-                "votor",
-                "gossip",
-                "serve repair"
-            ]
-        );
-        let votor = &alpenglow[3];
-        assert_eq!(votor.port, 8011);
-        assert_eq!(votor.received, Some(400));
-        assert!(
-            !votor.received_in_packets,
-            "votor counts votes, not packets"
-        );
-        assert!(
-            !votor.quic,
-            "kept on this card rather than the TPU path card"
-        );
+        let listed = |alpenglow| {
+            ingest_ports_at(&advertised(), &tap, alpenglow)
+                .iter()
+                .map(|port| (port.name, port.received, port.quic))
+                .collect::<Vec<_>>()
+        };
+        // Only this join knows `shred_fetch_receiver` is the socket gossip advertises as `tvu`.
+        // Elsewhere nothing rather than nought: no packets received alongside any drops works out
+        // to every packet lost.
+        let mut rows = vec![
+            ("turbine", Some(900), false),
+            // QUIC counts transactions, not packets.
+            ("tpu", None, true),
+            ("tpu forwards", None, true),
+            ("tpu vote", Some(70), false),
+            ("gossip", Some(40), false),
+            // Its receiver keeps counters that nothing reports.
+            ("serve repair", None, false),
+        ];
+        assert_eq!(listed(false), rows);
+        // Under alpenglow the vote port is left out.
+        rows.remove(3);
+        assert_eq!(listed(true), rows);
     }
 
     #[test]
@@ -2822,11 +2605,14 @@ mod tests {
 
     fn turbine_tap(layers: [u64; 4], dropped: u64, xdp: Option<bool>) -> TapCounters {
         TapCounters {
-            turbine_root: layers[0],
-            turbine_layer_1: layers[1],
-            turbine_layer_2: layers[2],
-            turbine_layer_3: layers[3],
-            xdp_dropped: dropped,
+            network: NetworkTotals {
+                turbine_root: layers[0],
+                turbine_layer_1: layers[1],
+                turbine_layer_2: layers[2],
+                turbine_layer_3: layers[3],
+                xdp_dropped: dropped,
+                ..NetworkTotals::default()
+            },
             retransmit_xdp: xdp,
             ..TapCounters::default()
         }
@@ -2835,7 +2621,7 @@ mod tests {
     #[test]
     fn test_the_turbine_layers_and_drops_are_differenced_over_the_window() {
         let publisher = Publisher::new();
-        let mut meter = TurbineMeter::new();
+        let mut meter = TrafficMeter::default();
         meter.tick(
             &turbine_tap([10, 100, 200, 0], 5, Some(true)),
             &turbine_tap([12, 140, 260, 1], 5, Some(true)),
@@ -2855,21 +2641,46 @@ mod tests {
     }
 
     #[test]
+    fn test_the_accounts_db_carries_levels_as_read_and_counts_over_the_window() {
+        let upkeep = |shrunk_bytes, index_entries| {
+            let mut counters = TapCounters::default();
+            counters.accounts_upkeep.totals.shrunk_bytes = shrunk_bytes;
+            counters.accounts_upkeep.levels.index_entries = index_entries;
+            counters
+        };
+        let publisher = Publisher::new();
+        let mut meter = AccountsMeter::default();
+        meter.tick(&upkeep(0, 0), &upkeep(500, 0), &publisher);
+        let sent = publisher.snapshot().pop().unwrap();
+        assert!(
+            sent.contains(r#""key":"accounts_db","value":null"#),
+            "{sent}"
+        );
+
+        meter.tick(&upkeep(500, 0), &upkeep(800, 900), &publisher);
+        let sent = publisher.snapshot().pop().unwrap();
+        assert!(sent.contains(r#""index_entries":900"#), "{sent}");
+        assert!(sent.contains(r#""shrunk_bytes":800"#), "{sent}");
+        assert!(sent.contains(r#""window_seconds":2.0"#), "{sent}");
+    }
+
+    #[test]
     fn test_no_turbine_figure_before_a_point_has_reported() {
         let publisher = Publisher::new();
-        let mut meter = TurbineMeter::new();
+        let mut meter = TrafficMeter::default();
         meter.tick(&TapCounters::default(), &TapCounters::default(), &publisher);
         let sent = publisher.snapshot().pop().unwrap();
         assert!(sent.contains(r#""value":null"#), "{sent}");
     }
 
-    fn at(epoch: Epoch, slots_in: u64) -> EpochPosition {
-        let start_slot = epoch.saturating_mul(432_000);
-        EpochPosition {
+    fn at(epoch: Epoch, slots_in: u64) -> WorkingReading {
+        let epoch_start_slot = epoch.saturating_mul(432_000);
+        WorkingReading {
             epoch,
-            slot: start_slot.saturating_add(slots_in),
-            start_slot,
+            slot: epoch_start_slot.saturating_add(slots_in),
+            epoch_start_slot,
             slots_in_epoch: 432_000,
+            ..WorkingReading::default()
         }
     }
 
@@ -3001,22 +2812,20 @@ mod tests {
     fn test_epoch_position_comes_from_the_working_bank() {
         let harness = fixture();
         let mut meters = harness.meters();
-        let bank = harness.advance_to(64);
-        meters.tpu.note_epoch(&bank);
+        let working = harness.advance_to(64);
+        meters.tick();
 
         let position = meters.tpu.epoch_now.unwrap();
         assert_eq!(position.slot, 64);
-        assert_eq!(position.epoch, bank.epoch_schedule().get_epoch(64));
-        assert!(position.start_slot <= 64);
+        assert_eq!(position.epoch, working.epoch);
+        assert!(position.epoch_start_slot <= 64);
     }
 
     #[test]
     fn test_no_xdp_is_published_where_the_validator_reported_none() {
         let harness = fixture();
         let mut meters = harness.meters();
-        meters
-            .tpu
-            .collect_xdp(&meters.metrics_tap, &meters.publisher);
+        meters.tick();
 
         let published = harness.published_key("summary", "xdp").unwrap();
         assert!(published.contains(r#""value":null"#), "{published}");
@@ -3031,9 +2840,7 @@ mod tests {
         point.add_tag("zero_copy", "true");
         point.add_field_str("model", "Ethernet Controller E810-C for QSFP");
         meters.metrics_tap.observe_point(&point);
-        meters
-            .tpu
-            .collect_xdp(&meters.metrics_tap, &meters.publisher);
+        meters.tick();
 
         let published = harness.published_key("summary", "xdp").unwrap();
         assert!(published.contains(r#""zero_copy":true"#), "{published}");
@@ -3060,12 +2867,10 @@ mod tests {
     fn test_the_vote_port_is_listed_from_its_first_connection_to_a_quiet_epoch() {
         let harness = fixture();
         let mut meters = harness.meters();
-        let vote = |offered| TapCounters {
-            quic_vote: QuicTotals {
-                offered,
-                ..QuicTotals::default()
-            },
-            ..quic_tap(1)
+        let vote = |offered| {
+            let mut counters = quic_tap(1);
+            counters.quic_vote.totals.offered = offered;
+            counters
         };
         let listed = || {
             harness
@@ -3103,45 +2908,28 @@ mod tests {
 
     #[test]
     fn test_an_advertised_tpu_bound_elsewhere_is_said_to_be() {
-        // Behind a relayer the socket join finds no TPU port here.
-        let harness = fixture();
-        let mut meters = harness.meters();
-        meters.sockets.sampled = true;
-        let used = quic_tap(1);
-        meters.collect_waterfall(&used, &used);
-        let published = harness.published_key("summary", "quic_paths").unwrap();
-        assert!(published.contains(r#""tpu_offhost":true"#), "{published}");
-
-        meters.sockets.kernel_drops.insert("tpu", 0);
-        meters.collect_waterfall(&used, &used);
-        let published = harness.published_key("summary", "quic_paths").unwrap();
-        assert!(published.contains(r#""tpu_offhost":false"#), "{published}");
-    }
-
-    #[test]
-    fn test_unreadable_sockets_do_not_say_tpu_moved() {
-        // Once the socket table is unreadable every port looks absent, and the honest
-        // answer is that we cannot tell.
-        let harness = fixture();
-        let mut meters = harness.meters();
-        meters.sockets.unavailable = true;
-        let used = quic_tap(1);
-        meters.collect_waterfall(&used, &used);
-
-        let published = harness.published_key("summary", "quic_paths").unwrap();
-        assert!(published.contains(r#""tpu_offhost":false"#), "{published}");
-    }
-
-    #[test]
-    fn test_an_unread_socket_table_does_not_say_tpu_moved() {
-        // The socket meter waits for a viewer, so an empty table may never have been read.
-        let harness = fixture();
-        let mut meters = harness.meters();
-        let used = quic_tap(1);
-        meters.collect_waterfall(&used, &used);
-
-        let published = harness.published_key("summary", "quic_paths").unwrap();
-        assert!(published.contains(r#""tpu_offhost":false"#), "{published}");
+        for (sampled, unavailable, tpu_here, offhost) in [
+            // Behind a relayer the socket join finds no TPU port here.
+            (true, false, false, true),
+            (true, false, true, false),
+            // Once the socket table is unreadable every port looks absent, and the honest
+            // answer is that we cannot tell.
+            (false, true, false, false),
+            // The socket meter waits for a viewer, so an empty table may never have been read.
+            (false, false, false, false),
+        ] {
+            let harness = fixture();
+            let mut meters = harness.meters();
+            meters.sockets.sampled = sampled;
+            meters.sockets.unavailable = unavailable;
+            if tpu_here {
+                meters.sockets.kernel_drops.insert("tpu", 0);
+            }
+            let used = quic_tap(1);
+            meters.collect_waterfall(&used, &used);
+            let paths = harness.published_value("quic_paths").unwrap();
+            assert_eq!(paths["tpu_offhost"], offhost, "{paths}");
+        }
     }
 
     #[test]
@@ -3159,218 +2947,51 @@ mod tests {
     }
 
     #[test]
-    fn test_a_busy_bank_forks_costs_neither_a_sample_nor_the_heartbeat() {
-        // Waiting on replay's lock would stop the clock, which looks like a dead feed.
-        let harness = fixture();
-        let mut meters = harness.meters();
-        harness.failed_total.store(0, Ordering::Relaxed);
-        meters.tick();
-        sleep(Duration::from_millis(250));
-        harness.advance_to(1);
-        let held = harness.bank_forks.write().unwrap();
-
-        meters.tick();
-        drop(held);
-
-        assert!(
-            harness
-                .published_key("summary", "server_time_nanos")
-                .is_some(),
-            "the heartbeat stopped while replay held the lock"
-        );
-        assert!(
-            last_tps(&harness).is_some(),
-            "the sample was skipped while replay held the lock"
-        );
-    }
-
-    #[test]
     fn test_a_second_with_no_new_bank_reports_a_rate_of_nought() {
-        let harness = fixture();
-        let mut meters = harness.meters();
-        harness.failed_total.store(0, Ordering::Relaxed);
-        meters.tick();
-        sleep(Duration::from_millis(20));
-        meters.tick();
-        let rate = last_tps(&harness).unwrap();
-        assert_eq!(rate["total"].as_f64(), Some(0.0), "{rate}");
+        assert_eq!(
+            rate_after((0, 0), 0, Duration::from_millis(20)).unwrap()["total"],
+            0.0
+        );
     }
 
     #[test]
     fn test_throughput_needs_two_samples() {
-        let harness = fixture();
-        let mut meters = harness.meters();
-        harness.failed_total.store(0, Ordering::Relaxed);
-
-        meters.tick();
         assert!(
-            last_tps(&harness).is_none(),
-            "a rate was reported from one reading"
-        );
-
-        sleep(Duration::from_millis(250));
-        harness.advance_to(1);
-        meters.tick();
-
-        assert!(
-            last_tps(&harness).is_some(),
+            rate_after((0, 0), 1, Duration::from_millis(250)).is_some(),
             "two readings should have produced a rate"
-        );
-        assert!(
-            harness.published_key("summary", "tps_history").is_some(),
-            "the chart series is retained for a client connecting later"
-        );
-    }
-
-    #[test]
-    fn test_failures_are_summed_as_banks_freeze() {
-        // The error counter resets per bank; differenced, it read nought whenever a bank had fewer
-        // failures than the last.
-        let harness = fixture();
-        let mut collector = harness.collector();
-        let mut meters = harness.meters();
-
-        meters.tick();
-        sleep(Duration::from_millis(250));
-        harness.advance_with_failures(1, 3);
-        collector.tick();
-        assert_eq!(harness.failed_total.load(Ordering::Relaxed), 3);
-        meters.tick();
-        sleep(Duration::from_millis(250));
-        harness.advance_with_failures(2, 1);
-        collector.tick();
-        collector.tick();
-        assert_eq!(harness.failed_total.load(Ordering::Relaxed), 4);
-        meters.tick();
-
-        let tps = last_tps(&harness).unwrap();
-        let failed = tps["non_vote_failed"].as_f64().unwrap();
-        let non_vote = failed + tps["non_vote_success"].as_f64().unwrap();
-        assert!(
-            failed > 0.0,
-            "one failure in the last slot was reported as none"
-        );
-        assert!(
-            (failed - non_vote).abs() < 1e-9,
-            "every non-vote transaction failed, so the two rates should agree: {tps}"
-        );
-    }
-
-    #[test]
-    fn test_failures_count_in_a_bank_pruned_between_samples() {
-        // Under alpenglow the root follows finalization, so a bank can leave bank forks before
-        // the collector drains its notification.
-        let harness = fixture();
-        let (sender, receiver) = crossbeam_channel::unbounded();
-        let mut collector = harness.notified_collector(receiver);
-        let mut meters = harness.meters();
-        // The collector's first count, which the meters take as their baseline.
-        sender
-            .send((BankNotification::Frozen(harness.working_bank()), None))
-            .unwrap();
-        collector.tick();
-
-        meters.tick();
-        sleep(Duration::from_millis(250));
-        let pruned = harness.advance_with_failures(1, 3);
-        let bank = harness.advance_to(2);
-        harness.bank_forks.write().unwrap().set_root(2, None, None);
-        for bank in [pruned, bank] {
-            sender.send((BankNotification::Frozen(bank), None)).unwrap();
-        }
-        collector.tick();
-        assert_eq!(harness.failed_total.load(Ordering::Relaxed), 3);
-        meters.tick();
-
-        let tps = last_tps(&harness).unwrap();
-        let failed = tps["non_vote_failed"].as_f64().unwrap();
-        let non_vote = failed + tps["non_vote_success"].as_f64().unwrap();
-        assert!(
-            failed > 0.0,
-            "the failures of a bank pruned before the sample were lost: {tps}"
-        );
-        assert!(
-            (failed - non_vote).abs() < 1e-9,
-            "every non-vote transaction failed, so the two rates should agree: {tps}"
         );
     }
 
     #[test]
     fn test_no_rate_is_reported_before_the_collectors_first_count() {
-        let harness = fixture();
-        let mut meters = harness.meters();
-
-        meters.tick();
-        sleep(Duration::from_millis(250));
-        harness.advance_to(1);
-        meters.tick();
-
-        assert!(
-            last_tps(&harness).is_none(),
-            "a rate was reported before the collector counted"
+        assert_eq!(
+            rate_after(
+                (FAILED_UNREAD, FAILED_UNREAD),
+                1,
+                Duration::from_millis(250)
+            ),
+            None,
+            "a rate was reported before a failed count was in"
         );
-    }
-
-    #[test]
-    fn test_the_collectors_first_count_is_a_baseline_and_not_a_spike() {
-        // The first count sums every bank drained at attach; differenced from nought, it put them
-        // all into one second.
-        let harness = fixture();
-        let mut collector = harness.collector();
-        let mut meters = harness.meters();
-
-        meters.tick();
-        sleep(Duration::from_millis(250));
-        harness.advance_with_failures(1, 3);
-        collector.tick();
-        assert_eq!(harness.failed_total.load(Ordering::Relaxed), 3);
-        meters.tick();
-        assert!(
-            last_tps(&harness).is_none(),
-            "the failures drained at attach were reported as one second's"
-        );
-
-        sleep(Duration::from_millis(250));
-        harness.advance_to(2);
-        collector.tick();
-        meters.tick();
-        let tps = last_tps(&harness).unwrap();
-        assert_eq!(tps["non_vote_failed"].as_f64(), Some(0.0), "{tps}");
     }
 
     #[test]
     fn test_a_failed_count_that_goes_back_skips_the_sample() {
-        // The collector's count follows the working fork, so a fork switch can lower it.
-        let harness = fixture();
-        let mut meters = harness.meters();
-
-        harness.failed_total.store(5, Ordering::Relaxed);
-        meters.tick();
-        sleep(Duration::from_millis(250));
-        harness.advance_to(1);
-        harness.failed_total.store(2, Ordering::Relaxed);
-        meters.tick();
-
-        assert!(
-            last_tps(&harness).is_none(),
+        // The count follows the working fork, so a fork switch can lower it.
+        assert_eq!(
+            rate_after((5, 2), 1, Duration::from_millis(250)),
+            None,
             "a sample was taken across a fork switch"
         );
     }
 
     #[test]
     fn test_a_replayed_burst_is_not_reported_as_throughput() {
-        let harness = fixture();
-        let mut meters = harness.meters();
-        harness.failed_total.store(0, Ordering::Relaxed);
-
-        meters.tick();
         // Thirty slots between back-to-back ticks stay above the guard for ticks up to 1.5 s
         // apart, so a loaded machine cannot slow the rate under it.
-        harness.advance_to(30);
-        meters.tick();
-
-        assert!(
-            last_tps(&harness).is_none(),
+        assert_eq!(
+            rate_after((0, 0), 30, Duration::ZERO),
+            None,
             "replay throughput was reported as cluster throughput"
         );
     }
@@ -3409,14 +3030,14 @@ mod tests {
     fn test_a_thread_reading_from_before_a_gap_starts_the_minute_again() {
         let harness = fixture();
         let mut meter = ThreadMeter::default();
-        meter.tick(&harness.publisher);
+        meter.tick(std::process::id(), &harness.publisher);
         sleep(Duration::from_millis(20));
-        meter.tick(&harness.publisher);
+        meter.tick(std::process::id(), &harness.publisher);
         assert_eq!(meter.history.len(), 1);
 
         let before_gap = Instant::now().checked_sub(WATCH_GAP * 2).unwrap();
         meter.last.as_mut().unwrap().1 = before_gap;
-        meter.tick(&harness.publisher);
+        meter.tick(std::process::id(), &harness.publisher);
         assert!(meter.history.is_empty() && meter.recent.is_empty());
         assert!(
             harness
@@ -3425,7 +3046,7 @@ mod tests {
                 .contains("[]")
         );
         sleep(Duration::from_millis(20));
-        meter.tick(&harness.publisher);
+        meter.tick(std::process::id(), &harness.publisher);
         assert_eq!(meter.history.len(), 1);
     }
 
@@ -3434,7 +3055,7 @@ mod tests {
     fn test_thread_names_carry_over_until_the_refresh() {
         let harness = fixture();
         let mut meter = ThreadMeter::default();
-        meter.tick(&harness.publisher);
+        meter.tick(std::process::id(), &harness.publisher);
         let named = |meter: &ThreadMeter, name: &str| {
             meter
                 .last
@@ -3447,32 +3068,31 @@ mod tests {
         for reading in meter.last.as_mut().unwrap().0.values_mut() {
             reading.name = "carried".to_string();
         }
-        meter.tick(&harness.publisher);
+        meter.tick(std::process::id(), &harness.publisher);
         assert!(named(&meter, "carried"));
 
         meter.named_at = Instant::now().checked_sub(THREAD_NAMES_REFRESH);
-        meter.tick(&harness.publisher);
+        meter.tick(std::process::id(), &harness.publisher);
         assert!(!named(&meter, "carried"));
     }
 
     fn gossip_tap(reports: u64, received_push: u64, process_us: u64, push_us: u64) -> TapCounters {
-        TapCounters {
-            gossip: GossipTotals {
-                reports,
-                received_push,
-                process_us,
-                push_us,
-                evicted: reports,
-                ..GossipTotals::default()
-            },
-            ..TapCounters::default()
-        }
+        let mut counters = TapCounters::default();
+        counters.gossip.totals = GossipTotals {
+            reports,
+            received_push,
+            process_us,
+            push_us,
+            evicted: reports,
+            ..GossipTotals::default()
+        };
+        counters
     }
 
     #[test]
     fn test_no_gossip_figure_until_a_report_arrives() {
         let publisher = Publisher::new();
-        let mut meter = GossipMeter::new();
+        let mut meter = GossipMeter::default();
         meter.tick(&TapCounters::default(), &TapCounters::default(), &publisher);
         let sent = publisher.snapshot().pop().unwrap();
         assert!(sent.contains(r#""value":null"#), "{sent}");
@@ -3481,7 +3101,7 @@ mod tests {
     #[test]
     fn test_gossip_rates_are_read_over_the_window() {
         let publisher = Publisher::new();
-        let mut meter = GossipMeter::new();
+        let mut meter = GossipMeter::default();
         // One report every other second, each carrying 2,000 pushes.
         let mut previous = TapCounters::default();
         for second in 1..=12u64 {
@@ -3504,18 +3124,19 @@ mod tests {
     #[test]
     fn test_gossip_drops_are_judged_against_packets_both_ways() {
         let publisher = Publisher::new();
-        let mut meter = GossipMeter::new();
+        let mut meter = GossipMeter::default();
         // A report every second: 900 packets in, 100 out, 3 dropped.
-        let tap = |reports: u64| TapCounters {
-            gossip: GossipTotals {
+        let tap = |reports: u64| {
+            let mut counters = TapCounters::default();
+            counters.gossip.totals = GossipTotals {
                 reports,
                 received: reports * 900,
                 sent_push: reports * 60,
                 sent_prune: reports * 40,
                 dropped_in: reports * 3,
                 ..GossipTotals::default()
-            },
-            ..TapCounters::default()
+            };
+            counters
         };
         let mut previous = TapCounters::default();
         for second in 1..=GOSSIP_MINUTE as u64 {
@@ -3538,7 +3159,7 @@ mod tests {
     #[test]
     fn test_gossip_that_stops_reporting_is_withdrawn() {
         let publisher = Publisher::new();
-        let mut meter = GossipMeter::new();
+        let mut meter = GossipMeter::default();
         let reported = gossip_tap(1, 10, 0, 0);
         meter.tick(&TapCounters::default(), &reported, &publisher);
         for _ in 0..GOSSIP_RATE_WINDOW {

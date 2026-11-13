@@ -2686,7 +2686,7 @@ pub mod tests {
                 // just pass the original session if it is a Primary variant
                 test_process_blockstore(genesis_config, blockstore, opts)
             }
-            AccessType::ReadOnly => {
+            AccessType::ReadOnly | AccessType::Secondary => {
                 let read_only_blockstore = Blockstore::open_with_options(
                     blockstore.ledger_path(),
                     BlockstoreOptions {
@@ -2783,7 +2783,7 @@ pub mod tests {
         match blockstore_access_type {
             // In ReadOnly access even though a dead slot
             // will be identified, it won't actually be marked dead.
-            AccessType::ReadOnly => {
+            AccessType::ReadOnly | AccessType::Secondary => {
                 assert_eq!(dead_slots.len(), 0);
             }
             AccessType::Primary | AccessType::PrimaryForMaintenance => {

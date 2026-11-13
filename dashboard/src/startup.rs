@@ -4,20 +4,13 @@
 use {
     crate::{
         metrics_tap::StakeInGossip,
-        proto::{Debounced, Publisher, TOPIC_SUMMARY},
+        proto::{Publisher, TOPIC_SUMMARY},
         validator_info::ValidatorInfoCache,
     },
-    crossbeam_channel::Receiver,
     serde::Serialize,
     solana_clock::Slot,
-    solana_core::validator::{GossipReady, ValidatorStartProgress},
-    solana_gossip::{
-        cluster_info::ClusterInfo, contact_info::ContactInfo,
-        crds_gossip_pull::CRDS_GOSSIP_PULL_CRDS_TIMEOUT_MS,
-    },
+    solana_core::validator::ValidatorStartProgress,
     solana_pubkey::Pubkey,
-    solana_runtime::bank::Bank,
-    solana_time_utils::timestamp,
     std::{
         collections::HashMap,
         time::{Duration, Instant},
@@ -26,8 +19,6 @@ use {
 
 pub const KEY_STARTUP_PROGRESS: &str = "startup_progress";
 pub const KEY_GOSSIP_STAKE: &str = "gossip_stake";
-
-pub type GossipReadyReceiver = Receiver<GossipReady>;
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct GossipStake {
@@ -47,34 +38,19 @@ pub struct GossipValidator {
     pub seen: bool,
 }
 
-/// Seen is a TVU peer with a fresh contact, as the validator's own wait counts it, and this node
-/// counts as seen.
-pub fn gossip_stake(
-    cluster_info: &ClusterInfo,
-    bank: &Bank,
+/// `seen` is each node seen in gossip, by its version.
+pub fn tally_gossip_stake(
+    slot: Slot,
+    shred_version: u16,
+    staked: HashMap<Pubkey, u64>,
+    seen: &HashMap<Pubkey, String>,
     names: &ValidatorInfoCache,
 ) -> GossipStake {
-    let shred_version = cluster_info.my_shred_version();
-    let now = timestamp();
-    let mut contacts: HashMap<Pubkey, String> = cluster_info
-        .tvu_peers(ContactInfo::clone)
-        .into_iter()
-        .filter(|contact| {
-            now.saturating_sub(contact.wallclock()) < CRDS_GOSSIP_PULL_CRDS_TIMEOUT_MS
-        })
-        .map(|contact| (*contact.pubkey(), contact.version().to_string()))
-        .collect();
-    contacts.insert(
-        cluster_info.id(),
-        cluster_info.my_contact_info().version().to_string(),
-    );
-
-    let mut validators: Vec<GossipValidator> = crate::collect::tally_bank_stake(bank)
-        .staked
+    let mut validators: Vec<GossipValidator> = staked
         .into_iter()
         .map(|(identity, stake)| {
             let info = names.get(&identity);
-            let version = contacts.get(&identity).cloned();
+            let version = seen.get(&identity).cloned();
             GossipValidator {
                 identity: identity.to_string(),
                 name: info.and_then(|info| info.name.clone()),
@@ -84,23 +60,18 @@ pub fn gossip_stake(
             }
         })
         .collect();
-    validators.sort_by(|a, b| {
-        b.stake
-            .cmp(&a.stake)
-            .then_with(|| a.identity.cmp(&b.identity))
-    });
-    let total = validators
-        .iter()
-        .fold(0, |sum, v| u64::saturating_add(sum, v.stake));
-    let seen = validators
-        .iter()
-        .filter(|v| v.seen)
-        .fold(0, |sum, v| u64::saturating_add(sum, v.stake));
+    validators.sort_by(|a, b| (b.stake, &a.identity).cmp(&(a.stake, &b.identity)));
+    let stake = |seen_only: bool| {
+        validators
+            .iter()
+            .filter(|v| v.seen || !seen_only)
+            .fold(0, |sum, v| u64::saturating_add(sum, v.stake))
+    };
     GossipStake {
-        slot: bank.slot(),
+        slot,
         shred_version,
-        total,
-        seen,
+        total: stake(false),
+        seen: stake(true),
         validators,
     }
 }
@@ -126,34 +97,20 @@ pub struct PhaseTiming {
     pub elapsed_nanos: u64,
 }
 
-pub struct StartupPublisher {
-    debounce: Debounced<StartupProgress>,
-    gossip: Debounced<Option<GossipStake>>,
-    /// Replay starts from a snapshot, so `slot / max_slot` would sit near 100% throughout.
-    replay_origin: Option<Slot>,
-    /// The validator reports its phase but not when it got there.
-    current: Option<(String, Instant)>,
-    /// Accumulated if a phase comes round again, as `loading_ledger` does.
-    taken: Vec<PhaseTiming>,
-}
-
-impl Default for StartupPublisher {
-    fn default() -> Self {
-        Self {
-            debounce: Debounced::new(TOPIC_SUMMARY, KEY_STARTUP_PROGRESS),
-            gossip: Debounced::new(TOPIC_SUMMARY, KEY_GOSSIP_STAKE),
-            replay_origin: None,
-            current: None,
-            taken: Vec::new(),
-        }
+debounced_keys! {
+    pub struct StartupPublisher {
+        debounce: StartupProgress = (TOPIC_SUMMARY, KEY_STARTUP_PROGRESS),
+        ;
+        /// Replay starts from a snapshot, so `slot / max_slot` would sit near 100% throughout.
+        replay_origin: Option<Slot> = None,
+        /// The validator reports its phase but not when it got there.
+        current: Option<(String, Instant)> = None,
+        /// Accumulated if a phase comes round again, as `loading_ledger` does.
+        taken: Vec<PhaseTiming> = Vec::new(),
     }
 }
 
 impl StartupPublisher {
-    pub fn publish_gossip(&mut self, publisher: &Publisher, stake: Option<GossipStake>) {
-        self.gossip.publish(publisher, stake);
-    }
-
     pub fn publish(
         &mut self,
         publisher: &Publisher,
@@ -180,30 +137,24 @@ impl StartupPublisher {
 
     /// Whole seconds, so the debounce does not send four messages a second.
     fn elapsed(&mut self, phase: &str, now: Instant) -> u64 {
-        match &mut self.current {
-            Some((current, since)) if current == phase => whole_seconds(now, *since),
-            other => {
-                if let Some((finished, since)) = other.take() {
-                    let elapsed_nanos = now.duration_since(since).as_nanos() as u64;
-                    match self
-                        .taken
-                        .iter_mut()
-                        .find(|timing| timing.phase == finished)
-                    {
-                        Some(timing) => {
-                            timing.elapsed_nanos =
-                                timing.elapsed_nanos.saturating_add(elapsed_nanos)
-                        }
-                        None => self.taken.push(PhaseTiming {
-                            phase: finished,
-                            elapsed_nanos,
-                        }),
-                    }
+        if let Some((current, since)) = &self.current
+            && current == phase
+        {
+            return whole_seconds(now, *since);
+        }
+        if let Some((finished, since)) = self.current.replace((phase.to_string(), now)) {
+            let elapsed_nanos = now.duration_since(since).as_nanos() as u64;
+            match self.taken.iter_mut().find(|taken| taken.phase == finished) {
+                Some(taken) => {
+                    taken.elapsed_nanos = taken.elapsed_nanos.saturating_add(elapsed_nanos)
                 }
-                *other = Some((phase.to_string(), now));
-                0
+                None => self.taken.push(PhaseTiming {
+                    phase: finished,
+                    elapsed_nanos,
+                }),
             }
         }
+        0
     }
 
     fn fraction(&mut self, slots: Option<(Slot, Slot)>) -> Option<f64> {
@@ -228,44 +179,38 @@ struct Phase {
 }
 
 fn describe(progress: ValidatorStartProgress) -> Phase {
-    let (name, detail, replay_slots, stake_percent) = match progress {
-        ValidatorStartProgress::Initializing => ("initializing", None, None, None),
-        ValidatorStartProgress::SearchingForRpcService => {
-            ("searching_for_rpc_service", None, None, None)
-        }
-        ValidatorStartProgress::DownloadingSnapshot { slot, rpc_addr } => (
-            "downloading_snapshot",
-            Some(format!("slot {slot} from {rpc_addr}")),
-            None,
-            None,
-        ),
-        ValidatorStartProgress::CleaningBlockStore => ("cleaning_blockstore", None, None, None),
-        ValidatorStartProgress::CleaningAccounts => ("cleaning_accounts", None, None, None),
-        ValidatorStartProgress::LoadingLedger => ("loading_ledger", None, None, None),
-        ValidatorStartProgress::ProcessingLedger { slot, max_slot } => (
-            "processing_ledger",
-            Some(format!("slot {slot} of {max_slot}")),
-            Some((slot, max_slot)),
-            None,
-        ),
-        ValidatorStartProgress::StartingServices => ("starting_services", None, None, None),
-        ValidatorStartProgress::Halted => ("halted", None, None, None),
+    let named = |name| Phase {
+        name,
+        detail: None,
+        replay_slots: None,
+        stake_percent: None,
+    };
+    match progress {
+        ValidatorStartProgress::Initializing => named("initializing"),
+        ValidatorStartProgress::SearchingForRpcService => named("searching_for_rpc_service"),
+        ValidatorStartProgress::DownloadingSnapshot { slot, rpc_addr } => Phase {
+            detail: Some(format!("slot {slot} from {rpc_addr}")),
+            ..named("downloading_snapshot")
+        },
+        ValidatorStartProgress::CleaningBlockStore => named("cleaning_blockstore"),
+        ValidatorStartProgress::CleaningAccounts => named("cleaning_accounts"),
+        ValidatorStartProgress::LoadingLedger => named("loading_ledger"),
+        ValidatorStartProgress::ProcessingLedger { slot, max_slot } => Phase {
+            detail: Some(format!("slot {slot} of {max_slot}")),
+            replay_slots: Some((slot, max_slot)),
+            ..named("processing_ledger")
+        },
+        ValidatorStartProgress::StartingServices => named("starting_services"),
+        ValidatorStartProgress::Halted => named("halted"),
         ValidatorStartProgress::WaitingForSupermajority {
             slot,
             gossip_stake_percent,
-        } => (
-            "waiting_for_supermajority",
-            Some(format!("slot {slot}")),
-            None,
-            Some(gossip_stake_percent as f64 / 100.0),
-        ),
-        ValidatorStartProgress::Running => ("running", None, None, None),
-    };
-    Phase {
-        name,
-        detail,
-        replay_slots,
-        stake_percent,
+        } => Phase {
+            detail: Some(format!("slot {slot}")),
+            stake_percent: Some(gossip_stake_percent as f64 / 100.0),
+            ..named("waiting_for_supermajority")
+        },
+        ValidatorStartProgress::Running => named("running"),
     }
 }
 
@@ -281,38 +226,36 @@ mod tests {
         ValidatorStartProgress::ProcessingLedger { slot, max_slot }
     }
 
-    #[test]
-    fn test_fraction_is_measured_from_the_first_slot_seen() {
-        let mut publisher = StartupPublisher::default();
-        assert_eq!(publisher.fraction(Some((1000, 2000))), Some(0.0));
-        assert_eq!(publisher.fraction(Some((1500, 2000))), Some(0.5));
-        assert_eq!(publisher.fraction(Some((2000, 2000))), Some(1.0));
+    /// What one publish of `phase` sends.
+    fn sent(phase: ValidatorStartProgress, stake: Option<StakeInGossip>) -> String {
+        let publisher = Publisher::new();
+        StartupPublisher::default().publish(&publisher, phase, stake);
+        publisher.snapshot().pop().unwrap().to_string()
     }
 
     #[test]
-    fn test_fraction_is_absent_without_replay_slots() {
-        let mut publisher = StartupPublisher::default();
-        assert_eq!(publisher.fraction(None), None);
-    }
-
-    #[test]
-    fn test_fraction_never_exceeds_one_or_runs_backwards() {
-        let mut publisher = StartupPublisher::default();
-        assert_eq!(publisher.fraction(Some((1000, 1100))), Some(0.0));
-        assert_eq!(publisher.fraction(Some((1200, 1100))), Some(1.0));
-        assert_eq!(publisher.fraction(Some((900, 1100))), Some(0.0));
-    }
-
-    #[test]
-    fn test_target_already_reached_reads_as_complete() {
-        let mut publisher = StartupPublisher::default();
-        assert_eq!(publisher.fraction(Some((1000, 1000))), Some(1.0));
-    }
-
-    #[test]
-    fn test_target_behind_the_origin_reports_nothing() {
-        let mut publisher = StartupPublisher::default();
-        assert_eq!(publisher.fraction(Some((1000, 900))), None);
+    fn test_fraction_is_measured_from_the_first_slot_seen_and_kept_in_bounds() {
+        // Each case on a fresh publisher.
+        let read = |slots: &[(Slot, Slot)]| {
+            let mut publisher = StartupPublisher::default();
+            slots
+                .iter()
+                .map(|&pair| publisher.fraction(Some(pair)))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            read(&[(1000, 2000), (1500, 2000), (2000, 2000)]),
+            [Some(0.0), Some(0.5), Some(1.0)]
+        );
+        assert_eq!(StartupPublisher::default().fraction(None), None);
+        // Never past one nor backwards.
+        assert_eq!(
+            read(&[(1000, 1100), (1200, 1100), (900, 1100)]),
+            [Some(0.0), Some(1.0), Some(0.0)]
+        );
+        // A target already reached is complete, and one behind the origin reports nothing.
+        assert_eq!(read(&[(1000, 1000)]), [Some(1.0)]);
+        assert_eq!(read(&[(1000, 900)]), [None]);
     }
 
     #[test]
@@ -328,22 +271,7 @@ mod tests {
     }
 
     #[test]
-    fn test_a_finished_phase_keeps_what_it_took() {
-        let mut publisher = StartupPublisher::default();
-        let base = Instant::now();
-        publisher.elapsed("cleaning_accounts", base);
-        publisher.elapsed("loading_ledger", base + Duration::from_secs(30));
-
-        assert_eq!(publisher.taken.len(), 1);
-        assert_eq!(publisher.taken[0].phase, "cleaning_accounts");
-        assert_eq!(
-            publisher.taken[0].elapsed_nanos,
-            Duration::from_secs(30).as_nanos() as u64
-        );
-    }
-
-    #[test]
-    fn test_a_phase_entered_twice_adds_to_its_own_total() {
+    fn test_a_finished_phase_keeps_what_it_took_and_adds_to_it_when_entered_again() {
         // `loading_ledger` is entered once for the snapshot and again if the
         // blockstore has slots to process.
         let mut publisher = StartupPublisher::default();
@@ -353,24 +281,14 @@ mod tests {
         publisher.elapsed("loading_ledger", base + Duration::from_secs(15));
         publisher.elapsed("processing_ledger", base + Duration::from_secs(21));
 
-        let loading = publisher
-            .taken
-            .iter()
-            .filter(|timing| timing.phase == "loading_ledger")
-            .count();
+        let took = |phase: &str, secs| PhaseTiming {
+            phase: phase.to_string(),
+            elapsed_nanos: Duration::from_secs(secs).as_nanos() as u64,
+        };
         assert_eq!(
-            loading, 1,
-            "one row per phase, however often it comes round"
-        );
-        assert_eq!(
-            publisher
-                .taken
-                .iter()
-                .find(|timing| timing.phase == "loading_ledger")
-                .unwrap()
-                .elapsed_nanos,
-            Duration::from_secs(16).as_nanos() as u64,
-            "ten seconds the first time and six the second"
+            publisher.taken,
+            [took("loading_ledger", 16), took("processing_ledger", 5)],
+            "one row per phase however often it comes round: ten seconds and six for loading"
         );
     }
 
@@ -409,9 +327,7 @@ mod tests {
             (ValidatorStartProgress::Running, false),
             (ValidatorStartProgress::StartingServices, false),
         ] {
-            let publisher = Publisher::new();
-            StartupPublisher::default().publish(&publisher, phase, seen);
-            let sent = publisher.snapshot().pop().unwrap();
+            let sent = sent(phase, seen);
             assert_eq!(
                 sent.contains(r#""stake_in_gossip":{"online":3,"total":10}"#),
                 carried,
@@ -438,9 +354,7 @@ mod tests {
             ValidatorStartProgress::Running,
         ];
         for phase in phases {
-            let publisher = Publisher::new();
-            StartupPublisher::default().publish(&publisher, phase, None);
-            let sent = publisher.snapshot().pop().unwrap();
+            let sent = sent(phase, None);
             assert!(!sent.contains(r#""phase":"""#), "{sent}");
             assert_eq!(
                 sent.contains(r#""running":true"#),

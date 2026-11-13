@@ -2,17 +2,13 @@
 //! client is asking for it.
 
 use {
-    super::{Collector, WANTED_FOR_MILLIS, is_delinquent, json_or_null, tally_bank_stake},
-    crate::{geoip, metrics_tap::VoteArrival},
+    super::{StakeTally, is_delinquent},
+    crate::{geoip, metrics_tap::VoteArrival, validator_info::ValidatorInfoCache},
+    indexmap::IndexSet,
     serde::Serialize,
     solana_clock::{Epoch, Slot},
-    solana_gossip::{
-        contact_info::ContactInfo,
-        crds_data::{LowestSlot, SnapshotHashes},
-    },
     solana_pubkey::Pubkey,
-    solana_runtime::bank::Bank,
-    std::{collections::HashMap, sync::atomic::Ordering},
+    std::{collections::HashMap, net::IpAddr},
 };
 
 /// Notarize mean, its spread and its worst, then the finalize mean, in microseconds; then the
@@ -37,147 +33,80 @@ pub struct GossipPeers {
     /// Two-letter country code of `ip`.
     pub country: Vec<Option<&'static str>>,
     pub rpc: Vec<Option<u16>>,
-    /// Milliseconds since this node last received the peer's contact record.
-    pub heard_ago: Vec<u64>,
-    /// When the peer's process started, in unix milliseconds.
-    pub started: Vec<u64>,
     /// Under alpenglow, the share of recent blocks whose finalization certificate carried its vote.
     pub finalization: Vec<Option<f32>>,
     /// The epoch `vote_arrival` describes; none until votor has reported one.
     pub vote_arrival_epoch: Option<Epoch>,
     /// Under alpenglow, from a slot starting here to the peer's votes arriving.
     pub vote_arrival: Vec<Option<VoteArrivalCell>>,
-    pub snapshot_full: Vec<Option<Slot>>,
-    pub snapshot_incremental: Vec<Option<Slot>>,
-    pub lowest: Vec<Option<Slot>>,
     /// Staked and not voting: never, or too far behind the tip.
     pub delinquent: Vec<bool>,
     /// The oldest last vote among a staked node's vote accounts.
     pub last_vote: Vec<Option<Slot>>,
 }
 
-impl Collector {
-    pub(super) fn collect_gossip_peers(
-        &mut self,
-        bank: &Bank,
-        root: Slot,
-        peers: &[(ContactInfo, u64)],
-        now_millis: u64,
-    ) {
-        let wanted = self.replies.gossip_peers_wanted.load(Ordering::Relaxed);
-        if now_millis.saturating_sub(wanted) > WANTED_FOR_MILLIS {
-            return;
-        }
-        let list = self.gossip_peers(bank, root, peers, now_millis);
-        if let Ok(mut held) = self.replies.gossip_peers.write() {
-            *held = json_or_null(&list);
-        }
-    }
+/// What a peer gossips about itself.
+pub struct Gossiped {
+    pub identity: Pubkey,
+    /// Its client and version.
+    pub client: (String, String),
+    pub gossip: Option<IpAddr>,
+    pub rpc: Option<u16>,
+}
 
-    fn gossip_peers(
-        &self,
-        bank: &Bank,
-        root: Slot,
-        peers: &[(ContactInfo, u64)],
-        now_millis: u64,
-    ) -> GossipPeers {
-        let tally = tally_bank_stake(bank);
-        let (stakes, stalest) = (&tally.staked, &tally.stalest_votes);
-        let total = tally
+/// The table, from any source of the gossip table, the stakes and the votes; `finalization` and
+/// `arrivals` by node, `tip` the slot the votes are judged against.
+pub fn gossip_peers(
+    root: Slot,
+    tip: Slot,
+    tally: &StakeTally,
+    mut peers: Vec<Gossiped>,
+    finalization: &HashMap<Pubkey, f64>,
+    (arrival_epoch, arrivals): (Option<Epoch>, &HashMap<Pubkey, VoteArrival>),
+    info: &ValidatorInfoCache,
+) -> GossipPeers {
+    let stake_of = |key: &Pubkey| tally.staked.get(key).copied().unwrap_or(0);
+    peers.sort_by(|a, b| {
+        stake_of(&b.identity)
+            .cmp(&stake_of(&a.identity))
+            .then_with(|| a.identity.cmp(&b.identity))
+    });
+    let mut list = GossipPeers {
+        root,
+        total_stake: tally
             .delinquent_stake
-            .saturating_add(tally.non_delinquent_stake);
-        let tip = bank.slot();
-        let stake_of = |key: &Pubkey| stakes.get(key).copied().unwrap_or(0);
-        let finalization = self.finalization_by_node(bank, now_millis);
-        let (arrival_epoch, arrivals) = self.metrics_tap.vote_arrivals();
-        let arrival_by_node: HashMap<Pubkey, VoteArrival> = bank
-            .vote_accounts()
-            .iter()
-            .filter_map(|(vote, (_, account))| Some((*account.node_pubkey(), *arrivals.get(vote)?)))
-            .collect();
-        let mut rows: Vec<&(ContactInfo, u64)> = peers.iter().collect();
-        rows.sort_by(|(a, _), (b, _)| {
-            stake_of(b.pubkey())
-                .cmp(&stake_of(a.pubkey()))
-                .then_with(|| a.pubkey().cmp(b.pubkey()))
-        });
-
-        let mut list = GossipPeers {
-            root,
-            total_stake: total,
-            vote_arrival_epoch: arrival_epoch,
-            ..GossipPeers::default()
-        };
-        // What each peer advertises, read in one short hold of the gossip table's lock.
-        let advertised: Vec<(Option<Slot>, Option<Slot>, Option<Slot>)> = {
-            let crds = self.ctx.cluster_info.gossip.crds.read().ok();
-            rows.iter()
-                .map(|(contact, _)| {
-                    let Some(crds) = crds.as_ref() else {
-                        return (None, None, None);
-                    };
-                    let key = *contact.pubkey();
-                    let hashes = crds.get::<&SnapshotHashes>(key);
-                    (
-                        hashes.map(|hashes| hashes.full.0),
-                        hashes.and_then(|hashes| {
-                            hashes.incremental.iter().map(|(slot, _)| *slot).max()
-                        }),
-                        crds.get::<&LowestSlot>(key).map(|lowest| lowest.lowest),
-                    )
-                })
-                .collect()
-        };
-
-        let mut client_at: HashMap<(String, String), usize> = HashMap::new();
-        let info = self.info_cache.read().unwrap();
-        for ((contact, heard_at), (full, incremental, lowest)) in rows.into_iter().zip(advertised) {
-            let key = contact.pubkey();
-            let client = (
-                contact.version().client().to_string(),
-                contact.version().to_string(),
-            );
-            let index = match client_at.get(&client) {
-                Some(index) => *index,
-                None => {
-                    let index = list.clients.len();
-                    client_at.insert(client.clone(), index);
-                    list.clients.push(client);
-                    index
-                }
-            };
-            list.identity.push(key.to_string());
-            list.name
-                .push(info.get(key).and_then(|info| info.name.clone()));
-            list.stake.push(stake_of(key));
-            list.client.push(index);
-            let ip = contact.gossip().map(|addr| addr.ip());
-            list.ip.push(ip.map(|ip| ip.to_string()));
-            list.country.push(ip.and_then(geoip::country));
-            list.rpc.push(contact.rpc().map(|addr| addr.port()));
-            list.heard_ago.push(now_millis.saturating_sub(*heard_at));
-            list.started
-                .push(contact.outset().checked_div(1_000).unwrap_or(0));
-            list.finalization
-                .push(finalization.get(key).map(|share| *share as f32));
-            list.vote_arrival
-                .push(arrival_by_node.get(key).map(|arrival| {
-                    (
-                        arrival.notarize_mean_micros,
-                        arrival.notarize_spread_micros,
-                        arrival.notarize_worst_micros,
-                        arrival.finalize_mean_micros,
-                        arrival.notarize_count,
-                    )
-                }));
-            list.snapshot_full.push(full);
-            list.snapshot_incremental.push(incremental);
-            list.lowest.push(lowest);
-            let last_vote = stalest.get(key).copied();
-            list.delinquent
-                .push(last_vote.is_some_and(|vote| is_delinquent(vote, tip)));
-            list.last_vote.push(last_vote.flatten());
-        }
-        list
+            .saturating_add(tally.non_delinquent_stake),
+        vote_arrival_epoch: arrival_epoch,
+        ..GossipPeers::default()
+    };
+    let mut clients = IndexSet::new();
+    for peer in peers {
+        let key = peer.identity;
+        let (index, _) = clients.insert_full(peer.client);
+        list.identity.push(key.to_string());
+        list.name
+            .push(info.get(&key).and_then(|info| info.name.clone()));
+        list.stake.push(stake_of(&key));
+        list.client.push(index);
+        list.ip.push(peer.gossip.map(|ip| ip.to_string()));
+        list.country.push(peer.gossip.and_then(geoip::country));
+        list.rpc.push(peer.rpc);
+        list.finalization
+            .push(finalization.get(&key).map(|share| *share as f32));
+        list.vote_arrival.push(arrivals.get(&key).map(|arrival| {
+            (
+                arrival.notarize_mean_micros,
+                arrival.notarize_spread_micros,
+                arrival.notarize_worst_micros,
+                arrival.finalize_mean_micros,
+                arrival.notarize_count,
+            )
+        }));
+        let last_vote = tally.stalest_votes.get(&key).copied();
+        list.delinquent
+            .push(last_vote.is_some_and(|vote| is_delinquent(vote, tip)));
+        list.last_vote.push(last_vote.flatten());
     }
+    list.clients = clients.into_iter().collect();
+    list
 }

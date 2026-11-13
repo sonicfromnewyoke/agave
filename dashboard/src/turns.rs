@@ -37,33 +37,20 @@ impl TurnTracker {
         if !mine {
             return;
         }
-        match self.open {
-            Some((first, last)) if last.saturating_add(1) == slot => {
-                self.open = Some((first, slot));
-            }
-            Some(turn) => {
-                self.closed.push_back(turn);
-                self.open = Some((slot, slot));
-            }
-            None => self.open = Some((slot, slot)),
+        match &mut self.open {
+            Some((_, last)) if last.saturating_add(1) == slot => *last = slot,
+            open => self.closed.extend(open.replace((slot, slot))),
         }
     }
 
     pub fn ended(&mut self, completed: Slot) -> Vec<(Slot, Slot)> {
-        let mut ended = Vec::new();
-        while let Some(&(first, last)) = self.closed.front() {
-            if last >= completed {
-                break;
-            }
-            ended.push((first, last));
-            self.closed.pop_front();
-        }
-        if let Some((first, last)) = self.open
-            && last < completed
-        {
-            ended.push((first, last));
-            self.open = None;
-        }
+        let count = self
+            .closed
+            .iter()
+            .take_while(|(_, last)| *last < completed)
+            .count();
+        let mut ended: Vec<(Slot, Slot)> = self.closed.drain(..count).collect();
+        ended.extend(self.open.take_if(|(_, last)| *last < completed));
         ended
     }
 }

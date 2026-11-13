@@ -67,6 +67,37 @@ export interface AccountsDisk {
   storages: number;
 }
 
+/** The index and write cache as they stand, then counts over the window. */
+export interface AccountsDb {
+  index_entries: number;
+  /** The slots of the index's hash maps, which is what its memory follows. */
+  index_capacity: number;
+  index_bytes: number;
+  write_cache_bytes: number;
+  write_cache_slots: number;
+  write_cache_accounts: number;
+  cleaned_to: number;
+
+  index_found: number;
+  /** Lookups of accounts that do not exist. */
+  index_missing: number;
+  index_inserts: number;
+  index_deletes: number;
+  clean_runs: number;
+  cleaned_slots: number;
+  cleaned_accounts: number;
+  shrunk_slots: number;
+  shrunk_accounts: number;
+  /** Dead bytes dropped, and live bytes written again to drop them. */
+  shrunk_bytes: number;
+  rewritten_bytes: number;
+  /** How long each job ran, counted as it ends. */
+  clean_micros: number;
+  shrink_micros: number;
+  flush_micros: number;
+  window_seconds: number;
+}
+
 export interface ProgramCache {
   looked_up: number;
   hits: number;
@@ -174,13 +205,6 @@ export interface GossipPeers {
   /** Two-letter country code of `ip`. */
   country: (string | null)[];
   rpc: (number | null)[];
-  /** Milliseconds since its contact record last arrived. */
-  heard_ago: number[];
-  /** Unix milliseconds. */
-  started: number[];
-  snapshot_full: (number | null)[];
-  snapshot_incremental: (number | null)[];
-  lowest: (number | null)[];
   /** Under Alpenglow, the share of recent blocks whose finalization certificate carried its vote. */
   finalization: (number | null)[];
   /** The epoch `vote_arrival` describes; null until votor has reported one. */
@@ -626,9 +650,7 @@ export interface ExecutedStage {
   blockhash_old: number;
   already_processed: number;
   bad_compute_budget: number;
-  account_data_too_large: number;
   program_not_executable: number;
-  program_restricted: number;
 }
 
 export interface SlotWaterfall extends Waterfall {
@@ -1436,6 +1458,7 @@ export interface Published {
     consensus: Consensus;
     program_cache: ProgramCache | null;
     accounts_cache: AccountsCache | null;
+    accounts_db: AccountsDb | null;
     shreds: Shreds | null;
     quic_paths: QuicPaths | null;
     verify: VerifyStage | null;

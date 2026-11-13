@@ -3,12 +3,12 @@
 
 use {
     crate::{certs::Reward, slots::SlotEntry},
-    serde::Serialize,
+    serde::{Serialize, Serializer},
     solana_clock::Slot,
 };
 
-/// An epoch, two days at 400 ms, in thirty-eight megabytes, allocated by the service since the
-/// server answers range queries before the collector exists.
+/// An epoch, two days at 400 ms, in thirty-eight megabytes, allocated at startup since the server
+/// answers range queries before the slot feed has run.
 pub const PACKED_SLOTS: usize = 432_000;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -42,33 +42,37 @@ pub const MAX_RANGE_SLOTS: usize = 4096;
 
 /// One slot on the wire, a JSON array: level, flags, votes, non-votes, compute, fees, priority
 /// fees, tips, time, replay, shreds, repaired, full, replayed, left out, recovered, failed. The
-/// frontend mirrors it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-pub struct WireRow(
-    pub u8,
-    pub u16,
-    pub u32,
-    pub u32,
-    pub u32,
-    pub u64,
-    pub u64,
-    pub u64,
-    pub u64,
-    pub u32,
-    pub u32,
-    pub u32,
-    pub u32,
-    pub u32,
-    pub u16,
-    pub u16,
-    pub u32,
-);
+/// frontend mirrors it; `notarized` is not sent.
+impl Serialize for PackedSlot {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        [
+            u64::from(self.level),
+            u64::from(self.flags),
+            u64::from(self.votes),
+            u64::from(self.non_votes),
+            u64::from(self.compute),
+            self.fees,
+            self.priority_fees,
+            self.tips,
+            self.time_millis,
+            u64::from(self.replay_micros),
+            u64::from(self.shreds),
+            u64::from(self.repaired),
+            u64::from(self.full_millis),
+            u64::from(self.replayed_millis),
+            u64::from(self.left_out),
+            u64::from(self.recovered),
+            u64::from(self.failed),
+        ]
+        .serialize(serializer)
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SlotRange {
     /// Every row after it is one slot on, so slot numbers are never sent.
     pub first_slot: Slot,
-    pub rows: Vec<Option<WireRow>>,
+    pub rows: Vec<Option<PackedSlot>>,
 }
 
 pub const HAS_BLOCK: u16 = 1;
@@ -103,7 +107,7 @@ fn reward_bits(reward: Option<Reward>) -> u16 {
 pub struct SlotHistory {
     rows: Vec<(Slot, PackedSlot)>,
     /// Slots below this were replayed while catching up after a start.
-    live_from: Slot,
+    pub live_from: Slot,
 }
 
 impl SlotHistory {
@@ -118,14 +122,6 @@ impl SlotHistory {
         self.rows.len()
     }
 
-    pub fn live_from(&self) -> Slot {
-        self.live_from
-    }
-
-    pub fn set_live_from(&mut self, slot: Slot) {
-        self.live_from = slot;
-    }
-
     pub fn get(&self, slot: Slot) -> Option<&PackedSlot> {
         let (held, row) = self.rows.get(self.index(slot))?;
         // Unfilled rows hold slot 0, so slot 0 itself is never reported.
@@ -135,29 +131,7 @@ impl SlotHistory {
     pub fn range(&self, first_slot: Slot, count: usize) -> SlotRange {
         let count = count.min(MAX_RANGE_SLOTS);
         let rows = (0..count as u64)
-            .map(|offset| {
-                self.get(first_slot.saturating_add(offset)).map(|row| {
-                    WireRow(
-                        row.level,
-                        row.flags,
-                        row.votes,
-                        row.non_votes,
-                        row.compute,
-                        row.fees,
-                        row.priority_fees,
-                        row.tips,
-                        row.time_millis,
-                        row.replay_micros,
-                        row.shreds,
-                        row.repaired,
-                        row.full_millis,
-                        row.replayed_millis,
-                        row.left_out,
-                        row.recovered,
-                        row.failed,
-                    )
-                })
-            })
+            .map(|offset| self.get(first_slot.saturating_add(offset)).copied())
             .collect();
         SlotRange { first_slot, rows }
     }
@@ -280,14 +254,7 @@ mod tests {
         SlotEntry {
             slot,
             level: SlotLevel::Rooted,
-            mine: false,
-            block: None,
-            duration_nanos: None,
-            time_millis: None,
-            shreds: None,
-            replayed_millis: None,
-            reward: None,
-            left_out: None,
+            ..SlotEntry::default()
         }
     }
 
@@ -312,15 +279,11 @@ mod tests {
             block: Some(BlockDetail {
                 transactions,
                 non_vote_transactions: non_vote,
-                failed_transactions: 0,
-                entries: 0,
                 block_cost: 41_827_311,
                 block_cost_limit: 60_000_000,
                 account_cost_limit: 12_000_000,
                 total_fees: 104_600_000,
-                priority_fees: 0,
-                tips: None,
-                replay_micros: None,
+                ..BlockDetail::default()
             }),
             ..entry(slot)
         }
@@ -396,19 +359,14 @@ mod tests {
         assert_eq!(range.rows.len(), 3);
         assert!(range.rows[0].is_some());
         assert!(range.rows[1].is_none(), "slot 11 was never recorded");
-        assert_eq!(range.rows[2].expect("slot 12").3, 9);
+        assert_eq!(range.rows[2].expect("slot 12").non_votes, 9);
     }
 
     #[test]
-    fn test_a_range_past_the_ceiling_is_clamped_rather_than_refused() {
+    fn test_a_range_off_the_history_is_all_holes_and_clamped_rather_than_refused() {
         let history = SlotHistory::new(64);
         let range = history.range(10, MAX_RANGE_SLOTS.saturating_add(1_000));
         assert_eq!(range.rows.len(), MAX_RANGE_SLOTS);
-    }
-
-    #[test]
-    fn test_a_range_off_the_end_of_the_history_is_all_holes() {
-        let history = SlotHistory::new(64);
         let range = history.range(900, 4);
         assert_eq!(range.rows.len(), 4);
         assert!(range.rows.iter().all(Option::is_none));
@@ -419,50 +377,33 @@ mod tests {
         // The one place the wire order is pinned.
         let mut history = SlotHistory::new(64);
         let mut block = with_block(10, 9_500, 8_752);
-        if let Some(detail) = block.block.as_mut() {
-            detail.failed_transactions = 37;
-        }
+        block.block.as_mut().unwrap().failed_transactions = 37;
         history.record(&block);
         history.record_time(10, 1_756_000_000_123);
 
-        let WireRow(
-            level,
-            flags,
-            votes,
-            non_votes,
-            compute,
-            fees,
-            priority,
-            tips,
-            time,
-            replay,
-            shreds,
-            repaired,
-            full,
-            replayed,
-            left_out,
-            recovered,
-            failed,
-        ) = history.range(10, 1).rows[0].expect("recorded");
-        assert_eq!(level, SlotLevel::Rooted as u8);
-        assert_eq!(flags, HAS_BLOCK | HAS_CLOCK);
-        assert_eq!(left_out, 0);
-        assert_eq!(votes, 748);
-        assert_eq!(non_votes, 8_752);
-        assert_eq!(failed, 37);
-        assert_eq!(compute, 41_827_311);
-        assert_eq!(fees, 104_600_000);
-        assert_eq!(priority, 0);
-        assert_eq!(tips, 0);
-        assert_eq!(flags & HAS_TIPS, 0);
-        assert_eq!(time, 1_756_000_000_123);
-        assert_eq!(replay, 0);
-        assert_eq!(flags & HAS_REPLAY, 0);
+        let row = history.range(10, 1).rows[0].expect("recorded");
         assert_eq!(
-            (shreds, repaired, recovered, full, replayed),
-            (0, 0, 0, 0, 0)
+            serde_json::to_value(row).unwrap(),
+            serde_json::json!([
+                SlotLevel::Rooted as u8,
+                HAS_BLOCK | HAS_CLOCK,
+                748,
+                8_752,
+                41_827_311,
+                104_600_000,
+                0,
+                0,
+                1_756_000_000_123_u64,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                37
+            ])
         );
-        assert_eq!(flags & (HAS_SHREDS | HAS_REPLAYED), 0);
     }
 
     #[test]
@@ -541,14 +482,13 @@ mod tests {
         let mut history = SlotHistory::new(MAX_RANGE_SLOTS);
         for slot in 0..MAX_RANGE_SLOTS as Slot {
             let mut big = with_block(slot, 99_999, 99_999);
-            if let Some(block) = big.block.as_mut() {
-                block.failed_transactions = 9_999;
-                block.block_cost = u64::from(u32::MAX);
-                block.total_fees = 9_999_999_999_999;
-                block.priority_fees = 9_999_999_999_999;
-                block.tips = Some(9_999_999_999_999);
-                block.replay_micros = Some(9_999_999);
-            }
+            let block = big.block.as_mut().unwrap();
+            block.failed_transactions = 9_999;
+            block.block_cost = u64::from(u32::MAX);
+            block.total_fees = 9_999_999_999_999;
+            block.priority_fees = 9_999_999_999_999;
+            block.tips = Some(9_999_999_999_999);
+            block.replay_micros = Some(9_999_999);
             big.shreds = Some(ShredArrival {
                 count: 99_999,
                 repaired: 99_999,
@@ -561,21 +501,14 @@ mod tests {
         }
 
         let encoded = crate::proto::encode("slot", "range", &history.range(0, MAX_RANGE_SLOTS));
-        assert!(
-            encoded.len() < crate::proto::MAX_MESSAGE / 2,
-            "a full range is {} bytes against a {} byte ceiling",
-            encoded.len(),
-            crate::proto::MAX_MESSAGE
-        );
+        crate::proto::assert_under("a full range", &encoded, crate::proto::MAX_MESSAGE / 2);
     }
 
     #[test]
     fn test_replay_time_travels_with_its_flag() {
         let mut history = SlotHistory::new(64);
         let mut replayed = with_block(40, 100, 10);
-        if let Some(block) = replayed.block.as_mut() {
-            block.replay_micros = Some(47_200);
-        }
+        replayed.block.as_mut().unwrap().replay_micros = Some(47_200);
         history.record(&replayed);
         history.record(&with_block(41, 100, 10));
 
@@ -592,9 +525,7 @@ mod tests {
         let mut history = SlotHistory::new(64);
 
         let mut measured = with_block(20, 100, 10);
-        if let Some(block) = measured.block.as_mut() {
-            block.tips = Some(0);
-        }
+        measured.block.as_mut().unwrap().tips = Some(0);
         history.record(&measured);
         history.record(&with_block(21, 100, 10));
 
@@ -611,10 +542,9 @@ mod tests {
     fn test_the_two_kinds_of_fee_are_kept_apart() {
         let mut history = SlotHistory::new(64);
         let mut block = with_block(30, 100, 10);
-        if let Some(detail) = block.block.as_mut() {
-            detail.total_fees = 104_600_000;
-            detail.priority_fees = 99_000_000;
-        }
+        let detail = block.block.as_mut().unwrap();
+        detail.total_fees = 104_600_000;
+        detail.priority_fees = 99_000_000;
         history.record(&block);
 
         let read = history.get(30).expect("recorded");

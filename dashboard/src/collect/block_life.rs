@@ -2,7 +2,11 @@
 //! here. A block this node built never enters: replay does not run it, so it is never noted.
 
 use {
-    crate::slots::ShredArrival, serde::Serialize, solana_clock::Slot, std::collections::BTreeMap,
+    super::{HANDOFF_BEHIND_SLOTS, MINUTE_MILLIS, cluster_charts::at_percent},
+    crate::slots::ShredArrival,
+    serde::Serialize,
+    solana_clock::Slot,
+    std::collections::BTreeMap,
 };
 
 /// An hour of 200 ms slots.
@@ -19,11 +23,6 @@ const SLOWEST: usize = 5;
 
 /// A block is listed only where one stage ran this far over its median, past ordinary spread.
 const SLOW_BY_MILLIS: u32 = 50;
-
-const MINUTE_MILLIS: u64 = 60_000;
-
-/// A block replayed this far behind the cluster's tip was caught up on, not received live.
-const BEHIND_SLOTS: u64 = 32;
 
 /// Our first shred arriving this long after the leader's close means its clock is behind ours.
 const CLOCK_SLACK_MILLIS: u64 = 100;
@@ -166,14 +165,14 @@ impl Life {
 }
 
 #[derive(Debug, Default)]
-pub(super) struct BlockLives {
+pub struct BlockLives {
     blocks: BTreeMap<Slot, Life>,
 }
 
 impl BlockLives {
     /// Times on the blockstore's clock: the first shred in unix milliseconds, then milliseconds
     /// after it.
-    pub(super) fn note_arrival(
+    pub fn note_arrival(
         &mut self,
         slot: Slot,
         first_shred_millis: u64,
@@ -181,7 +180,7 @@ impl BlockLives {
         replayed_millis: u64,
         cluster_tip: Option<Slot>,
     ) {
-        if cluster_tip.is_some_and(|tip| tip.saturating_sub(slot) > BEHIND_SLOTS) {
+        if cluster_tip.is_some_and(|tip| tip.saturating_sub(slot) > HANDOFF_BEHIND_SLOTS) {
             return;
         }
         let life = self.blocks.entry(slot).or_default();
@@ -195,13 +194,13 @@ impl BlockLives {
     }
 
     /// Only for a block already noted, so footers of this node's own blocks are passed by.
-    pub(super) fn note_closed(&mut self, slot: Slot, closed_at_nanos: u64) {
+    pub fn note_closed(&mut self, slot: Slot, closed_at_nanos: u64) {
         if let Some(life) = self.blocks.get_mut(&slot) {
             life.closed = closed_at_nanos.checked_div(1_000_000);
         }
     }
 
-    pub(super) fn note_votes(
+    pub fn note_votes(
         &mut self,
         slot: Slot,
         vote_after_full_us: Option<u64>,
@@ -213,7 +212,7 @@ impl BlockLives {
         }
     }
 
-    pub(super) fn summary(&self, now_millis: u64) -> Option<BlockLifeSummary> {
+    pub fn summary(&self, now_millis: u64) -> Option<BlockLifeSummary> {
         let timed: Vec<Timed> = self
             .blocks
             .iter()
@@ -287,11 +286,10 @@ fn furthest_over(block: &Timed, median: &Stages, receiving: Option<u32>) -> Opti
     .max_by_key(|(over, _)| *over)
 }
 
-/// The upper median.
 fn upper_median(values: impl Iterator<Item = u32>) -> Option<u32> {
     let mut values: Vec<u32> = values.collect();
     values.sort_unstable();
-    values.get(values.len().checked_div(2)?).copied()
+    at_percent(&values, 50)
 }
 
 fn millis(value: u64) -> u32 {
@@ -479,7 +477,6 @@ mod tests {
         assert_eq!(summary.median.reaching, Some(100));
         assert!(summary.slowest.is_empty());
     }
-
     #[test]
     fn test_the_store_holds_an_hour_of_blocks() {
         let mut lives = BlockLives::default();

@@ -50,6 +50,9 @@ pub enum AccessType {
     /// Read only access; multiple processes can obtain ReadOnly access.
     /// ReadOnly instance gets a static view of the database at creation time.
     ReadOnly,
+    /// Read only access that follows the primary's writes as
+    /// `Blockstore::try_catch_up_with_primary` is called.
+    Secondary,
 }
 
 #[derive(Debug, Clone, PartialEq)]

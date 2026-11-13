@@ -15,6 +15,7 @@ describe("readRoute", () => {
     expect(readRoute("/slots").page).toBe("slots");
     expect(readRoute("/gossip").page).toBe("gossip");
     expect(readRoute("/cluster").page).toBe("cluster");
+    expect(readRoute("/accounts").page).toBe("accounts");
   });
 
   it("falls back to the overview rather than showing nothing", () => {
@@ -95,6 +96,7 @@ describe("routeAddress", () => {
       },
       { ...HOME, page: "gossip" },
       { ...HOME, page: "cluster" },
+      { ...HOME, page: "accounts" },
     ];
     for (const route of routes) expect(readRoute(routeAddress(route))).toEqual(route);
   });

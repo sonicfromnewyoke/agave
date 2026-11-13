@@ -2,14 +2,15 @@
 
 use {
     crate::certs::Reward,
-    serde::Serialize,
+    serde::{Serialize, Serializer},
     solana_clock::Slot,
-    std::collections::{BTreeMap, btree_map::Entry},
+    std::collections::BTreeMap,
 };
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SlotLevel {
+    #[default]
     Incomplete,
     Completed,
     OptimisticallyConfirmed,
@@ -18,11 +19,12 @@ pub enum SlotLevel {
     Skipped,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
 pub struct SlotEntry {
     pub slot: Slot,
     pub level: SlotLevel,
     pub mine: bool,
+    #[serde(serialize_with = "with_replay")]
     pub block: Option<BlockDetail>,
     /// In nanoseconds, from the last earlier block to fill here to this one filling, so it lines up
     /// with the slot's own work rather than the one before it.
@@ -46,7 +48,7 @@ pub struct ShredArrival {
     pub full_millis: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct BlockDetail {
     pub transactions: u64,
     pub non_vote_transactions: u64,
@@ -60,7 +62,29 @@ pub struct BlockDetail {
     pub total_fees: u64,
     pub priority_fees: u64,
     pub tips: Option<u64>,
+    /// Sent with the slot's entry only, as the last of the block's figures.
+    #[serde(skip)]
     pub replay_micros: Option<u64>,
+}
+
+/// A slot's block with its replay time, which a produced block leaves out.
+fn with_replay<S: Serializer>(
+    block: &Option<BlockDetail>,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    #[derive(Serialize)]
+    struct Replayed<'a> {
+        #[serde(flatten)]
+        block: &'a BlockDetail,
+        replay_micros: Option<u64>,
+    }
+    block
+        .as_ref()
+        .map(|block| Replayed {
+            block,
+            replay_micros: block.replay_micros,
+        })
+        .serialize(serializer)
 }
 
 impl SlotEntry {
@@ -70,21 +94,6 @@ impl SlotEntry {
             self.time_millis?
                 .saturating_add(self.shreds.as_ref()?.full_millis),
         )
-    }
-
-    fn new(slot: Slot) -> Self {
-        Self {
-            slot,
-            level: SlotLevel::Incomplete,
-            mine: false,
-            block: None,
-            duration_nanos: None,
-            time_millis: None,
-            shreds: None,
-            replayed_millis: None,
-            reward: None,
-            left_out: None,
-        }
     }
 }
 
@@ -128,10 +137,10 @@ impl SlotRing {
     /// Returns the entry only if something changed, so idle polling sends nothing.
     pub fn update(&mut self, slot: Slot, update: impl FnOnce(&mut SlotEntry)) -> Option<SlotEntry> {
         let before = self.entries.get(&slot).cloned();
-        let entry = match self.entries.entry(slot) {
-            Entry::Occupied(occupied) => occupied.into_mut(),
-            Entry::Vacant(vacant) => vacant.insert(SlotEntry::new(slot)),
-        };
+        let entry = self.entries.entry(slot).or_insert_with(|| SlotEntry {
+            slot,
+            ..SlotEntry::default()
+        });
         update(entry);
 
         // A level never moves backwards: replay and the commitment cache are sampled
@@ -192,21 +201,17 @@ impl SlotRing {
             .collect()
     }
 
-    pub fn mark_skipped_below(&mut self, up_to: Slot) -> Vec<SlotEntry> {
-        let stale: Vec<Slot> = self
-            .entries
-            .iter()
-            .filter(|(slot, entry)| **slot < up_to && entry.level == SlotLevel::Incomplete)
-            .map(|(&slot, _)| slot)
-            .collect();
-        stale
-            .into_iter()
-            .filter_map(|slot| self.update(slot, |entry| entry.level = SlotLevel::Skipped))
-            .collect()
-    }
-
     pub fn set_mine(&mut self, slot: Slot, mine: bool) -> Option<SlotEntry> {
         self.update(slot, |entry| entry.mine = mine)
+    }
+
+    /// The slots below `up_to` never completed here, oldest first.
+    pub fn incomplete_below(&self, up_to: Slot) -> Vec<Slot> {
+        self.entries
+            .range(..up_to)
+            .filter(|(_, entry)| entry.level == SlotLevel::Incomplete)
+            .map(|(&slot, _)| slot)
+            .collect()
     }
 }
 
@@ -215,16 +220,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_a_slot_records_only_whether_it_is_ours() {
+    fn test_a_slot_records_whether_it_is_ours_and_marking_it_twice_reports_no_change() {
         let mut ring = SlotRing::new(16);
-        let entry = ring.set_mine(7, true).expect("a change");
-        assert!(entry.mine);
-    }
-
-    #[test]
-    fn test_marking_the_same_slot_ours_twice_reports_no_change() {
-        let mut ring = SlotRing::new(16);
-        assert!(ring.set_mine(7, true).is_some());
+        assert!(ring.set_mine(7, true).expect("a change").mine);
         assert!(ring.set_mine(7, true).is_none());
     }
 
@@ -267,12 +265,7 @@ mod tests {
         };
 
         let encoded = crate::proto::encode("slot", "overview", &worst(512 + OWN_SLOTS_KEPT));
-        assert!(
-            encoded.len() < crate::proto::MAX_MESSAGE,
-            "worst-case overview is {} bytes against a {} byte ceiling",
-            encoded.len(),
-            crate::proto::MAX_MESSAGE
-        );
+        crate::proto::assert_under("worst-case overview", &encoded, crate::proto::MAX_MESSAGE);
     }
 
     fn ours(ring: &SlotRing) -> Vec<Slot> {
@@ -432,16 +425,5 @@ mod tests {
         ring.update(1, |entry| entry.level = SlotLevel::Finalized);
         assert!(ring.promote(1, SlotLevel::Rooted).is_empty());
         assert_eq!(ring.get(1).unwrap().level, SlotLevel::Finalized);
-    }
-
-    #[test]
-    fn test_marking_skipped_leaves_completed_slots_alone() {
-        let mut ring = SlotRing::new(16);
-        ring.update(1, |entry| entry.level = SlotLevel::Completed);
-        ring.update(2, |_| {});
-        let skipped = ring.mark_skipped_below(3);
-        assert_eq!(skipped.len(), 1);
-        assert_eq!(skipped[0].slot, 2);
-        assert_eq!(ring.get(1).unwrap().level, SlotLevel::Completed);
     }
 }

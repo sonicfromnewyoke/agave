@@ -1,11 +1,11 @@
-//! Counters lifted from the metrics points the validator submits about itself.
-//! The observer runs on the submitting thread: a name match, then an atomic add for a single
-//! counter or one short lock for a set of them, the per-slot points included.
+//! Counters lifted from the metrics points the validator exports about itself, read in batches
+//! from its metrics writer: a name match, then one short lock for the set a point adds into, the
+//! per-slot points included.
 //! Points carry deltas, accumulated into totals. A few fields are levels,
 //! replaced by the latest reading and never summed.
 
 use {
-    crate::certs::VoteSent,
+    crate::{certs::VoteSent, collect::system_time_nanos},
     serde::Serialize,
     solana_clock::{Epoch, Slot},
     solana_metrics::datapoint::DataPoint,
@@ -15,10 +15,10 @@ use {
         collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
         str::FromStr,
         sync::{
-            Arc, Mutex, MutexGuard, PoisonError,
-            atomic::{AtomicU8, AtomicU64, Ordering},
+            Mutex, MutexGuard, PoisonError,
+            atomic::{AtomicU64, Ordering},
         },
-        time::UNIX_EPOCH,
+        time::SystemTime,
     },
 };
 
@@ -44,8 +44,6 @@ const REPAIR_SENDER: &str = "Repair";
 const SENT_BYTES: &str = "streamer-send-bytes_total";
 const SENT_MILLIS: &str = "streamer-send-sample_duration_ms";
 const TPU_VOTE_RECEIVER: &str = "tpu_vote_receiver";
-/// Votor's server, which takes every vote under alpenglow; it counts votes, not packets.
-const VOTOR_SERVER: &str = "votor_datagram_server";
 
 const PACKETS_COUNT: &str = "packets_count";
 
@@ -56,6 +54,15 @@ const WORKER_ERROR_METRICS: &str = "banking_stage_worker_error_metrics";
 const ACCOUNTS_LOADS: &str = "accounts_db_load_accounts";
 const ACCOUNTS_STORES: &str = "accounts_db-stores";
 const ACCOUNTS_FLUSH: &str = "accounts_db-flush_accounts_cache";
+
+const ACCOUNTS_CLEAN: &str = "clean_accounts";
+/// Shrink rewrites one slot's storage without its dead accounts; the ancient one packs old
+/// slots' storages together. Both report the same fields.
+const ACCOUNTS_SHRINK: &str = "shrink_stats";
+const ACCOUNTS_SHRINK_ANCIENT: &str = "shrink_ancient_stats";
+/// One point each time a background job starts or ends: its one field names the job and holds
+/// how many of it now run, so the time between the two is how long the job took.
+const ACCOUNTS_ACTIVE: &str = "accounts_db_active";
 
 /// The program cache's counters, reported and reset once per bank, so each point is one slot's
 /// work.
@@ -79,8 +86,8 @@ const VOTE_SLOT_TIMING: &str = "banking_stage-leader_slot_vote_execute_and_commi
 
 const WORKER_ID: &str = "id";
 
-/// The worker threads, one point each, summed. Submitted at trace level, which the observer sees
-/// anyway since it runs before the level check.
+/// The worker threads, one point each, summed. Exported at any log level: agave submits it directly
+/// with `solana_metrics::submit(.., Level::Trace)`.
 const WORKER_COUNTS: &str = "banking_stage_worker_counts";
 
 const SCHEDULER_SLOT_COUNTS: &str = "banking_stage_scheduler_slot_counts";
@@ -96,6 +103,9 @@ const RETRANSMIT_SLOT_STATS: &str = "retransmit-stage-slot-stats";
 const REPLAY_SLOT_STATS: &str = "replay-slot-stats";
 
 const SHRED_FULL: &str = "shred_insert_is_full";
+
+/// Sent for every bank made, with its block height.
+const NEW_BANK: &str = "bank-new_from_parent-heights";
 
 /// Reported for every slot, tagged with whether it was ours; only ours are kept.
 const COST_TRACKER: &str = "cost_tracker_stats";
@@ -167,8 +177,13 @@ const FINALITY_SAMPLES: usize = 1024;
 /// Read when replay freezes a slot; during a catch-up the blockstore fills far ahead of replay.
 const SHRED_FILLS: usize = 4096;
 
-/// Reports held until the collector copies them into one of our blocks.
+/// Banks' heights held: the newest frozen block's chain meets one well inside a metrics batch.
+const BLOCK_HEIGHTS: usize = 1024;
+
+/// Reports held until the slot feed copies them into one of our blocks.
 const PENDING_SLOTS: usize = 500;
+/// As many banks as the slot ring holds.
+const BANK_FIGURES: usize = 4096;
 
 /// Well past 1.2 epochs of the largest stake's slots; a guard for a floor never set.
 const MAX_HELD_SLOTS: usize = 32_768;
@@ -185,11 +200,7 @@ struct TimedSamples(Mutex<VecDeque<(u64, u64)>>);
 
 impl TimedSamples {
     fn push(&self, at_millis: u64, value: u64) {
-        let mut samples = locked(&self.0);
-        samples.push_back((at_millis, value));
-        while samples.len() > FINALITY_SAMPLES {
-            samples.pop_front();
-        }
+        push_capped(&mut locked(&self.0), (at_millis, value), FINALITY_SAMPLES);
     }
 
     fn median(&self, now_millis: u64, window_millis: u64) -> Option<u64> {
@@ -207,48 +218,13 @@ impl TimedSamples {
 
 #[derive(Debug, Default)]
 pub struct MetricsTap {
-    pub accounts_cache_hits: AtomicU64,
-    pub accounts_cache_misses: AtomicU64,
-    pub accounts_cache_evicts: AtomicU64,
-
-    pub shreds_turbine: AtomicU64,
-    pub shreds_repair: AtomicU64,
-
-    pub packets_gossip: AtomicU64,
-    pub packets_tpu_vote: AtomicU64,
-    pub votes_votor: AtomicU64,
-
-    pub turbine_root: AtomicU64,
-    pub turbine_layer_1: AtomicU64,
-    pub turbine_layer_2: AtomicU64,
-    pub turbine_layer_3: AtomicU64,
-    pub xdp_dropped: AtomicU64,
-    /// The `is_xdp` tag last seen: 0 none yet, 1 false, 2 true.
-    retransmit_xdp: AtomicU8,
-
-    pub gossip_sent_bytes: AtomicU64,
-    pub gossip_sent_millis: AtomicU64,
-    pub repair_sent_bytes: AtomicU64,
-    pub repair_sent_millis: AtomicU64,
-
-    accounts: Mutex<AccountsSet>,
+    counters: Mutex<TapCounters>,
     memory: Mutex<MemorySet>,
-
-    program_cache: Mutex<ProgramCacheSet>,
-
-    /// Separate sets, since the stages either side of the scheduler do not reconcile.
-    quic: Mutex<QuicSet>,
-    quic_forwards: Mutex<QuicSet>,
-    quic_vote: Mutex<QuicSet>,
-    verify: Mutex<VerifyTotals>,
-    executed: Mutex<ExecutedTotals>,
-    bundles: Mutex<BundleTotals>,
-
-    gossip: Mutex<GossipSet>,
 
     slot_waterfalls: Mutex<HeldSlots<SlotWaterfall>>,
 
     slot_costs: Mutex<HeldSlots<SlotCost>>,
+    bank_figures: Mutex<BTreeMap<Slot, BankFigures>>,
 
     slot_lists_revision: AtomicU64,
 
@@ -264,14 +240,16 @@ pub struct MetricsTap {
     /// Microseconds from the leader closing a block, by its clock, to its finalization here.
     from_leader: TimedSamples,
 
-    /// Held until the collector takes them.
+    /// Held until the slot feed takes them.
     block_votes: Mutex<VecDeque<BlockVotes>>,
 
     closed_blocks: Mutex<ClosedBlocks>,
 
     shred_fills: Mutex<BTreeMap<Slot, ShredFill>>,
 
-    bundle_slots: Mutex<BTreeMap<Slot, BundleLanding>>,
+    block_heights: Mutex<BTreeMap<Slot, u64>>,
+
+    bundle_slots: Mutex<BTreeMap<Slot, Bundles>>,
 
     worker_timings: Mutex<VecDeque<WorkerTiming>>,
 
@@ -285,6 +263,26 @@ pub struct MetricsTap {
     xdp: Mutex<Option<XdpConfig>>,
 
     stake_in_gossip: Mutex<Option<StakeInGossip>>,
+
+    /// For points read after the fact: the counters as each step of point time began.
+    external: Mutex<ExternalSteps>,
+}
+
+/// The counters read for a moment of point time stand at most this long after it.
+pub const COUNTER_STEP_MILLIS: u64 = 200;
+/// A minute of point time.
+const COUNTER_STEPS: usize = 300;
+/// The point time [`COUNTER_STEPS`] cover. Points come in out of order by less than this.
+const COUNTER_STEPS_MILLIS: u64 = COUNTER_STEP_MILLIS.saturating_mul(COUNTER_STEPS as u64);
+
+/// Points read from the validator's metrics export reach the tap in batches, long after they were
+/// made, so the counters a reader wants for a moment are kept as each step of point time began.
+#[derive(Debug, Default)]
+struct ExternalSteps {
+    /// The newest point time read, in unix milliseconds.
+    through_millis: u64,
+    /// By the step's first millisecond: the counters before the first point made in it.
+    steps: VecDeque<(u64, TapCounters)>,
 }
 
 /// Where one of our leader slots' time went, merged from the reports that each carry part of it.
@@ -343,12 +341,22 @@ pub struct XdpConfig {
     pub kernel_version: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
 pub struct SlotWaterfall {
     pub slot: Slot,
     pub source: SchedulerSource,
     #[serde(flatten)]
     pub counts: SchedulerTotals,
+}
+
+/// What the cost update service reports of every frozen bank holding transactions, leader or not:
+/// the block figures a collector outside the validator cannot read off the bank.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct BankFigures {
+    pub block_cost: u64,
+    pub transactions: u64,
+    pub total_fees: u64,
+    pub priority_fees: u64,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
@@ -375,21 +383,11 @@ pub struct Recurrence {
 }
 
 /// Our leader slots' reports from the produced store's floor on, and which changed since taken.
-#[derive(Debug)]
+#[derive(Debug, Default)]
 struct HeldSlots<T> {
     held: BTreeMap<Slot, T>,
     changed: BTreeSet<Slot>,
     floor: Slot,
-}
-
-impl<T> Default for HeldSlots<T> {
-    fn default() -> Self {
-        Self {
-            held: BTreeMap::new(),
-            changed: BTreeSet::new(),
-            floor: 0,
-        }
-    }
 }
 
 impl<T: Clone> HeldSlots<T> {
@@ -401,10 +399,7 @@ impl<T: Clone> HeldSlots<T> {
         match self.held.get_mut(&slot) {
             Some(held) if replaces(held) => *held = value,
             Some(_) => return false,
-            None => {
-                self.held.insert(slot, value);
-                keep_newest(&mut self.held, MAX_HELD_SLOTS);
-            }
+            None => insert_capped(&mut self.held, slot, value, MAX_HELD_SLOTS),
         }
         self.changed.insert(slot);
         true
@@ -432,7 +427,6 @@ impl<T: Clone> HeldSlots<T> {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct ShredFill {
-    pub slot: Slot,
     pub shreds: u64,
     pub repaired: u64,
     /// Rebuilt here from erasure coding rather than received.
@@ -440,6 +434,16 @@ pub struct ShredFill {
     pub full_millis: u64,
     /// Unix nanoseconds when the block became full here, from the point's own clock.
     pub full_at_nanos: u64,
+}
+
+impl ShredFill {
+    /// The blockstore's stamp of the slot's first shred, which `full_millis` is counted from: the
+    /// fill is timed a few microseconds before its point, so this is the stamp or a millisecond
+    /// after it.
+    pub fn first_shred_millis(&self) -> Option<u64> {
+        (self.full_at_nanos > 0)
+            .then(|| (self.full_at_nanos / 1_000_000).saturating_sub(self.full_millis))
+    }
 }
 
 /// Microseconds from a block's last shred to our notarize vote and to its finalization.
@@ -457,39 +461,6 @@ struct ClosedBlocks {
     waiting: BTreeMap<Slot, u64>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
-pub struct StageTimes {
-    pub cost_model: u64,
-    pub load_execute: u64,
-    pub freeze_lock: u64,
-    pub record: u64,
-    pub commit: u64,
-    pub send_votes: u64,
-}
-
-impl StageTimes {
-    fn add(&mut self, other: &StageTimes) {
-        self.cost_model = self.cost_model.saturating_add(other.cost_model);
-        self.load_execute = self.load_execute.saturating_add(other.load_execute);
-        self.freeze_lock = self.freeze_lock.saturating_add(other.freeze_lock);
-        self.record = self.record.saturating_add(other.record);
-        self.commit = self.commit.saturating_add(other.commit);
-        self.send_votes = self.send_votes.saturating_add(other.send_votes);
-    }
-
-    fn field(&mut self, name: &str) -> Option<&mut u64> {
-        Some(match name {
-            "cost_model_us" => &mut self.cost_model,
-            "load_execute_us" => &mut self.load_execute,
-            "freeze_lock_us" => &mut self.freeze_lock,
-            "record_us" => &mut self.record,
-            "commit_us" => &mut self.commit,
-            "find_and_send_votes_us" => &mut self.send_votes,
-            _ => return None,
-        })
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct WorkerTiming {
     at_millis: u64,
@@ -505,53 +476,6 @@ pub struct WorkerSum {
     pub longest_batch: u64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct BundleLanding {
-    pub slot: Slot,
-    pub sanitized: u64,
-    pub executed: u64,
-}
-
-/// One replayed slot's timings, in microseconds: `fetch`, `confirming` and `completing` are
-/// disjoint on replay's thread, the verify fields overlap, and the rest is worker thread time.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct ReplaySlotTimes {
-    pub slot: Slot,
-    // Replay's own thread, sequential.
-    pub fetch: u64,
-    pub confirming: u64,
-    pub completing: u64,
-
-    // Verification jobs, concurrent. Relative only.
-    pub poh_verify: u64,
-    pub tx_verify: u64,
-    pub dispatch: u64,
-
-    // Thread time across the workers.
-    pub execute: u64,
-    pub bytecode: u64,
-    pub serialising: u64,
-    pub deserialising: u64,
-    pub load: u64,
-    pub store: u64,
-    pub program_cache: u64,
-    pub compiling: u64,
-    pub checking: u64,
-    pub other: u64,
-
-    pub transactions: u64,
-
-    pub observed_millis: u64,
-}
-
-impl ReplaySlotTimes {
-    pub fn serial(&self) -> u64 {
-        self.fetch
-            .saturating_add(self.confirming)
-            .saturating_add(self.completing)
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum SchedulerSource {
@@ -562,9 +486,8 @@ pub enum SchedulerSource {
 }
 
 fn scheduler_source(point: &DataPoint) -> SchedulerSource {
-    match point.tags.iter().find(|(name, _)| *name == SCHEDULER_ID) {
-        None => SchedulerSource::Scheduler,
-        Some((_, id)) if id == OWN_SCHEDULER_ID => SchedulerSource::Scheduler,
+    match tag_named(point, SCHEDULER_ID) {
+        None | Some(OWN_SCHEDULER_ID) => SchedulerSource::Scheduler,
         Some(_) => SchedulerSource::Bam,
     }
 }
@@ -580,12 +503,13 @@ pub trait WindowedCounters: Copy + Default {
 }
 
 /// Declares a set's totals and their window arithmetic from one field list, so no field can be
-/// left out of the arithmetic and read nought for ever.
+/// left out of the arithmetic and read nought for ever. A field given names adds in the point
+/// fields of those names.
 macro_rules! counter_totals {
     (
         $(#[$meta:meta])*
         pub struct $totals:ident {
-            $($(#[$field_meta:meta])* pub $field:ident: u64,)*
+            $($(#[$field_meta:meta])* pub $field:ident: u64 $(= $($name:literal)|+)?,)*
         }
     ) => {
         $(#[$meta])*
@@ -608,34 +532,196 @@ macro_rules! counter_totals {
                 }
             }
         }
+
+        impl $totals {
+            /// The counter the point field `name` adds into.
+            fn counter(&mut self, name: &str) -> Option<&mut u64> {
+                match name {
+                    $($($($name)|+ => Some(&mut self.$field),)?)*
+                    _ => None,
+                }
+            }
+        }
+
+        impl AddPoint for $totals {
+            fn add_point(&mut self, point: &DataPoint) {
+                for (name, value) in &point.fields {
+                    if let Some(counter) = self.counter(name) {
+                        add_value(counter, value);
+                    }
+                }
+            }
+        }
     };
+}
+
+counter_totals! {
+    pub struct StageTimes {
+        pub cost_model: u64 = "cost_model_us",
+        pub load_execute: u64 = "load_execute_us",
+        pub freeze_lock: u64 = "freeze_lock_us",
+        pub record: u64 = "record_us",
+        pub commit: u64 = "commit_us",
+        pub send_votes: u64 = "find_and_send_votes_us",
+    }
+}
+
+counter_totals! {
+    /// Bundles sanitized and landed in a block of ours.
+    pub struct Bundles {
+        pub sanitized: u64 = "num_sanitized_ok",
+        pub executed: u64 = "execution_results_ok",
+    }
+}
+
+counter_totals! {
+    /// One replayed slot's timings, in microseconds: `fetch`, `confirming` and `completing` are
+    /// disjoint on replay's thread, the verify fields overlap, and the rest is worker thread time.
+    pub struct ReplaySlotTimes {
+        pub slot: u64,
+        // Replay's own thread, sequential.
+        pub fetch: u64 = "fetch_entries_time",
+        /// The second name, as on `dispatch`, is sent when a block's footer already collected the
+        /// scheduler's results, as every alpenglow block does; the values are the same.
+        pub confirming: u64 = "confirmation_without_replay_us" | "confirmation_time_us",
+        pub completing: u64 = "bank_complete_time_us",
+
+        // Verification jobs, concurrent. Relative only.
+        pub poh_verify: u64 = "entry_poh_verification_time",
+        pub tx_verify: u64 = "entry_transaction_verification_time",
+        pub dispatch: u64 = "task_submission_us" | "replay_time",
+
+        // Thread time across the workers.
+        pub execute: u64 = "execute_us",
+        pub bytecode: u64 = "execute_details_execute_inner_us",
+        pub serialising: u64 = "execute_details_serialize_us",
+        pub deserialising: u64 = "execute_details_deserialize_us",
+        pub load: u64 = "load_us",
+        pub store: u64 = "store_us",
+        pub program_cache: u64 = "program_cache_us",
+        /// Compiling a program that was not in the cache, summed: what a miss cost, not which
+        /// third of the compiler it went to.
+        pub compiling: u64 = "execute_details_create_executor_load_elf_us"
+            | "execute_details_create_executor_verify_code_us"
+            | "execute_details_create_executor_jit_compile_us",
+        pub checking: u64 = "validate_transactions_us"
+            | "validate_fees_us"
+            | "filter_executable_us",
+        pub other: u64 = "collect_balances_us"
+            | "collect_logs_us"
+            | "update_stakes_cache_us"
+            | "update_transaction_statuses"
+            | "check_block_limits_us",
+
+        pub transactions: u64 = "total_transactions",
+        /// Every entry replay ran through, ticks included.
+        pub entries: u64 = "total_entries",
+
+        pub observed_millis: u64,
+    }
+}
+
+impl ReplaySlotTimes {
+    pub fn serial(&self) -> u64 {
+        self.fetch
+            .saturating_add(self.confirming)
+            .saturating_add(self.completing)
+    }
+}
+
+counter_totals! {
+    /// The packets each receiver handed on, turbine's shreds by layer, and what gossip and repair
+    /// sent. Receivers share field names, so only the layers are read by name alone.
+    pub struct NetworkTotals {
+        pub shreds_turbine: u64,
+        pub shreds_repair: u64,
+        pub packets_gossip: u64,
+        pub packets_tpu_vote: u64,
+        pub turbine_root: u64 = "num_shreds_received_root",
+        pub turbine_layer_1: u64 = "num_shreds_received_1st_layer",
+        pub turbine_layer_2: u64 = "num_shreds_received_2nd_layer",
+        pub turbine_layer_3: u64 = "num_shreds_received_3rd_layer",
+        pub xdp_dropped: u64,
+        pub gossip_sent_bytes: u64,
+        pub gossip_sent_millis: u64,
+        pub repair_sent_bytes: u64,
+        pub repair_sent_millis: u64,
+    }
 }
 
 counter_totals! {
     /// Reads are counted in accounts, since nothing on the load path counts bytes.
     pub struct AccountsTotals {
-        pub loaded_from_write_cache: u64,
-        pub loaded_from_read_cache: u64,
-        pub loaded_from_storage: u64,
-        pub stored_accounts: u64,
-        pub stored_bytes: u64,
+        pub loaded_from_write_cache: u64 = "num_loaded_from_write_cache",
+        pub loaded_from_read_cache: u64 = "num_loaded_from_read_cache",
+        pub loaded_from_storage: u64 = "num_loaded_from_index_storage",
+        pub stored_accounts: u64 = "num_accounts_stored",
+        pub stored_bytes: u64 = "account_bytes_stored",
+        pub cache_hits: u64 = "read_only_accounts_cache_hits",
+        pub cache_misses: u64 = "read_only_accounts_cache_misses",
+        pub cache_evicts: u64 = "read_only_accounts_cache_evicts",
     }
 }
 
 /// Levels. The difference between the two storage figures is what shrink reclaims.
-#[derive(Debug, Clone, Copy, Default)]
-struct AccountsLevels {
-    storage_bytes: u64,
-    storage_alive_bytes: u64,
-    storage_count: u64,
-    cache_bytes: u64,
-    cache_entries: u64,
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AccountsLevels {
+    pub storage_bytes: u64,
+    pub storage_alive_bytes: u64,
+    pub storage_count: u64,
+    pub cache_bytes: u64,
+    pub cache_entries: u64,
 }
 
-#[derive(Debug, Clone, Copy, Default)]
-struct AccountsSet {
-    totals: AccountsTotals,
-    levels: AccountsLevels,
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AccountsSet {
+    pub totals: AccountsTotals,
+    pub levels: AccountsLevels,
+}
+
+counter_totals! {
+    /// What the index was asked, and what clean and shrink did. The index reports every ten
+    /// seconds, clean once a run and shrink once a second.
+    pub struct AccountsUpkeepTotals {
+        pub index_found: u64,
+        /// With the index all in memory, lookups of accounts that do not exist.
+        pub index_missing: u64,
+        pub index_inserts: u64,
+        pub index_deletes: u64,
+        pub clean_runs: u64,
+        pub cleaned_slots: u64,
+        pub cleaned_accounts: u64,
+        pub shrunk_slots: u64,
+        pub shrunk_accounts: u64,
+        /// Dead bytes dropped, and live bytes written again to drop them.
+        pub shrunk_bytes: u64,
+        pub rewritten_bytes: u64,
+        /// How long each job ran, counted as it ends.
+        pub clean_micros: u64,
+        pub shrink_micros: u64,
+        pub flush_micros: u64,
+    }
+}
+
+/// Levels, as last reported.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+pub struct AccountsUpkeepLevels {
+    pub index_entries: u64,
+    /// The slots of the index's hash maps, which is what its memory follows.
+    pub index_capacity: u64,
+    pub index_bytes: u64,
+    pub write_cache_bytes: u64,
+    pub write_cache_slots: u64,
+    pub write_cache_accounts: u64,
+    pub cleaned_to: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AccountsUpkeep {
+    pub totals: AccountsUpkeepTotals,
+    pub levels: AccountsUpkeepLevels,
+    /// When the clean, shrink and flush now running began.
+    began: [Option<SystemTime>; 3],
 }
 
 /// Sizes the validator's parts report of themselves; `None` until first reported.
@@ -688,25 +774,25 @@ struct MemorySet {
 
 counter_totals! {
     pub struct ProgramCacheTotals {
-        pub hits: u64,
-        pub misses: u64,
-        pub evictions: u64,
-        pub reloads: u64,
-        pub insertions: u64,
-        pub lost_insertions: u64,
-        pub replacements: u64,
-        pub one_hit_wonders: u64,
-        pub prunes_orphan: u64,
-        pub prunes_environment: u64,
+        pub hits: u64 = "hits",
+        pub misses: u64 = "misses",
+        pub evictions: u64 = "evictions",
+        pub reloads: u64 = "reloads",
+        pub insertions: u64 = "insertions",
+        pub lost_insertions: u64 = "lost_insertions",
+        pub replacements: u64 = "replace_entry",
+        pub one_hit_wonders: u64 = "one_hit_wonders",
+        pub prunes_orphan: u64 = "prunes_orphan",
+        pub prunes_environment: u64 = "prunes_environment",
     }
 }
 
-#[derive(Debug, Clone, Copy, Default)]
-struct ProgramCacheSet {
-    totals: ProgramCacheTotals,
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ProgramCacheSet {
+    pub totals: ProgramCacheTotals,
     /// Entries loaded when an eviction last ran, reset with each bank, so the panel takes the
     /// window's peak.
-    water_level: u64,
+    pub water_level: u64,
 }
 
 counter_totals! {
@@ -715,29 +801,31 @@ counter_totals! {
     pub struct QuicTotals {
         /// Cumulative on the wire; the denominator for the rest.
         pub offered: u64,
-        pub shed_all: u64,
-        pub shed_address: u64,
-        pub refused_full: u64,
-        pub handshake_timeout: u64,
-        pub handshake_error: u64,
-        pub handshook: u64,
+        pub shed_all: u64 = "connection_rate_limited_across_all",
+        pub shed_address: u64 = "connection_rate_limited_per_ipaddr",
+        pub refused_full: u64 = "refused_connections_too_many_open_connections",
+        pub handshake_timeout: u64 = "connection_setup_timeout",
+        pub handshake_error: u64 = "connection_setup_error",
+        pub handshook: u64 = "new_connections",
         /// Four overlapping counters for one event, never summed; see `refusedTable` in `tpuPath.ts`.
-        pub add_failed: u64,
-        pub add_failed_staked: u64,
-        pub add_failed_unstaked: u64,
-        pub add_failed_banned: u64,
-        pub admitted_staked: u64,
-        pub admitted_unstaked: u64,
-        pub streams: u64,
-        pub throttled_staked: u64,
-        pub throttled_unstaked: u64,
-        pub read_timeouts: u64,
-        pub read_errors: u64,
-        pub invalid_size: u64,
-        pub handed_on: u64,
+        pub add_failed: u64 = "connection_add_failed",
+        /// `connection_add_failed_on_pruning` is raised on the same refusal and would count one
+        /// event twice.
+        pub add_failed_staked: u64 = "connection_add_failed_staked_node",
+        pub add_failed_unstaked: u64 = "connection_add_failed_unstaked_node",
+        pub add_failed_banned: u64 = "connection_add_failed_banned",
+        pub admitted_staked: u64 = "connection_added_from_staked_peer",
+        pub admitted_unstaked: u64 = "connection_added_from_unstaked_peer",
+        pub streams: u64 = "new_streams",
+        pub throttled_staked: u64 = "throttled_staked_streams",
+        pub throttled_unstaked: u64 = "throttled_unstaked_streams",
+        pub read_timeouts: u64 = "stream_read_timeouts",
+        pub read_errors: u64 = "stream_read_errors",
+        pub invalid_size: u64 = "invalid_stream_size",
+        pub handed_on: u64 = "packets_sent_to_consumer",
         /// The one row here meaning this validator could not keep up.
-        pub queue_full: u64,
-        pub disconnected: u64,
+        pub queue_full: u64 = "total_handle_chunk_to_packet_send_full_err",
+        pub disconnected: u64 = "total_handle_chunk_to_packet_send_disconnected_err",
     }
 }
 
@@ -749,89 +837,91 @@ pub struct QuicLevels {
 }
 
 /// One QUIC port: who was let in, what they sent, and what got through.
-#[derive(Debug, Clone, Copy, Default)]
-struct QuicSet {
-    totals: QuicTotals,
-    levels: QuicLevels,
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct QuicSet {
+    pub totals: QuicTotals,
+    pub levels: QuicLevels,
 }
 
 counter_totals! {
     pub struct BundleTotals {
-        pub received: u64,
-        pub packets: u64,
+        pub received: u64 = "num_bundles_received",
+        pub packets: u64 = "num_packets_received",
     }
 }
 
 counter_totals! {
     pub struct VerifyTotals {
-        pub received: u64,
+        pub received: u64 = "total_packets",
         /// Ordinary: the network sends transactions more than once.
-        pub duplicate: u64,
-        pub below_floor: u64,
-        pub verified: u64,
+        pub duplicate: u64 = "total_dedup",
+        pub below_floor: u64 = "total_dropped_below_priority_floor",
+        pub verified: u64 = "total_valid_packets",
         /// Batches, not transactions, so never added to a packet count.
-        pub evicted_batches: u64,
+        pub evicted_batches: u64 = "eviction_drops",
     }
 }
 
 counter_totals! {
+    /// `max_queue_len` is a gauge, `num_messages_processed` counts batches, and `total` sums
+    /// errors drawn elsewhere, so none is read.
     pub struct ExecutedTotals {
-        pub attempted: u64,
-        pub cost_throttled: u64,
-        pub retryable: u64,
-        pub expired_bank: u64,
-        pub processed: u64,
+        pub attempted: u64 = "transactions_attempted_processing_count",
+        pub cost_throttled: u64 = "cost_model_throttled_transactions_count",
+        pub retryable: u64 = "retryable_transaction_count",
+        pub expired_bank: u64 = "retryable_expired_bank_count",
+        pub processed: u64 = "processed_transactions_count",
         /// The rest landed having failed, which still costs their fee.
-        pub succeeded: u64,
+        pub succeeded: u64 = "processed_with_successful_result_count",
 
-        pub too_many_locks: u64,
-        pub account_missing: u64,
-        pub fee_payer_broke: u64,
-        pub fee_payer_invalid: u64,
-        pub blockhash_missing: u64,
-        pub blockhash_old: u64,
-        pub already_processed: u64,
-        pub bad_compute_budget: u64,
-        pub account_data_too_large: u64,
-        pub program_not_executable: u64,
-        pub program_restricted: u64,
+        // From the error point beside it. No name is shared with the counts point, so both are
+        // read here.
+        pub too_many_locks: u64 = "too_many_account_locks",
+        pub account_missing: u64 = "account_not_found",
+        pub fee_payer_broke: u64 = "insufficient_funds",
+        pub fee_payer_invalid: u64 = "invalid_account_for_fee",
+        pub blockhash_missing: u64 = "blockhash_not_found",
+        pub blockhash_old: u64 = "blockhash_too_old",
+        pub already_processed: u64 = "already_processed",
+        pub bad_compute_budget: u64 = "invalid_compute_budget",
+        pub program_not_executable: u64 = "invalid_program_for_execution",
     }
 }
 
 counter_totals! {
     pub struct SchedulerTotals {
-        pub received: u64,
+        pub received: u64 = "num_received",
 
         // Lost at the door, before ever being buffered.
         /// Not held because the validator was forwarding rather than buffering.
-        pub not_held: u64,
-        pub check_queue_full: u64,
-        pub unparsable: u64,
-        pub bad_locks: u64,
-        pub compute_budget: u64,
-        pub too_old: u64,
-        pub already_processed: u64,
-        pub fee_payer: u64,
-        pub filtered: u64,
-        pub nonce_conflict: u64,
+        pub not_held: u64 = "num_dropped_on_receive",
+        pub check_queue_full: u64 = "num_dropped_on_check_work_queue_full",
+        pub unparsable: u64 = "num_dropped_on_parsing_and_sanitization",
+        pub bad_locks: u64 = "num_dropped_on_validate_locks",
+        pub compute_budget: u64 = "num_dropped_on_receive_compute_budget",
+        pub too_old: u64 = "num_dropped_on_receive_age",
+        pub already_processed: u64 = "num_dropped_on_receive_already_processed",
+        pub fee_payer: u64 = "num_dropped_on_receive_fee_payer",
+        pub filtered: u64 = "num_dropped_on_filter_key",
+        pub nonce_conflict: u64 = "num_dropped_on_nonce_dedup",
 
-        pub buffered: u64,
+        pub buffered: u64 = "num_buffered",
 
         // Lost from the container, after being buffered.
         /// Pushed out by something of higher priority when the queue was full.
-        pub queue_full: u64,
-        pub nonce_evicted: u64,
-        pub cleared: u64,
-        pub cleaned: u64,
+        pub queue_full: u64 = "num_dropped_on_capacity",
+        pub nonce_evicted: u64 = "num_evicted_on_nonce_dedup",
+        pub cleared: u64 = "num_dropped_on_clear",
+        pub cleaned: u64 = "num_dropped_on_clean",
 
-        pub scheduled: u64,
+        pub scheduled: u64 = "num_scheduled",
         /// Held back this pass for account conflicts or busy workers. Pressure, not
         /// losses.
-        pub blocked_conflicts: u64,
-        pub blocked_threads: u64,
+        pub blocked_conflicts: u64 = "num_unschedulable_conflicts",
+        pub blocked_threads: u64 = "num_unschedulable_threads",
 
-        pub finished: u64,
-        pub retried: u64,
+        pub finished: u64 = "num_finished",
+        pub retried: u64 = "num_retryable",
     }
 }
 
@@ -839,52 +929,52 @@ counter_totals! {
     /// Messages are counted in packets and the rest in entries; the times are in microseconds.
     pub struct GossipTotals {
         /// Every packet read off gossip's sockets, before any check.
-        pub received: u64,
-        pub received_push: u64,
-        pub received_pull_requests: u64,
-        pub received_pull_responses: u64,
-        pub received_ping: u64,
-        pub received_pong: u64,
-        pub received_prune: u64,
-        pub sent_push: u64,
-        pub sent_pull_requests: u64,
-        pub sent_pull_responses: u64,
-        pub sent_ping: u64,
-        pub sent_pong: u64,
-        pub sent_prune: u64,
+        pub received: u64 = "packets_received_count",
+        pub received_push: u64 = "packets_received_push_messages_count",
+        pub received_pull_requests: u64 = "packets_received_pull_requests_count",
+        pub received_pull_responses: u64 = "packets_received_pull_responses_count",
+        pub received_ping: u64 = "packets_received_ping_messages_count",
+        pub received_pong: u64 = "packets_received_pong_messages_count",
+        pub received_prune: u64 = "packets_received_prune_messages_count",
+        pub sent_push: u64 = "packets_sent_push_messages_count",
+        pub sent_pull_requests: u64 = "packets_sent_pull_requests_count",
+        pub sent_pull_responses: u64 = "packets_sent_pull_responses_count",
+        pub sent_ping: u64 = "packets_sent_ping_messages_count",
+        pub sent_pong: u64 = "packets_sent_pong_messages_count",
+        pub sent_prune: u64 = "packets_sent_prune_messages_count",
 
         pub accepted_push: u64,
         pub accepted_pull: u64,
         pub rejected_push: u64,
         pub rejected_pull: u64,
-        pub duplicate_push: u64,
-        pub redundant_pull: u64,
+        pub duplicate_push: u64 = "num_duplicate_push_messages",
+        pub redundant_pull: u64 = "num_redundant_pull_responses",
         /// Timed out of the table.
-        pub expired: u64,
+        pub expired: u64 = "purge_count",
         /// Trimmed once the table held more distinct pubkeys than it keeps.
-        pub evicted: u64,
+        pub evicted: u64 = "trim_crds_table_purged_values_count",
 
-        pub dropped_in: u64,
-        pub dropped_out: u64,
-        pub pull_no_budget: u64,
-        pub pull_scan_exhausted: u64,
-        pub other_shred_version_push: u64,
-        pub other_shred_version_pull_responses: u64,
-        pub other_shred_version_pull_requests: u64,
-        pub ping_check_failed: u64,
-        /// Values whose sender has not yet answered a ping.
-        pub unverified_addresses: u64,
-        pub bad_prune_destination: u64,
+        pub dropped_in: u64 = "gossip_packets_dropped_count",
+        pub dropped_out: u64 = "gossip_transmit_packets_dropped_count",
+        pub pull_no_budget: u64 = "gossip_pull_request_no_budget",
+        pub pull_scan_exhausted: u64 = "pull_request_scan_budget_exhausted",
+        pub other_shred_version_push: u64 = "skip_push_message_shred_version",
+        pub other_shred_version_pull_responses: u64 = "skip_pull_response_shred_version",
+        pub other_shred_version_pull_requests: u64 = "skip_pull_shred_version",
+        pub ping_check_failed: u64 = "pull_request_ping_pong_check_failed_count",
+        /// Values whose sender has not yet answered a ping. Gossip's own spelling.
+        pub unverified_addresses: u64 = "num_unverifed_gossip_addrs",
+        pub bad_prune_destination: u64 = "bad_prune_destination",
 
-        pub push_us: u64,
-        pub pull_requests_us: u64,
-        pub pull_responses_us: u64,
-        pub ping_us: u64,
-        pub pong_us: u64,
-        pub prune_us: u64,
-        pub verify_us: u64,
+        pub push_us: u64 = "handle_batch_push_messages_time",
+        pub pull_requests_us: u64 = "handle_batch_pull_requests_time",
+        pub pull_responses_us: u64 = "handle_batch_pull_responses_time",
+        pub ping_us: u64 = "handle_batch_ping_messages_time",
+        pub pong_us: u64 = "handle_batch_pong_messages_time",
+        pub prune_us: u64 = "handle_batch_prune_messages_time",
+        pub verify_us: u64 = "verify_gossip_packets_time",
         /// Includes the six handling times above.
-        pub process_us: u64,
+        pub process_us: u64 = "process_gossip_packets_time",
 
         /// Points of the first kind seen, so a quiet gossip can be told from a silent one.
         pub reports: u64,
@@ -931,102 +1021,95 @@ impl WindowedCounters for GossipEntryTotals {
     }
 }
 
-#[derive(Debug, Clone, Copy, Default)]
-struct GossipSet {
-    totals: GossipTotals,
-    levels: GossipLevels,
-    entries: GossipEntryTotals,
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct GossipSet {
+    pub totals: GossipTotals,
+    pub levels: GossipLevels,
+    pub entries: GossipEntryTotals,
 }
 
+/// Every set the points add into, under one lock so a reading is whole.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct TapCounters {
-    pub accounts_cache_hits: u64,
-    pub accounts_cache_misses: u64,
-    pub accounts_cache_evicts: u64,
-    pub shreds_turbine: u64,
-    pub shreds_repair: u64,
-    pub packets_gossip: u64,
-    pub packets_tpu_vote: u64,
-    pub votes_votor: u64,
-    pub turbine_root: u64,
-    pub turbine_layer_1: u64,
-    pub turbine_layer_2: u64,
-    pub turbine_layer_3: u64,
-    pub xdp_dropped: u64,
+    pub network: NetworkTotals,
+    /// The `is_xdp` tag retransmit last sent.
     pub retransmit_xdp: Option<bool>,
-    pub gossip_sent_bytes: u64,
-    pub gossip_sent_millis: u64,
-    pub repair_sent_bytes: u64,
-    pub repair_sent_millis: u64,
-    pub accounts: AccountsTotals,
-    pub accounts_storage_bytes: u64,
-    pub accounts_storage_alive_bytes: u64,
-    pub accounts_storage_count: u64,
-    pub accounts_cache_bytes: u64,
-    pub accounts_cache_entries: u64,
-    pub program_cache: ProgramCacheTotals,
-    pub program_cache_water_level: u64,
-    pub quic: QuicTotals,
-    pub quic_forwards: QuicTotals,
-    pub quic_vote: QuicTotals,
-    pub quic_levels: QuicLevels,
-    pub quic_forwards_levels: QuicLevels,
-    pub quic_vote_levels: QuicLevels,
+    pub accounts: AccountsSet,
+    pub accounts_upkeep: AccountsUpkeep,
+    pub program_cache: ProgramCacheSet,
+    pub quic: QuicSet,
+    pub quic_forwards: QuicSet,
+    pub quic_vote: QuicSet,
+    /// Separate sets, since the stages either side of the scheduler do not reconcile.
     pub verify: VerifyTotals,
     pub executed: ExecutedTotals,
     pub bundles: BundleTotals,
-    pub gossip: GossipTotals,
-    pub gossip_levels: GossipLevels,
-    pub gossip_entries: GossipEntryTotals,
+    pub gossip: GossipSet,
 }
 
 impl MetricsTap {
-    /// The first observer keeps the process's one slot; a second gets a tap that stays at zero.
-    pub fn install() -> Arc<Self> {
-        let tap = Arc::new(Self::default());
-        let observer = tap.clone();
-        if !solana_metrics::set_datapoint_observer(Box::new(move |point| {
-            observer.observe(point);
-        })) {
-            log::warn!("dashboard: something else is already watching metrics points");
-        }
-        tap
-    }
-
     #[cfg(test)]
     pub(crate) fn observe_point(&self, point: &DataPoint) {
-        self.observe(point);
+        self.observe_at(point, timestamp());
     }
 
-    fn observe(&self, point: &DataPoint) {
+    /// A point read from the validator's metrics export, after the fact: what the tap would stamp
+    /// with its arrival takes the point's own time instead.
+    pub fn observe_external(&self, point: &DataPoint) {
+        let at_millis = system_time_nanos(point.timestamp) / 1_000_000;
+        {
+            let mut external = locked(&self.external);
+            let step =
+                at_millis.saturating_sub(at_millis.checked_rem(COUNTER_STEP_MILLIS).unwrap_or(0));
+            // Further back than the steps reach: the validator's clock was set back, and the
+            // steps kept count time on the clock it left.
+            if external
+                .steps
+                .back()
+                .is_some_and(|(newest, _)| step.saturating_add(COUNTER_STEPS_MILLIS) < *newest)
+            {
+                external.steps.clear();
+                external.through_millis = 0;
+            }
+            if external
+                .steps
+                .back()
+                .is_none_or(|(newest, _)| step > *newest)
+            {
+                let counters = self.counters();
+                push_capped(&mut external.steps, (step, counters), COUNTER_STEPS);
+            }
+            external.through_millis = external.through_millis.max(at_millis);
+        }
+        self.observe_at(point, at_millis);
+    }
+
+    /// The newest point time read after the fact, in unix milliseconds.
+    pub fn points_through(&self) -> Option<u64> {
+        let through = locked(&self.external).through_millis;
+        (through > 0).then_some(through)
+    }
+
+    /// The counters as they stood at `at_millis` of point time, up to [`COUNTER_STEP_MILLIS`] later;
+    /// `None` until a point made after that has been read.
+    pub fn counters_at(&self, at_millis: u64) -> Option<TapCounters> {
+        locked(&self.external)
+            .steps
+            .iter()
+            .find(|(step, _)| *step > at_millis)
+            .map(|(_, counters)| *counters)
+    }
+
+    /// `now_millis` stands for when the point was made, which the arrival-stamped figures read.
+    fn observe_at(&self, point: &DataPoint, now_millis: u64) {
+        locked(&self.counters).add_point(point);
         match point.name {
-            ACCOUNTS_DB_TIMINGS => {
-                add_to(&self.accounts, point);
-                add_to(&self.memory, point);
-                for (name, value) in &point.fields {
-                    let counter = match *name {
-                        "read_only_accounts_cache_hits" => &self.accounts_cache_hits,
-                        "read_only_accounts_cache_misses" => &self.accounts_cache_misses,
-                        "read_only_accounts_cache_evicts" => &self.accounts_cache_evicts,
-                        _ => continue,
-                    };
-                    add_field(counter, value);
-                }
-            }
-            SHREDS_TURBINE => add_named(&self.shreds_turbine, point, PACKETS_COUNT),
-            SHREDS_REPAIR => add_named(&self.shreds_repair, point, PACKETS_COUNT),
-            GOSSIP_RECEIVER => add_named(&self.packets_gossip, point, PACKETS_COUNT),
-            TPU_VOTE_RECEIVER => add_named(&self.packets_tpu_vote, point, PACKETS_COUNT),
-            VOTOR_SERVER => add_named(&self.votes_votor, point, "datagrams_received"),
-            GOSSIP_SENDER => {
-                self.add_sent(&self.gossip_sent_bytes, &self.gossip_sent_millis, point)
-            }
-            REPAIR_SENDER => {
-                self.add_sent(&self.repair_sent_bytes, &self.repair_sent_millis, point)
+            ACCOUNTS_DB_TIMINGS | ACCOUNTS_INDEX | ACCOUNTS_WRITE_CACHE | BLOCKSTORE_CFS => {
+                locked(&self.memory).add_point(point)
             }
             SCHEDULER_SLOT_COUNTS => self.remember_slot(point),
-            REPLAY_SLOT_STATS => self.remember_replay(point),
-            VOTE_TRACKING => self.remember_vote_track(point),
+            REPLAY_SLOT_STATS => self.remember_replay(point, now_millis),
+            VOTE_TRACKING => self.remember_vote_track(point, now_millis),
             VOTE_ARRIVAL => self.remember_vote_arrival(point),
             LEADER_START | LEADER_BANK | BROADCAST_TRANSMIT | BROADCAST_PROCESS => {
                 self.remember_leader_timing(point)
@@ -1035,57 +1118,14 @@ impl MetricsTap {
                 self.remember_leader_timing(point)
             }
             SHRED_FULL => self.remember_fill(point),
+            NEW_BANK => self.remember_height(point),
             BUNDLE_SLOT_STATS => self.remember_bundles(point),
-            WORKER_TIMING => self.remember_worker_timing(point, timestamp()),
+            WORKER_TIMING => self.remember_worker_timing(point, now_millis),
             VOTE_SLOT_TIMING => self.remember_vote_timing(point),
             XDP_NETWORK_CONFIG => self.remember_xdp(point),
-            RETRANSMIT_STAGE => self.add_retransmit(point),
-            RETRANSMIT_SLOT_STATS => self.add_turbine_layers(point),
             WFSM_GOSSIP => self.remember_stake_in_gossip(point),
             COST_TRACKER => self.remember_cost(point),
-            ACCOUNTS_LOADS | ACCOUNTS_STORES | ACCOUNTS_FLUSH => add_to(&self.accounts, point),
-            ACCOUNTS_INDEX | ACCOUNTS_WRITE_CACHE | BLOCKSTORE_CFS => add_to(&self.memory, point),
-            PROGRAM_CACHE => add_to(&self.program_cache, point),
-            QUIC_TPU => add_to(&self.quic, point),
-            QUIC_TPU_FORWARDS => add_to(&self.quic_forwards, point),
-            QUIC_TPU_VOTE => add_to(&self.quic_vote, point),
-            TPU_VERIFIER => add_to(&self.verify, point),
-            BUNDLE_STAGE => add_to(&self.bundles, point),
-            WORKER_COUNTS | WORKER_ERROR_METRICS => add_to(&self.executed, point),
-            GOSSIP_ENTRIES | GOSSIP_ENTRY_FAILS => add_to(&self.gossip, point),
-            name if GOSSIP_STATS.contains(&name) => add_to(&self.gossip, point),
             _ => (),
-        }
-    }
-
-    fn add_retransmit(&self, point: &DataPoint) {
-        add_named(&self.xdp_dropped, point, "num_shreds_dropped_xdp_full");
-        if let Some((_, is_xdp)) = point.tags.iter().find(|(name, _)| *name == IS_XDP) {
-            let flag = if is_xdp == "true" { 2 } else { 1 };
-            self.retransmit_xdp.store(flag, Ordering::Relaxed);
-        }
-    }
-
-    fn add_turbine_layers(&self, point: &DataPoint) {
-        for (name, value) in &point.fields {
-            let counter = match *name {
-                "num_shreds_received_root" => &self.turbine_root,
-                "num_shreds_received_1st_layer" => &self.turbine_layer_1,
-                "num_shreds_received_2nd_layer" => &self.turbine_layer_2,
-                "num_shreds_received_3rd_layer" => &self.turbine_layer_3,
-                _ => continue,
-            };
-            add_field(counter, value);
-        }
-    }
-
-    fn add_sent(&self, bytes: &AtomicU64, millis: &AtomicU64, point: &DataPoint) {
-        for (name, value) in &point.fields {
-            match *name {
-                SENT_BYTES => add_field(bytes, value),
-                SENT_MILLIS => add_field(millis, value),
-                _ => (),
-            }
         }
     }
 
@@ -1119,15 +1159,11 @@ impl MetricsTap {
     /// `driver` and `zero_copy` are tags; an unparseable `zero_copy` reads as false.
     fn remember_xdp(&self, point: &DataPoint) {
         let tag = |wanted| tag_named(point, wanted);
-        let field = |wanted: &str| {
-            point
-                .fields
-                .iter()
-                .find(|(name, _)| *name == wanted)
-                .map(|(_, value)| field_str(value))
+        let field = |wanted| {
+            field_named(point, wanted)
+                .map(field_str)
                 .unwrap_or_default()
         };
-
         let config = XdpConfig {
             zero_copy: tag("zero_copy") == Some("true"),
             driver: tag("driver").unwrap_or_default().to_string(),
@@ -1196,24 +1232,19 @@ impl MetricsTap {
         arrivals.by_vote.insert(vote, arrival);
     }
 
-    fn remember_vote_track(&self, point: &DataPoint) {
+    fn remember_vote_track(&self, point: &DataPoint, now_millis: u64) {
         let field = |wanted| number_named(point, wanted);
         let Some(slot) = field(SLOT) else {
             return;
         };
         // Only a late fast certificate can make this read fast for a slot the second round
         // finalized, and the pool prunes a slot too soon after its root for that to be common.
-        let fast = point
-            .fields
-            .iter()
-            .find(|(name, _)| *name == "is_fast_finalization")
-            .map(|(_, value)| value == "true");
-        if let Some(fast) = fast {
-            let mut paths = locked(&self.finalized_paths);
-            paths.push_back((slot, fast));
-            if paths.len() > VOTE_TRACKS {
-                paths.pop_front();
-            }
+        if let Some(fast) = field_named(point, "is_fast_finalization") {
+            push_capped(
+                &mut locked(&self.finalized_paths),
+                (slot, fast == "true"),
+                VOTE_TRACKS,
+            );
         }
         let vote = VoteSent {
             first_shred_us: field("first_shred"),
@@ -1227,11 +1258,10 @@ impl MetricsTap {
                 first_shred_us,
                 field("finalized"),
                 vote.notarize_us,
+                now_millis,
             );
         }
-        let mut tracks = locked(&self.vote_tracks);
-        tracks.insert(slot, vote);
-        keep_newest(&mut tracks, VOTE_TRACKS);
+        insert_capped(&mut locked(&self.vote_tracks), slot, vote, VOTE_TRACKS);
     }
 
     /// Every time counts from votor's start on the slot, and the block's arrival from its first
@@ -1242,12 +1272,12 @@ impl MetricsTap {
         first_shred_us: u64,
         finalized_us: Option<u64>,
         notarize_us: Option<u64>,
+        now_millis: u64,
     ) {
         let Some(full_millis) = self.shred_fill(slot).map(|fill| fill.full_millis) else {
             return;
         };
         let last_shred_us = first_shred_us.saturating_add(full_millis.saturating_mul(1_000));
-        let now_millis = timestamp();
         let finalized = finalized_us.and_then(|at| at.checked_sub(last_shred_us));
         let vote = notarize_us.and_then(|at| at.checked_sub(last_shred_us));
         if let Some(micros) = finalized {
@@ -1257,23 +1287,18 @@ impl MetricsTap {
             self.vote_lag.push(now_millis, micros);
         }
         if vote.is_some() || finalized.is_some() {
-            let mut votes = locked(&self.block_votes);
-            votes.push_back(BlockVotes {
+            let votes = BlockVotes {
                 slot,
                 vote_us: vote,
                 finalized_us: finalized,
-            });
-            if votes.len() > VOTE_TRACKS {
-                votes.pop_front();
-            }
+            };
+            push_capped(&mut locked(&self.block_votes), votes, VOTE_TRACKS);
         }
     }
 
     /// Each slot's, once.
     pub fn take_block_votes(&self) -> Vec<BlockVotes> {
-        std::mem::take(&mut *locked(&self.block_votes))
-            .into_iter()
-            .collect()
+        Vec::from(std::mem::take(&mut *locked(&self.block_votes)))
     }
 
     /// The median time from the leader closing a block to its finalization here, over the window.
@@ -1284,8 +1309,7 @@ impl MetricsTap {
     /// The footer's producer clock for `slot`, from the certificate walk.
     pub fn note_block_closed(&self, slot: Slot, closed_at_nanos: u64) {
         let mut closed = locked(&self.closed_blocks);
-        closed.closed_at.insert(slot, closed_at_nanos);
-        keep_newest(&mut closed.closed_at, SHRED_FILLS);
+        insert_capped(&mut closed.closed_at, slot, closed_at_nanos, SHRED_FILLS);
         let waiting = closed.waiting.remove(&slot);
         drop(closed);
         if let Some(finality_us) = waiting {
@@ -1297,8 +1321,7 @@ impl MetricsTap {
     fn time_from_leader(&self, slot: Slot, finality_us: u64, now_millis: u64) {
         let mut closed = locked(&self.closed_blocks);
         let Some(&closed_at_nanos) = closed.closed_at.get(&slot) else {
-            closed.waiting.insert(slot, finality_us);
-            keep_newest(&mut closed.waiting, SHRED_FILLS);
+            insert_capped(&mut closed.waiting, slot, finality_us, SHRED_FILLS);
             return;
         };
         drop(closed);
@@ -1336,9 +1359,7 @@ impl MetricsTap {
     }
 
     pub fn take_finalized_paths(&self) -> Vec<(Slot, bool)> {
-        std::mem::take(&mut *locked(&self.finalized_paths))
-            .into_iter()
-            .collect()
+        Vec::from(std::mem::take(&mut *locked(&self.finalized_paths)))
     }
 
     pub fn take_vote_tracks(&self) -> Vec<(Slot, VoteSent)> {
@@ -1347,57 +1368,19 @@ impl MetricsTap {
             .collect()
     }
 
-    fn remember_replay(&self, point: &DataPoint) {
-        let mut slot = ReplaySlotTimes::default();
+    /// The first `slot` field stands: the loop reads only fields that name a counter.
+    fn remember_replay(&self, point: &DataPoint, now_millis: u64) {
+        let mut slot = ReplaySlotTimes {
+            slot: number_named(point, SLOT).unwrap_or(0),
+            observed_millis: now_millis,
+            ..ReplaySlotTimes::default()
+        };
         let mut seen = false;
         for (name, value) in &point.fields {
-            let Some(micros) = field_u64(value) else {
-                continue;
-            };
-            if *name == SLOT {
-                slot.slot = micros;
-                continue;
+            if let (Some(counter), Some(micros)) = (slot.counter(name), field_u64(value)) {
+                *counter = counter.saturating_add(micros);
+                seen = true;
             }
-            let field = match *name {
-                "fetch_entries_time" => &mut slot.fetch,
-                // The second spellings are sent when a block's footer already collected the
-                // scheduler's results, as every alpenglow block does; the values are the same.
-                "confirmation_without_replay_us" | "confirmation_time_us" => &mut slot.confirming,
-                "bank_complete_time_us" => &mut slot.completing,
-
-                "entry_poh_verification_time" => &mut slot.poh_verify,
-                "entry_transaction_verification_time" => &mut slot.tx_verify,
-                "task_submission_us" | "replay_time" => &mut slot.dispatch,
-
-                "execute_us" => &mut slot.execute,
-                "execute_details_execute_inner_us" => &mut slot.bytecode,
-                "execute_details_serialize_us" => &mut slot.serialising,
-                "execute_details_deserialize_us" => &mut slot.deserialising,
-                "load_us" => &mut slot.load,
-                "store_us" => &mut slot.store,
-                "program_cache_us" => &mut slot.program_cache,
-                "total_transactions" => &mut slot.transactions,
-
-                // Compiling a program that was not in the cache, summed: what a miss cost,
-                // not which third of the compiler it went to.
-                "execute_details_create_executor_load_elf_us"
-                | "execute_details_create_executor_verify_code_us"
-                | "execute_details_create_executor_jit_compile_us" => &mut slot.compiling,
-
-                "validate_transactions_us" | "validate_fees_us" | "filter_executable_us" => {
-                    &mut slot.checking
-                }
-
-                "collect_balances_us"
-                | "collect_logs_us"
-                | "update_stakes_cache_us"
-                | "update_transaction_statuses"
-                | "check_block_limits_us" => &mut slot.other,
-
-                _ => continue,
-            };
-            *field = field.saturating_add(micros);
-            seen = true;
         }
 
         // A point naming nothing read here would drag every mean towards nought.
@@ -1405,163 +1388,105 @@ impl MetricsTap {
             return;
         }
 
-        slot.observed_millis = timestamp();
-        let mut slots = locked(&self.replay_slots);
         // A slot replayed twice keeps the later report. Bounded from the lowest
         // slot, which is the oldest during ordinary running.
-        slots.insert(slot.slot, slot);
-        keep_newest(&mut slots, REPLAY_SLOTS);
+        insert_capped(
+            &mut locked(&self.replay_slots),
+            slot.slot,
+            slot,
+            REPLAY_SLOTS,
+        );
     }
 
     /// The -1 the blockstore sends for an unknown last index drops the point.
     fn remember_fill(&self, point: &DataPoint) {
-        let mut fill = ShredFill {
-            full_at_nanos: point
-                .timestamp
-                .duration_since(UNIX_EPOCH)
-                .ok()
-                .and_then(|since| u64::try_from(since.as_nanos()).ok())
-                .unwrap_or_default(),
-            ..ShredFill::default()
-        };
-        let mut slot = None;
-        let mut last_index = None;
-        for (name, value) in &point.fields {
-            let Some(number) = field_u64(value) else {
-                continue;
-            };
-            match *name {
-                SLOT => slot = Some(number),
-                "last_index" => last_index = Some(number),
-                "num_repaired" => fill.repaired = number,
-                "num_recovered" => fill.recovered = number,
-                "total_time_ms" => fill.full_millis = number,
-                _ => (),
-            }
-        }
-        let (Some(slot), Some(last_index)) = (slot, last_index) else {
+        let field = |wanted| number_named(point, wanted);
+        let (Some(slot), Some(last_index)) = (field(SLOT), field("last_index")) else {
             return;
         };
-        fill.slot = slot;
-        fill.shreds = last_index.saturating_add(1);
+        let fill = ShredFill {
+            shreds: last_index.saturating_add(1),
+            repaired: field("num_repaired").unwrap_or(0),
+            recovered: field("num_recovered").unwrap_or(0),
+            full_millis: field("total_time_ms").unwrap_or(0),
+            full_at_nanos: system_time_nanos(point.timestamp),
+        };
+        insert_capped(&mut locked(&self.shred_fills), slot, fill, SHRED_FILLS);
+    }
 
-        let mut fills = locked(&self.shred_fills);
-        fills.insert(slot, fill);
-        keep_newest(&mut fills, SHRED_FILLS);
+    fn remember_height(&self, point: &DataPoint) {
+        let field = |wanted| number_named(point, wanted);
+        if let (Some(slot), Some(height)) = (field(SLOT), field("block_height")) {
+            insert_capped(
+                &mut locked(&self.block_heights),
+                slot,
+                height,
+                BLOCK_HEIGHTS,
+            );
+        }
     }
 
     fn remember_worker_timing(&self, point: &DataPoint, at_millis: u64) {
         let mut times = StageTimes::default();
-        let mut longest_batch = 0;
-        for (name, value) in &point.fields {
-            let Some(micros) = field_u64(value) else {
-                continue;
-            };
-            if *name == "load_execute_us_max" {
-                longest_batch = micros;
-            } else if let Some(field) = times.field(name) {
-                *field = micros;
-            }
-        }
-        let worker = tag_named(point, WORKER_ID)
-            .and_then(|id| id.parse().ok())
-            .unwrap_or(u64::MAX);
-        let mut timings = locked(&self.worker_timings);
-        timings.push_back(WorkerTiming {
+        times.add_point(point);
+        let timing = WorkerTiming {
             at_millis,
-            worker,
+            worker: tag_named(point, WORKER_ID)
+                .and_then(|id| id.parse().ok())
+                .unwrap_or(u64::MAX),
             times,
-            longest_batch,
-        });
-        while timings.len() > WORKER_TIMINGS {
-            timings.pop_front();
-        }
+            longest_batch: number_named(point, "load_execute_us_max").unwrap_or(0),
+        };
+        push_capped(&mut locked(&self.worker_timings), timing, WORKER_TIMINGS);
     }
 
     fn remember_vote_timing(&self, point: &DataPoint) {
-        let mut times = StageTimes::default();
-        let mut slot = None;
-        for (name, value) in &point.fields {
-            let Some(micros) = field_u64(value) else {
-                continue;
-            };
-            if *name == SLOT {
-                slot = Some(micros);
-            } else if let Some(field) = times.field(name) {
-                *field = micros;
-            }
-        }
-        let Some(slot) = slot else {
+        let Some(slot) = number_named(point, SLOT) else {
             return;
         };
-        let mut slots = locked(&self.vote_timings);
-        slots.insert(slot, times);
-        keep_newest(&mut slots, PENDING_SLOTS);
+        let mut times = StageTimes::default();
+        times.add_point(point);
+        insert_capped(&mut locked(&self.vote_timings), slot, times, PENDING_SLOTS);
     }
 
     fn remember_bundles(&self, point: &DataPoint) {
-        let mut slot = None;
-        let mut sanitized = 0;
-        let mut executed = 0;
-        for (name, value) in &point.fields {
-            let Some(number) = field_u64(value) else {
-                continue;
-            };
-            match *name {
-                SLOT => slot = Some(number),
-                "num_sanitized_ok" => sanitized = number,
-                "execution_results_ok" => executed = number,
-                _ => (),
-            }
-        }
-        let Some(slot) = slot else {
+        let Some(slot) = number_named(point, SLOT) else {
             return;
         };
-
         let mut slots = locked(&self.bundle_slots);
-        let landing = slots.entry(slot).or_insert(BundleLanding {
-            slot,
-            ..BundleLanding::default()
-        });
-        landing.sanitized = landing.sanitized.saturating_add(sanitized);
-        landing.executed = landing.executed.saturating_add(executed);
+        slots.entry(slot).or_default().add_point(point);
         keep_newest(&mut slots, PENDING_SLOTS);
     }
 
     fn remember_cost(&self, point: &DataPoint) {
-        let is_leader = point
-            .tags
-            .iter()
-            .any(|(name, value)| *name == IS_LEADER && value == "true");
-        if !is_leader {
-            return;
-        }
-
-        let mut slot = None;
-        let mut cost = SlotCost::default();
-        for (name, value) in &point.fields {
-            match *name {
-                "costliest_account" => cost.costliest_account = value.trim_matches('"').to_string(),
-                "bank_slot" => slot = field_u64(value),
-                "costliest_account_cost" => cost.costliest_cost = field_u64(value).unwrap_or(0),
-                "block_cost" => cost.block_cost = field_u64(value).unwrap_or(0),
-                "number_of_accounts" => cost.accounts = field_u64(value).unwrap_or(0),
-                "number_of_contended_accounts" => cost.contended = field_u64(value).unwrap_or(0),
-                "allocated_accounts_data_size" => {
-                    cost.new_account_data = field_u64(value).unwrap_or(0)
-                }
-                "inflight_transaction_count" => cost.in_flight = field_u64(value).unwrap_or(0),
-                _ => continue,
-            }
-        }
-
-        let Some(slot_number) = slot else {
+        let Some(slot) = number_named(point, "bank_slot") else {
             return;
         };
-        cost.slot = slot_number;
-
-        let mut costs = locked(&self.slot_costs);
-        if costs.put(slot_number, cost, |_| true) {
+        let field = |wanted| number_named(point, wanted).unwrap_or(0);
+        let figures = BankFigures {
+            block_cost: field("block_cost"),
+            transactions: field("transaction_count"),
+            total_fees: field("total_transaction_fee"),
+            priority_fees: field("total_priority_fee"),
+        };
+        insert_capped(&mut locked(&self.bank_figures), slot, figures, BANK_FIGURES);
+        if tag_named(point, IS_LEADER) != Some("true") {
+            return;
+        }
+        let cost = SlotCost {
+            slot,
+            costliest_account: field_named(point, "costliest_account")
+                .unwrap_or_default()
+                .trim_matches('"')
+                .to_string(),
+            costliest_cost: field("costliest_account_cost"),
+            block_cost: figures.block_cost,
+            accounts: field("number_of_accounts"),
+            contended: field("number_of_contended_accounts"),
+            new_account_data: field("allocated_accounts_data_size"),
+            in_flight: field("inflight_transaction_count"),
+        };
+        if locked(&self.slot_costs).put(slot, cost, |_| true) {
             self.note_slot_lists_changed();
         }
     }
@@ -1582,6 +1507,11 @@ impl MetricsTap {
 
     pub fn cost(&self, slot: Slot) -> Option<SlotCost> {
         locked(&self.slot_costs).held.get(&slot).cloned()
+    }
+
+    /// Reported shortly after the bank froze, and never for one without transactions.
+    pub fn bank_figures(&self, slot: Slot) -> Option<BankFigures> {
+        locked(&self.bank_figures).get(&slot).copied()
     }
 
     /// How often each of `accounts` was a held block's costliest, and its costliest block, in
@@ -1624,21 +1554,14 @@ impl MetricsTap {
     }
 
     fn remember_stake_in_gossip(&self, point: &DataPoint) {
-        let mut seen = StakeInGossip::default();
-        for (name, value) in &point.fields {
-            let Some(number) = field_u64(value) else {
-                continue;
-            };
-            match *name {
-                "online_stake" => seen.online = number,
-                "total_activated_stake" => seen.total = number,
-                _ => (),
-            }
+        let field = |wanted| number_named(point, wanted).unwrap_or(0);
+        let seen = StakeInGossip {
+            online: field("online_stake"),
+            total: field("total_activated_stake"),
+        };
+        if seen.total > 0 {
+            *locked(&self.stake_in_gossip) = Some(seen);
         }
-        if seen.total == 0 {
-            return;
-        }
-        *locked(&self.stake_in_gossip) = Some(seen);
     }
 
     pub fn stake_in_gossip(&self) -> Option<StakeInGossip> {
@@ -1675,7 +1598,7 @@ impl MetricsTap {
 
     /// `None` until the storages have reported.
     pub fn accounts_files(&self) -> Option<AccountsFiles> {
-        let levels = locked(&self.accounts).levels;
+        let levels = locked(&self.counters).accounts.levels;
         (levels.storage_bytes > 0).then_some(AccountsFiles {
             live: levels.storage_alive_bytes,
             fragmented: levels
@@ -1696,6 +1619,25 @@ impl MetricsTap {
         locked(&self.shred_fills).get(&slot).copied()
     }
 
+    /// `slot`'s block height: the newest bank on its chain the metrics reported, plus one for each
+    /// block after it, `parent` walking the chain down.
+    pub fn block_height(&self, slot: Slot, parent: impl Fn(Slot) -> Option<Slot>) -> Option<u64> {
+        let heights = locked(&self.block_heights);
+        let (mut at, mut above) = (slot, 0u64);
+        loop {
+            if let Some(height) = heights.get(&at) {
+                return height.checked_add(above);
+            }
+            at = parent(at).filter(|parent| *parent < at)?;
+            above = above.saturating_add(1);
+        }
+    }
+
+    /// The newest slot whose fill has been reported.
+    pub fn newest_fill(&self) -> Option<Slot> {
+        locked(&self.shred_fills).keys().next_back().copied()
+    }
+
     pub fn worker_time(&self, from: u64, to: u64) -> Option<WorkerSum> {
         let timings = locked(&self.worker_timings);
         let mut sum = WorkerSum::default();
@@ -1705,7 +1647,7 @@ impl MetricsTap {
             .range(first..)
             .take_while(|timing| timing.at_millis < to)
         {
-            sum.times.add(&timing.times);
+            sum.times = sum.times.plus(&timing.times);
             sum.longest_batch = sum.longest_batch.max(timing.longest_batch);
             workers.insert(timing.worker);
         }
@@ -1734,7 +1676,7 @@ impl MetricsTap {
         locked(&self.vote_timings).get(&slot).copied()
     }
 
-    pub fn bundles_landed(&self, slot: Slot) -> Option<BundleLanding> {
+    pub fn bundles_landed(&self, slot: Slot) -> Option<Bundles> {
         locked(&self.bundle_slots).get(&slot).copied()
     }
 
@@ -1767,58 +1709,7 @@ impl MetricsTap {
     }
 
     pub fn counters(&self) -> TapCounters {
-        let accounts = copy_of(&self.accounts);
-        let program_cache = copy_of(&self.program_cache);
-        let gossip = copy_of(&self.gossip);
-        let (quic, quic_forwards, quic_vote) = (
-            copy_of(&self.quic),
-            copy_of(&self.quic_forwards),
-            copy_of(&self.quic_vote),
-        );
-        TapCounters {
-            accounts_cache_hits: self.accounts_cache_hits.load(Ordering::Relaxed),
-            accounts_cache_misses: self.accounts_cache_misses.load(Ordering::Relaxed),
-            accounts_cache_evicts: self.accounts_cache_evicts.load(Ordering::Relaxed),
-            shreds_turbine: self.shreds_turbine.load(Ordering::Relaxed),
-            shreds_repair: self.shreds_repair.load(Ordering::Relaxed),
-            packets_gossip: self.packets_gossip.load(Ordering::Relaxed),
-            packets_tpu_vote: self.packets_tpu_vote.load(Ordering::Relaxed),
-            votes_votor: self.votes_votor.load(Ordering::Relaxed),
-            turbine_root: self.turbine_root.load(Ordering::Relaxed),
-            turbine_layer_1: self.turbine_layer_1.load(Ordering::Relaxed),
-            turbine_layer_2: self.turbine_layer_2.load(Ordering::Relaxed),
-            turbine_layer_3: self.turbine_layer_3.load(Ordering::Relaxed),
-            xdp_dropped: self.xdp_dropped.load(Ordering::Relaxed),
-            retransmit_xdp: match self.retransmit_xdp.load(Ordering::Relaxed) {
-                1 => Some(false),
-                2 => Some(true),
-                _ => None,
-            },
-            gossip_sent_bytes: self.gossip_sent_bytes.load(Ordering::Relaxed),
-            gossip_sent_millis: self.gossip_sent_millis.load(Ordering::Relaxed),
-            repair_sent_bytes: self.repair_sent_bytes.load(Ordering::Relaxed),
-            repair_sent_millis: self.repair_sent_millis.load(Ordering::Relaxed),
-            accounts: accounts.totals,
-            accounts_storage_bytes: accounts.levels.storage_bytes,
-            accounts_storage_alive_bytes: accounts.levels.storage_alive_bytes,
-            accounts_storage_count: accounts.levels.storage_count,
-            accounts_cache_bytes: accounts.levels.cache_bytes,
-            accounts_cache_entries: accounts.levels.cache_entries,
-            program_cache: program_cache.totals,
-            program_cache_water_level: program_cache.water_level,
-            quic: quic.totals,
-            quic_forwards: quic_forwards.totals,
-            quic_vote: quic_vote.totals,
-            quic_levels: quic.levels,
-            quic_forwards_levels: quic_forwards.levels,
-            quic_vote_levels: quic_vote.levels,
-            verify: copy_of(&self.verify),
-            bundles: copy_of(&self.bundles),
-            executed: copy_of(&self.executed),
-            gossip: gossip.totals,
-            gossip_levels: gossip.levels,
-            gossip_entries: gossip.entries,
-        }
+        *locked(&self.counters)
     }
 }
 
@@ -1827,16 +1718,117 @@ trait AddPoint {
     fn add_point(&mut self, point: &DataPoint);
 }
 
+impl AddPoint for TapCounters {
+    fn add_point(&mut self, point: &DataPoint) {
+        let network = &mut self.network;
+        match point.name {
+            SHREDS_TURBINE => add_named(&mut network.shreds_turbine, point, PACKETS_COUNT),
+            SHREDS_REPAIR => add_named(&mut network.shreds_repair, point, PACKETS_COUNT),
+            GOSSIP_RECEIVER => add_named(&mut network.packets_gossip, point, PACKETS_COUNT),
+            TPU_VOTE_RECEIVER => add_named(&mut network.packets_tpu_vote, point, PACKETS_COUNT),
+            GOSSIP_SENDER => {
+                add_named(&mut network.gossip_sent_bytes, point, SENT_BYTES);
+                add_named(&mut network.gossip_sent_millis, point, SENT_MILLIS);
+            }
+            REPAIR_SENDER => {
+                add_named(&mut network.repair_sent_bytes, point, SENT_BYTES);
+                add_named(&mut network.repair_sent_millis, point, SENT_MILLIS);
+            }
+            RETRANSMIT_STAGE => {
+                add_named(
+                    &mut network.xdp_dropped,
+                    point,
+                    "num_shreds_dropped_xdp_full",
+                );
+                if let Some(is_xdp) = tag_named(point, IS_XDP) {
+                    self.retransmit_xdp = Some(is_xdp == "true");
+                }
+            }
+            RETRANSMIT_SLOT_STATS => network.add_point(point),
+            ACCOUNTS_DB_TIMINGS | ACCOUNTS_LOADS | ACCOUNTS_STORES | ACCOUNTS_FLUSH => {
+                self.accounts.add_point(point)
+            }
+            ACCOUNTS_INDEX
+            | ACCOUNTS_WRITE_CACHE
+            | ACCOUNTS_CLEAN
+            | ACCOUNTS_SHRINK
+            | ACCOUNTS_SHRINK_ANCIENT
+            | ACCOUNTS_ACTIVE => self.accounts_upkeep.add_point(point),
+            PROGRAM_CACHE => {
+                self.program_cache.totals.add_point(point);
+                if let Some(level) = number_named(point, "water_level") {
+                    self.program_cache.water_level = level;
+                }
+            }
+            QUIC_TPU => self.quic.add_point(point),
+            QUIC_TPU_FORWARDS => self.quic_forwards.add_point(point),
+            QUIC_TPU_VOTE => self.quic_vote.add_point(point),
+            TPU_VERIFIER => self.verify.add_point(point),
+            BUNDLE_STAGE => self.bundles.add_point(point),
+            WORKER_COUNTS | WORKER_ERROR_METRICS => self.executed.add_point(point),
+            GOSSIP_ENTRIES | GOSSIP_ENTRY_FAILS => self.gossip.add_entries(point),
+            name if GOSSIP_STATS.contains(&name) => self.gossip.add_stats(point),
+            _ => (),
+        }
+    }
+}
+
 impl AddPoint for AccountsSet {
     fn add_point(&mut self, point: &DataPoint) {
-        let (totals, levels) = (&mut self.totals, &mut self.levels);
+        self.totals.add_point(point);
+        let levels = &mut self.levels;
         for (name, value) in &point.fields {
             let level = match *name {
-                "total_bytes" => Some(&mut levels.storage_bytes),
-                "total_alive_bytes" => Some(&mut levels.storage_alive_bytes),
-                "total_count" => Some(&mut levels.storage_count),
-                "read_only_accounts_cache_data_size" => Some(&mut levels.cache_bytes),
-                "read_only_accounts_cache_entries" => Some(&mut levels.cache_entries),
+                "total_bytes" => &mut levels.storage_bytes,
+                "total_alive_bytes" => &mut levels.storage_alive_bytes,
+                "total_count" => &mut levels.storage_count,
+                "read_only_accounts_cache_data_size" => &mut levels.cache_bytes,
+                "read_only_accounts_cache_entries" => &mut levels.cache_entries,
+                _ => continue,
+            };
+            set_value(level, value);
+        }
+    }
+}
+
+/// Matched by point as well as field: the two shrinks, clean and the flush share field names.
+impl AddPoint for AccountsUpkeep {
+    fn add_point(&mut self, point: &DataPoint) {
+        let (totals, levels) = (&mut self.totals, &mut self.levels);
+        if point.name == ACCOUNTS_CLEAN {
+            totals.clean_runs = totals.clean_runs.saturating_add(1);
+        }
+        for (name, value) in &point.fields {
+            if point.name == ACCOUNTS_ACTIVE {
+                let (began, micros) = match *name {
+                    "clean" => (&mut self.began[0], &mut totals.clean_micros),
+                    "shrink" | "squash_ancient" => (&mut self.began[1], &mut totals.shrink_micros),
+                    "flush" => (&mut self.began[2], &mut totals.flush_micros),
+                    _ => continue,
+                };
+                match field_u64(value) {
+                    Some(0) => {
+                        let ran = began
+                            .take()
+                            .and_then(|began| point.timestamp.duration_since(began).ok());
+                        let ran = ran.map_or(0, |ran| u64::try_from(ran.as_micros()).unwrap_or(0));
+                        *micros = micros.saturating_add(ran);
+                    }
+                    Some(_) => *began = began.or(Some(point.timestamp)),
+                    None => {}
+                }
+                continue;
+            }
+            let level = match (point.name, *name) {
+                (ACCOUNTS_INDEX, "count") => Some(&mut levels.index_entries),
+                (ACCOUNTS_INDEX, "capacity_in_mem") => Some(&mut levels.index_capacity),
+                (ACCOUNTS_INDEX, "estimate_mem_bytes") => Some(&mut levels.index_bytes),
+                (ACCOUNTS_WRITE_CACHE, "total_size") => Some(&mut levels.write_cache_bytes),
+                (ACCOUNTS_WRITE_CACHE, "num_slots") => Some(&mut levels.write_cache_slots),
+                (ACCOUNTS_WRITE_CACHE, "total_accounts_count") => {
+                    Some(&mut levels.write_cache_accounts)
+                }
+                (ACCOUNTS_CLEAN, "max_clean_root") => Some(&mut levels.cleaned_to),
                 _ => None,
             };
             if let Some(level) = level {
@@ -1844,12 +1836,25 @@ impl AddPoint for AccountsSet {
                 continue;
             }
 
-            let counter = match *name {
-                "num_loaded_from_write_cache" => &mut totals.loaded_from_write_cache,
-                "num_loaded_from_read_cache" => &mut totals.loaded_from_read_cache,
-                "num_loaded_from_index_storage" => &mut totals.loaded_from_storage,
-                "num_accounts_stored" => &mut totals.stored_accounts,
-                "account_bytes_stored" => &mut totals.stored_bytes,
+            let counter = match (point.name, *name) {
+                (ACCOUNTS_INDEX, "gets_from_mem") => &mut totals.index_found,
+                (ACCOUNTS_INDEX, "gets_missing") => &mut totals.index_missing,
+                (ACCOUNTS_INDEX, "inserts") => &mut totals.index_inserts,
+                (ACCOUNTS_INDEX, "deletes") => &mut totals.index_deletes,
+                (ACCOUNTS_CLEAN, "slots_cleaned") => &mut totals.cleaned_slots,
+                (ACCOUNTS_CLEAN, "num_accounts_removed_from_index") => &mut totals.cleaned_accounts,
+                (ACCOUNTS_SHRINK | ACCOUNTS_SHRINK_ANCIENT, "num_slots_shrunk") => {
+                    &mut totals.shrunk_slots
+                }
+                (ACCOUNTS_SHRINK | ACCOUNTS_SHRINK_ANCIENT, "accounts_removed") => {
+                    &mut totals.shrunk_accounts
+                }
+                (ACCOUNTS_SHRINK | ACCOUNTS_SHRINK_ANCIENT, "bytes_removed") => {
+                    &mut totals.shrunk_bytes
+                }
+                (ACCOUNTS_SHRINK | ACCOUNTS_SHRINK_ANCIENT, "bytes_written") => {
+                    &mut totals.rewritten_bytes
+                }
                 _ => continue,
             };
             add_value(counter, value);
@@ -1862,22 +1867,14 @@ impl AddPoint for MemorySet {
         let field = |wanted| number_named(point, wanted);
         match point.name {
             ACCOUNTS_DB_TIMINGS => {
-                if let Some(bytes) = field("read_only_accounts_cache_data_size") {
-                    self.read_cache = Some(bytes);
-                }
+                self.read_cache = field("read_only_accounts_cache_data_size").or(self.read_cache)
             }
             ACCOUNTS_INDEX => {
-                if let Some(bytes) = field("estimate_mem_bytes") {
-                    self.index_estimate = Some(bytes);
-                }
+                self.index_estimate = field("estimate_mem_bytes").or(self.index_estimate)
             }
-            ACCOUNTS_WRITE_CACHE => {
-                if let Some(bytes) = field("total_size") {
-                    self.write_cache = Some(bytes);
-                }
-            }
+            ACCOUNTS_WRITE_CACHE => self.write_cache = field("total_size").or(self.write_cache),
             BLOCKSTORE_CFS => {
-                let Some((_, cf)) = point.tags.iter().find(|(name, _)| *name == CF_NAME) else {
+                let Some(cf) = tag_named(point, CF_NAME) else {
                     return;
                 };
                 // A property RocksDB could not read comes as -1, which is not a u64.
@@ -1889,19 +1886,9 @@ impl AddPoint for MemorySet {
                 .into_iter()
                 .filter_map(field)
                 .fold(0, u64::saturating_add);
-                match self.blockstore.get_mut(cf.as_str()) {
-                    Some(held) => *held = bytes,
-                    None => {
-                        self.blockstore.insert(cf.clone(), bytes);
-                    }
-                }
+                self.blockstore.insert(cf.to_string(), bytes);
                 if let Some(bytes) = field("total_sst_files_size") {
-                    match self.blockstore_files.get_mut(cf.as_str()) {
-                        Some(held) => *held = bytes,
-                        None => {
-                            self.blockstore_files.insert(cf.clone(), bytes);
-                        }
-                    }
+                    self.blockstore_files.insert(cf.to_string(), bytes);
                 }
             }
             _ => (),
@@ -1909,177 +1896,19 @@ impl AddPoint for MemorySet {
     }
 }
 
-impl AddPoint for ProgramCacheSet {
-    fn add_point(&mut self, point: &DataPoint) {
-        let totals = &mut self.totals;
-        for (name, value) in &point.fields {
-            if *name == "water_level" {
-                set_value(&mut self.water_level, value);
-                continue;
-            }
-            let counter = match *name {
-                "hits" => &mut totals.hits,
-                "misses" => &mut totals.misses,
-                "evictions" => &mut totals.evictions,
-                "reloads" => &mut totals.reloads,
-                "insertions" => &mut totals.insertions,
-                "lost_insertions" => &mut totals.lost_insertions,
-                "replace_entry" => &mut totals.replacements,
-                "one_hit_wonders" => &mut totals.one_hit_wonders,
-                "prunes_orphan" => &mut totals.prunes_orphan,
-                "prunes_environment" => &mut totals.prunes_environment,
-                _ => continue,
-            };
-            add_value(counter, value);
-        }
-    }
-}
-
 impl AddPoint for QuicSet {
     fn add_point(&mut self, point: &DataPoint) {
-        let (totals, levels) = (&mut self.totals, &mut self.levels);
+        self.totals.add_point(point);
         for (name, value) in &point.fields {
-            let set = match *name {
+            let level = match *name {
                 // Cumulative on the wire, unlike the counters beside it: stored, not added.
-                "total_incoming_connection_attempts" => Some(&mut totals.offered),
+                "total_incoming_connection_attempts" => &mut self.totals.offered,
                 // `peak_open_staked_connections` is reset as reported, neither a level nor a count.
-                "open_connections" => Some(&mut levels.open),
-                "active_streams" => Some(&mut levels.active_streams),
-                _ => None,
-            };
-            if let Some(set) = set {
-                set_value(set, value);
-                continue;
-            }
-            let counter = match *name {
-                "connection_rate_limited_across_all" => &mut totals.shed_all,
-                "connection_rate_limited_per_ipaddr" => &mut totals.shed_address,
-                "refused_connections_too_many_open_connections" => &mut totals.refused_full,
-                "connection_setup_timeout" => &mut totals.handshake_timeout,
-                "connection_setup_error" => &mut totals.handshake_error,
-                "new_connections" => &mut totals.handshook,
-                "connection_add_failed" => &mut totals.add_failed,
-                "connection_add_failed_staked_node" => &mut totals.add_failed_staked,
-                "connection_add_failed_unstaked_node" => &mut totals.add_failed_unstaked,
-                "connection_add_failed_banned" => &mut totals.add_failed_banned,
-                // `connection_add_failed_on_pruning` is raised on the same refusal as
-                // `..._staked_node` and would count one event twice.
-                "connection_added_from_staked_peer" => &mut totals.admitted_staked,
-                "connection_added_from_unstaked_peer" => &mut totals.admitted_unstaked,
-                "new_streams" => &mut totals.streams,
-                "throttled_staked_streams" => &mut totals.throttled_staked,
-                "throttled_unstaked_streams" => &mut totals.throttled_unstaked,
-                "stream_read_timeouts" => &mut totals.read_timeouts,
-                "stream_read_errors" => &mut totals.read_errors,
-                "invalid_stream_size" => &mut totals.invalid_size,
-                "packets_sent_to_consumer" => &mut totals.handed_on,
-                "total_handle_chunk_to_packet_send_full_err" => &mut totals.queue_full,
-                "total_handle_chunk_to_packet_send_disconnected_err" => &mut totals.disconnected,
+                "open_connections" => &mut self.levels.open,
+                "active_streams" => &mut self.levels.active_streams,
                 _ => continue,
             };
-            add_value(counter, value);
-        }
-    }
-}
-
-impl AddPoint for BundleTotals {
-    fn add_point(&mut self, point: &DataPoint) {
-        for (name, value) in &point.fields {
-            let counter = match *name {
-                "num_bundles_received" => &mut self.received,
-                "num_packets_received" => &mut self.packets,
-                _ => continue,
-            };
-            add_value(counter, value);
-        }
-    }
-}
-
-impl AddPoint for VerifyTotals {
-    fn add_point(&mut self, point: &DataPoint) {
-        for (name, value) in &point.fields {
-            let counter = match *name {
-                "total_packets" => &mut self.received,
-                "total_dedup" => &mut self.duplicate,
-                "total_dropped_below_priority_floor" => &mut self.below_floor,
-                "total_valid_packets" => &mut self.verified,
-                "eviction_drops" => &mut self.evicted_batches,
-                _ => continue,
-            };
-            add_value(counter, value);
-        }
-    }
-}
-
-impl AddPoint for ExecutedTotals {
-    fn add_point(&mut self, point: &DataPoint) {
-        for (name, value) in &point.fields {
-            let counter = match *name {
-                "transactions_attempted_processing_count" => &mut self.attempted,
-                "cost_model_throttled_transactions_count" => &mut self.cost_throttled,
-                "retryable_transaction_count" => &mut self.retryable,
-                "retryable_expired_bank_count" => &mut self.expired_bank,
-                "processed_transactions_count" => &mut self.processed,
-                "processed_with_successful_result_count" => &mut self.succeeded,
-                // And from the error point beside it. No name is shared with
-                // the counts point, so both are read here.
-                "too_many_account_locks" => &mut self.too_many_locks,
-                "account_not_found" => &mut self.account_missing,
-                "insufficient_funds" => &mut self.fee_payer_broke,
-                "invalid_account_for_fee" => &mut self.fee_payer_invalid,
-                "blockhash_not_found" => &mut self.blockhash_missing,
-                "blockhash_too_old" => &mut self.blockhash_old,
-                "already_processed" => &mut self.already_processed,
-                "invalid_compute_budget" => &mut self.bad_compute_budget,
-                "max_loaded_accounts_data_size_exceeded" => &mut self.account_data_too_large,
-                "invalid_program_for_execution" => &mut self.program_not_executable,
-                "program_execution_temporarily_restricted" => &mut self.program_restricted,
-                // `max_queue_len` is a gauge, `num_messages_processed` counts batches, and
-                // `total` sums errors drawn elsewhere.
-                _ => continue,
-            };
-            add_value(counter, value);
-        }
-    }
-}
-
-impl AddPoint for SchedulerTotals {
-    fn add_point(&mut self, point: &DataPoint) {
-        for (name, value) in &point.fields {
-            let counter = match *name {
-                "num_received" => &mut self.received,
-                "num_dropped_on_receive" => &mut self.not_held,
-                "num_dropped_on_check_work_queue_full" => &mut self.check_queue_full,
-                "num_dropped_on_parsing_and_sanitization" => &mut self.unparsable,
-                "num_dropped_on_validate_locks" => &mut self.bad_locks,
-                "num_dropped_on_receive_compute_budget" => &mut self.compute_budget,
-                "num_dropped_on_receive_age" => &mut self.too_old,
-                "num_dropped_on_receive_already_processed" => &mut self.already_processed,
-                "num_dropped_on_receive_fee_payer" => &mut self.fee_payer,
-                "num_dropped_on_filter_key" => &mut self.filtered,
-                "num_dropped_on_nonce_dedup" => &mut self.nonce_conflict,
-                "num_buffered" => &mut self.buffered,
-                "num_dropped_on_capacity" => &mut self.queue_full,
-                "num_evicted_on_nonce_dedup" => &mut self.nonce_evicted,
-                "num_dropped_on_clear" => &mut self.cleared,
-                "num_dropped_on_clean" => &mut self.cleaned,
-                "num_scheduled" => &mut self.scheduled,
-                "num_unschedulable_conflicts" => &mut self.blocked_conflicts,
-                "num_unschedulable_threads" => &mut self.blocked_threads,
-                "num_finished" => &mut self.finished,
-                "num_retryable" => &mut self.retried,
-                _ => continue,
-            };
-            add_value(counter, value);
-        }
-    }
-}
-
-impl AddPoint for GossipSet {
-    fn add_point(&mut self, point: &DataPoint) {
-        match point.name {
-            GOSSIP_ENTRIES | GOSSIP_ENTRY_FAILS => self.add_entries(point),
-            _ => self.add_stats(point),
+            set_value(level, value);
         }
     }
 }
@@ -2124,61 +1953,17 @@ impl GossipSet {
         if point.name == GOSSIP_STATS[0] {
             self.totals.reports = self.totals.reports.saturating_add(1);
         }
-        let (totals, levels) = (&mut self.totals, &mut self.levels);
+        self.totals.add_point(point);
+        let levels = &mut self.levels;
         for (name, value) in &point.fields {
             let level = match *name {
-                "table_size" => Some(&mut levels.table_size),
-                "num_pubkeys" => Some(&mut levels.pubkeys),
-                "num_nodes" => Some(&mut levels.nodes),
-                "num_nodes_staked" => Some(&mut levels.staked_nodes),
-                _ => None,
-            };
-            if let Some(level) = level {
-                set_value(level, value);
-                continue;
-            }
-            let counter = match *name {
-                "packets_received_count" => &mut totals.received,
-                "packets_received_push_messages_count" => &mut totals.received_push,
-                "packets_received_pull_requests_count" => &mut totals.received_pull_requests,
-                "packets_received_pull_responses_count" => &mut totals.received_pull_responses,
-                "packets_received_ping_messages_count" => &mut totals.received_ping,
-                "packets_received_pong_messages_count" => &mut totals.received_pong,
-                "packets_received_prune_messages_count" => &mut totals.received_prune,
-                "packets_sent_push_messages_count" => &mut totals.sent_push,
-                "packets_sent_pull_requests_count" => &mut totals.sent_pull_requests,
-                "packets_sent_pull_responses_count" => &mut totals.sent_pull_responses,
-                "packets_sent_ping_messages_count" => &mut totals.sent_ping,
-                "packets_sent_pong_messages_count" => &mut totals.sent_pong,
-                "packets_sent_prune_messages_count" => &mut totals.sent_prune,
-                "num_duplicate_push_messages" => &mut totals.duplicate_push,
-                "num_redundant_pull_responses" => &mut totals.redundant_pull,
-                "purge_count" => &mut totals.expired,
-                "trim_crds_table_purged_values_count" => &mut totals.evicted,
-                "gossip_packets_dropped_count" => &mut totals.dropped_in,
-                "gossip_transmit_packets_dropped_count" => &mut totals.dropped_out,
-                "gossip_pull_request_no_budget" => &mut totals.pull_no_budget,
-                "pull_request_scan_budget_exhausted" => &mut totals.pull_scan_exhausted,
-                "skip_push_message_shred_version" => &mut totals.other_shred_version_push,
-                "skip_pull_response_shred_version" => {
-                    &mut totals.other_shred_version_pull_responses
-                }
-                "skip_pull_shred_version" => &mut totals.other_shred_version_pull_requests,
-                "pull_request_ping_pong_check_failed_count" => &mut totals.ping_check_failed,
-                // Gossip's own spelling.
-                "num_unverifed_gossip_addrs" => &mut totals.unverified_addresses,
-                "bad_prune_destination" => &mut totals.bad_prune_destination,
-                "handle_batch_push_messages_time" => &mut totals.push_us,
-                "handle_batch_pull_requests_time" => &mut totals.pull_requests_us,
-                "handle_batch_pull_responses_time" => &mut totals.pull_responses_us,
-                "handle_batch_ping_messages_time" => &mut totals.ping_us,
-                "handle_batch_pong_messages_time" => &mut totals.pong_us,
-                "handle_batch_prune_messages_time" => &mut totals.prune_us,
-                "verify_gossip_packets_time" => &mut totals.verify_us,
-                "process_gossip_packets_time" => &mut totals.process_us,
+                "table_size" => &mut levels.table_size,
+                "num_pubkeys" => &mut levels.pubkeys,
+                "num_nodes" => &mut levels.nodes,
+                "num_nodes_staked" => &mut levels.staked_nodes,
                 _ => continue,
             };
-            add_value(counter, value);
+            set_value(level, value);
         }
     }
 }
@@ -2188,17 +1973,14 @@ fn locked<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-fn add_to<T: AddPoint>(set: &Mutex<T>, point: &DataPoint) {
-    locked(set).add_point(point);
-}
-
-fn copy_of<T: Copy + Default>(set: &Mutex<T>) -> T {
-    *locked(set)
-}
-
-fn number_named(point: &DataPoint, wanted: &str) -> Option<u64> {
+/// The first field of the point named `wanted`, as written.
+fn field_named<'a>(point: &'a DataPoint, wanted: &str) -> Option<&'a str> {
     let (_, value) = point.fields.iter().find(|(name, _)| *name == wanted)?;
-    field_u64(value)
+    Some(value.as_str())
+}
+
+pub(crate) fn number_named(point: &DataPoint, wanted: &str) -> Option<u64> {
+    field_named(point, wanted).and_then(field_u64)
 }
 
 fn tag_named<'a>(point: &'a DataPoint, wanted: &str) -> Option<&'a str> {
@@ -2206,22 +1988,27 @@ fn tag_named<'a>(point: &'a DataPoint, wanted: &str) -> Option<&'a str> {
     Some(value.as_str())
 }
 
-/// Drops the lowest keys until `map` holds at most `cap`.
 pub(crate) fn keep_newest<K: Ord, V>(map: &mut BTreeMap<K, V>, cap: usize) {
     while map.len() > cap {
         map.pop_first();
     }
 }
 
-fn add_named(counter: &AtomicU64, point: &DataPoint, wanted: &str) {
-    if let Some((_, value)) = point.fields.iter().find(|(name, _)| *name == wanted) {
-        add_field(counter, value);
+pub(crate) fn insert_capped<K: Ord, V>(map: &mut BTreeMap<K, V>, key: K, value: V, cap: usize) {
+    map.insert(key, value);
+    keep_newest(map, cap);
+}
+
+pub(crate) fn push_capped<T>(queue: &mut VecDeque<T>, value: T, cap: usize) {
+    queue.push_back(value);
+    while queue.len() > cap {
+        queue.pop_front();
     }
 }
 
-fn add_field(counter: &AtomicU64, value: &str) {
-    if let Some(delta) = field_u64(value) {
-        counter.fetch_add(delta, Ordering::Relaxed);
+fn add_named(counter: &mut u64, point: &DataPoint, wanted: &str) {
+    if let Some(value) = field_named(point, wanted) {
+        add_value(counter, value);
     }
 }
 
@@ -2252,7 +2039,7 @@ fn field_str(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use {super::*, std::time::UNIX_EPOCH};
 
     fn named(name: &'static str, fields: &[(&'static str, &str)]) -> DataPoint {
         let mut point = DataPoint::new(name);
@@ -2305,16 +2092,16 @@ mod tests {
             point.add_tag(CF_NAME, cf);
             point
         };
-        tap.observe(&column("data_shred", "100i"));
-        tap.observe(&column("meta", "50i"));
-        tap.observe(&column("data_shred", "300i"));
-        tap.observe(&named(ACCOUNTS_INDEX, &[("estimate_mem_bytes", "9000i")]));
-        tap.observe(&named(
+        tap.observe_point(&column("data_shred", "100i"));
+        tap.observe_point(&column("meta", "50i"));
+        tap.observe_point(&column("data_shred", "300i"));
+        tap.observe_point(&named(ACCOUNTS_INDEX, &[("estimate_mem_bytes", "9000i")]));
+        tap.observe_point(&named(
             "accounts_index_startup",
             &[("estimate_mem_bytes", "1i")],
         ));
-        tap.observe(&named(ACCOUNTS_WRITE_CACHE, &[("total_size", "700i")]));
-        tap.observe(&point(&[("read_only_accounts_cache_data_size", "800i")]));
+        tap.observe_point(&named(ACCOUNTS_WRITE_CACHE, &[("total_size", "700i")]));
+        tap.observe_point(&point(&[("read_only_accounts_cache_data_size", "800i")]));
 
         assert_eq!(
             tap.memory_parts(),
@@ -2337,16 +2124,16 @@ mod tests {
             point.add_tag(CF_NAME, cf);
             point
         };
-        tap.observe(&column("data_shred", "100i"));
-        tap.observe(&column("data_shred", "300i"));
-        tap.observe(&column("code_shred", "50i"));
-        tap.observe(&column("alt_data_shred", "5i"));
-        tap.observe(&column("transaction_status", "20i"));
-        tap.observe(&column("address_signatures", "7i"));
-        tap.observe(&column("meta", "9i"));
-        tap.observe(&column("root", "1i"));
+        tap.observe_point(&column("data_shred", "100i"));
+        tap.observe_point(&column("data_shred", "300i"));
+        tap.observe_point(&column("code_shred", "50i"));
+        tap.observe_point(&column("alt_data_shred", "5i"));
+        tap.observe_point(&column("transaction_status", "20i"));
+        tap.observe_point(&column("address_signatures", "7i"));
+        tap.observe_point(&column("meta", "9i"));
+        tap.observe_point(&column("root", "1i"));
         // A property RocksDB could not read leaves the last size held.
-        tap.observe(&column("meta", "-1i"));
+        tap.observe_point(&column("meta", "-1i"));
 
         assert_eq!(
             tap.ledger_files(),
@@ -2363,7 +2150,7 @@ mod tests {
         let tap = MetricsTap::default();
         assert_eq!(tap.accounts_files(), None);
 
-        tap.observe(&named(
+        tap.observe_point(&named(
             ACCOUNTS_STORES,
             &[("total_bytes", "104i"), ("total_alive_bytes", "100i")],
         ));
@@ -2381,7 +2168,7 @@ mod tests {
     fn test_a_leader_slots_timing_is_merged_from_its_reports() {
         let tap = MetricsTap::default();
         let slot = 4_000;
-        tap.observe(&slot_point_named(
+        tap.observe_point(&slot_point_named(
             LEADER_START,
             slot,
             &[
@@ -2390,18 +2177,18 @@ mod tests {
                 ("leader_handover_fast", "1i"),
             ],
         ));
-        tap.observe(&slot_point_named(LEADER_BANK, slot, &[("elapsed", "400i")]));
-        tap.observe(&slot_point_named(
+        tap.observe_point(&slot_point_named(LEADER_BANK, slot, &[("elapsed", "400i")]));
+        tap.observe_point(&slot_point_named(
             BROADCAST_TRANSMIT,
             slot,
             &[("end_to_end_elapsed", "411000i")],
         ));
-        tap.observe(&slot_point_named(
+        tap.observe_point(&slot_point_named(
             BROADCAST_PROCESS,
             slot,
             &[("shredding_time", "9800i")],
         ));
-        tap.observe(&slot_point_named(
+        tap.observe_point(&slot_point_named(
             SCHEDULER_SLOT_TIMING,
             slot,
             &[
@@ -2430,7 +2217,7 @@ mod tests {
     #[test]
     fn test_from_44_the_start_and_the_wait_for_the_parent_come_apart() {
         let tap = MetricsTap::default();
-        tap.observe(&slot_point_named(
+        tap.observe_point(&slot_point_named(
             LEADER_START,
             12,
             &[
@@ -2445,7 +2232,7 @@ mod tests {
         assert!(timing.parent_switched);
 
         // A start that took no measurable time is still a reading.
-        tap.observe(&slot_point_named(
+        tap.observe_point(&slot_point_named(
             LEADER_START,
             13,
             &[("slot_delay_us", "0i"), ("replay_is_behind_us", "0i")],
@@ -2458,7 +2245,7 @@ mod tests {
         let tap = MetricsTap::default();
         let mut bam = slot_point_named(SCHEDULER_SLOT_TIMING, 9, &[("receive_time_us", "5i")]);
         bam.tags.push((SCHEDULER_ID, "10000".to_string()));
-        tap.observe(&bam);
+        tap.observe_point(&bam);
         assert_eq!(tap.leader_timing(9), None);
     }
 
@@ -2474,9 +2261,9 @@ mod tests {
             ("notar_vote_us_maximum", "470000i"),
             ("finalize_vote_us_mean", "166000i"),
         ];
-        tap.observe(&arrival_point(&early, &full));
+        tap.observe_point(&arrival_point(&early, &full));
         // Votor sends no mean for a validator that never voted that way.
-        tap.observe(&arrival_point(
+        tap.observe_point(&arrival_point(
             &Pubkey::new_unique(),
             &[("epoch", "7i"), ("notar_vote_count", "0i")],
         ));
@@ -2494,11 +2281,11 @@ mod tests {
             })
         );
 
-        tap.observe(&arrival_point(
+        tap.observe_point(&arrival_point(
             &late,
             &[("epoch", "8i"), ("notar_vote_us_mean", "92000i")],
         ));
-        tap.observe(&arrival_point(
+        tap.observe_point(&arrival_point(
             &early,
             &[("epoch", "7i"), ("notar_vote_us_mean", "1i")],
         ));
@@ -2516,7 +2303,7 @@ mod tests {
             &[("epoch", "7i"), ("notar_vote_us_mean", "5i")],
         );
         point.add_tag(VOTE_ACCOUNT, "not a key");
-        tap.observe(&point);
+        tap.observe_point(&point);
         assert_eq!(tap.vote_arrivals(), (None, HashMap::new()));
     }
 
@@ -2539,25 +2326,24 @@ mod tests {
     fn test_the_totals_accumulate_across_points() {
         // Each point carries what happened since the last, so the totals are the sum.
         let tap = MetricsTap::default();
-        tap.observe(&point(&[
+        tap.observe_point(&point(&[
             ("read_only_accounts_cache_hits", "10i"),
             ("read_only_accounts_cache_misses", "2i"),
             ("read_only_accounts_cache_evicts", "1i"),
         ]));
-        tap.observe(&point(&[
+        tap.observe_point(&point(&[
             ("read_only_accounts_cache_hits", "5i"),
             ("read_only_accounts_cache_misses", "1i"),
         ]));
 
-        assert_eq!(
-            tap.counters(),
-            TapCounters {
-                accounts_cache_hits: 15,
-                accounts_cache_misses: 3,
-                accounts_cache_evicts: 1,
-                ..TapCounters::default()
-            }
-        );
+        let mut expected = TapCounters::default();
+        expected.accounts.totals = AccountsTotals {
+            cache_hits: 15,
+            cache_misses: 3,
+            cache_evicts: 1,
+            ..AccountsTotals::default()
+        };
+        assert_eq!(tap.counters(), expected);
     }
 
     #[test]
@@ -2565,11 +2351,11 @@ mod tests {
         let tap = MetricsTap::default();
         let mut point = named(RETRANSMIT_STAGE, &[("num_shreds_dropped_xdp_full", "12i")]);
         point.tags.push((IS_XDP, "true".to_string()));
-        tap.observe(&point);
-        tap.observe(&point);
+        tap.observe_point(&point);
+        tap.observe_point(&point);
 
         let counters = tap.counters();
-        assert_eq!(counters.xdp_dropped, 24);
+        assert_eq!(counters.network.xdp_dropped, 24);
         assert_eq!(counters.retransmit_xdp, Some(true));
         assert_eq!(MetricsTap::default().counters().retransmit_xdp, None);
     }
@@ -2577,7 +2363,7 @@ mod tests {
     #[test]
     fn test_a_slot_stats_point_adds_each_layer_into_its_own_count() {
         let tap = MetricsTap::default();
-        tap.observe(&named(
+        tap.observe_point(&named(
             RETRANSMIT_SLOT_STATS,
             &[
                 ("slot", "100i"),
@@ -2588,10 +2374,10 @@ mod tests {
             ],
         ));
         let counters = tap.counters();
-        assert_eq!(counters.turbine_root, 3);
-        assert_eq!(counters.turbine_layer_1, 400);
-        assert_eq!(counters.turbine_layer_2, 1100);
-        assert_eq!(counters.turbine_layer_3, 0);
+        assert_eq!(counters.network.turbine_root, 3);
+        assert_eq!(counters.network.turbine_layer_1, 400);
+        assert_eq!(counters.network.turbine_layer_2, 1100);
+        assert_eq!(counters.network.turbine_layer_3, 0);
     }
 
     #[test]
@@ -2601,78 +2387,66 @@ mod tests {
         other
             .fields
             .push(("read_only_accounts_cache_hits", "99i".to_string()));
-        tap.observe(&other);
+        tap.observe_point(&other);
+        // Votes never reach the scheduler, so counting them at the top would inflate a total the
+        // stages below cannot account for.
+        tap.observe_point(&named("tpu-vote-verifier", &[("total_packets", "5000i")]));
         assert_eq!(tap.counters(), TapCounters::default());
     }
 
     #[test]
     fn test_each_socket_receiver_counts_into_its_own_port() {
         let tap = MetricsTap::default();
-        tap.observe(&named(SHREDS_TURBINE, &[("packets_count", "900i")]));
-        tap.observe(&named(GOSSIP_RECEIVER, &[("packets_count", "40i")]));
-        tap.observe(&named(TPU_VOTE_RECEIVER, &[("packets_count", "70i")]));
-        tap.observe(&named(GOSSIP_RECEIVER, &[("packets_count", "2i")]));
-        tap.observe(&named(SHREDS_REPAIR, &[("packets_count", "12i")]));
-
-        let counters = tap.counters();
-        assert_eq!(counters.shreds_turbine, 900);
-        assert_eq!(counters.shreds_repair, 12);
-        assert_eq!(counters.packets_gossip, 42);
-        assert_eq!(counters.packets_tpu_vote, 70);
-    }
-
-    #[test]
-    fn test_votor_counts_the_votes_it_took_not_the_ones_it_refused() {
-        let tap = MetricsTap::default();
-        let point = |received: &str| {
-            named(
-                VOTOR_SERVER,
-                &[
-                    ("datagrams_received", received),
-                    ("datagram_rate_limited", "5i"),
-                    ("handshakes_completed", "3i"),
-                ],
-            )
-        };
-        tap.observe(&point("400i"));
-        tap.observe(&point("25i"));
-
-        let counters = tap.counters();
-        assert_eq!(counters.votes_votor, 425);
-        assert_eq!(counters.packets_tpu_vote, 0);
-    }
-
-    #[test]
-    fn test_a_replayed_slot_can_be_asked_for_its_own_wall_time() {
-        let tap = MetricsTap::default();
-        tap.observe(&named(
-            REPLAY_SLOT_STATS,
+        tap.observe_point(&named(
+            SHREDS_TURBINE,
             &[
-                ("slot", "443895975i"),
-                ("fetch_entries_time", "4300i"),
-                ("confirmation_without_replay_us", "33500i"),
-                ("bank_complete_time_us", "9400i"),
-                ("execute_us", "231000i"),
+                ("packet_batches_count", "7i"),
+                ("packets_count", "900i"),
+                ("channel_len", "3i"),
             ],
         ));
+        tap.observe_point(&named(GOSSIP_RECEIVER, &[("packets_count", "40i")]));
+        tap.observe_point(&named(TPU_VOTE_RECEIVER, &[("packets_count", "70i")]));
+        tap.observe_point(&named(GOSSIP_RECEIVER, &[("packets_count", "2i")]));
+        tap.observe_point(&named(SHREDS_REPAIR, &[("packets_count", "12i")]));
 
-        assert_eq!(
-            tap.replayed(443_895_975).map(|times| times.serial()),
-            Some(47_200)
-        );
-        assert!(tap.replayed(443_895_974).is_none());
+        let counters = tap.counters();
+        assert_eq!(counters.network.shreds_turbine, 900);
+        assert_eq!(counters.network.shreds_repair, 12);
+        assert_eq!(counters.network.packets_gossip, 42);
+        assert_eq!(counters.network.packets_tpu_vote, 70);
+    }
+
+    #[test]
+    fn test_a_block_height_counts_the_blocks_past_the_newest_bank_reported() {
+        let tap = MetricsTap::default();
+        tap.observe_point(&named(
+            NEW_BANK,
+            &[
+                ("slot", "100i"),
+                ("block_height", "90i"),
+                ("parent_slot", "98i"),
+            ],
+        ));
+        let parents = BTreeMap::from([(104, 103), (103, 100), (102, 101)]);
+        let parent = |slot| parents.get(&slot).copied();
+        assert_eq!(tap.block_height(100, parent), Some(90));
+        assert_eq!(tap.block_height(104, parent), Some(92));
+        // Off the reported chain.
+        assert_eq!(tap.block_height(102, parent), None);
     }
 
     #[test]
     fn test_a_replay_record_says_when_it_arrived() {
         let tap = MetricsTap::default();
         let before = timestamp();
-        tap.observe(&named(
+        tap.observe_point(&named(
             REPLAY_SLOT_STATS,
             &[("slot", "443895975i"), ("execute_us", "231000i")],
         ));
         let observed = tap.replayed(443_895_975).unwrap().observed_millis;
         assert!(observed >= before && observed <= timestamp());
+        assert!(tap.replayed(443_895_974).is_none());
     }
 
     #[test]
@@ -2680,7 +2454,7 @@ mod tests {
         // Names from `ledger/src/slot_stats.rs`. The last index is the highest
         // shred, so the count is one more.
         let tap = MetricsTap::default();
-        tap.observe(&named(
+        tap.observe_point(&named(
             SHRED_FULL,
             &[
                 ("slot", "444422652i"),
@@ -2697,6 +2471,25 @@ mod tests {
         assert_eq!(fill.recovered, 12);
         assert_eq!(fill.full_millis, 921);
         assert!(tap.shred_fill(444_422_651).is_none());
+        assert_eq!(tap.newest_fill(), Some(444_422_652));
+    }
+
+    #[test]
+    fn test_a_fill_gives_back_the_first_shred_stamp_it_was_counted_from() {
+        let tap = MetricsTap::default();
+        let mut point = named(
+            SHRED_FULL,
+            &[
+                ("slot", "444422652i"),
+                ("total_time_ms", "921i"),
+                ("last_index", "927i"),
+            ],
+        );
+        point.timestamp = UNIX_EPOCH + std::time::Duration::from_nanos(1_794_392_646_486_400_000);
+        tap.observe_external(&point);
+        let fill = tap.shred_fill(444_422_652).unwrap();
+        assert_eq!(fill.first_shred_millis(), Some(1_794_392_646_486 - 921));
+        assert_eq!(ShredFill::default().first_shred_millis(), None);
     }
 
     #[test]
@@ -2704,7 +2497,7 @@ mod tests {
         // The blockstore writes -1 where it has not seen the last shred, which
         // is not a count and must not become one.
         let tap = MetricsTap::default();
-        tap.observe(&named(
+        tap.observe_point(&named(
             SHRED_FULL,
             &[
                 ("slot", "10i"),
@@ -2719,7 +2512,7 @@ mod tests {
     fn test_only_the_newest_filled_slots_are_kept() {
         let tap = MetricsTap::default();
         for slot in 0..SHRED_FILLS.saturating_add(10) {
-            tap.observe(&named(
+            tap.observe_point(&named(
                 SHRED_FULL,
                 &[("slot", &format!("{slot}i")), ("last_index", "99i")],
             ));
@@ -2735,7 +2528,7 @@ mod tests {
     #[test]
     fn test_a_leader_slots_bundles_are_summed_across_the_stage_threads() {
         let tap = MetricsTap::default();
-        tap.observe(&named(
+        tap.observe_point(&named(
             BUNDLE_SLOT_STATS,
             &[
                 ("id", "0i"),
@@ -2744,7 +2537,7 @@ mod tests {
                 ("execution_results_ok", "8i"),
             ],
         ));
-        tap.observe(&named(
+        tap.observe_point(&named(
             BUNDLE_SLOT_STATS,
             &[
                 ("id", "1i"),
@@ -2762,7 +2555,7 @@ mod tests {
     #[test]
     fn test_a_bundle_point_without_a_slot_is_dropped() {
         let tap = MetricsTap::default();
-        tap.observe(&named(BUNDLE_SLOT_STATS, &[("num_sanitized_ok", "3i")]));
+        tap.observe_point(&named(BUNDLE_SLOT_STATS, &[("num_sanitized_ok", "3i")]));
         assert!(tap.bundle_slots.lock().unwrap().is_empty());
     }
 
@@ -2776,15 +2569,15 @@ mod tests {
                 ("streamer-send-host_count", "1000i"),
             ]
         }
-        tap.observe(&named(GOSSIP_SENDER, &sent("22786715i", "5503i")));
-        tap.observe(&named(REPAIR_SENDER, &sent("2138992i", "10004i")));
-        tap.observe(&named(GOSSIP_SENDER, &sent("21012098i", "5383i")));
+        tap.observe_point(&named(GOSSIP_SENDER, &sent("22786715i", "5503i")));
+        tap.observe_point(&named(REPAIR_SENDER, &sent("2138992i", "10004i")));
+        tap.observe_point(&named(GOSSIP_SENDER, &sent("21012098i", "5383i")));
 
         let counters = tap.counters();
-        assert_eq!(counters.gossip_sent_bytes, 43_798_813);
-        assert_eq!(counters.gossip_sent_millis, 10_886);
-        assert_eq!(counters.repair_sent_bytes, 2_138_992);
-        assert_eq!(counters.repair_sent_millis, 10_004);
+        assert_eq!(counters.network.gossip_sent_bytes, 43_798_813);
+        assert_eq!(counters.network.gossip_sent_millis, 10_886);
+        assert_eq!(counters.network.repair_sent_bytes, 2_138_992);
+        assert_eq!(counters.network.repair_sent_millis, 10_004);
     }
 
     #[test]
@@ -2792,7 +2585,7 @@ mod tests {
         // Several of these names differ only in their tail; a transposed pair would
         // put the wrong reason under a label.
         let tap = MetricsTap::default();
-        tap.observe(&slot_point(
+        tap.observe_point(&slot_point(
             7,
             &[
                 ("num_received", "1000i"),
@@ -2816,6 +2609,8 @@ mod tests {
                 ("num_unschedulable_threads", "15i"),
                 ("num_finished", "38i"),
                 ("num_retryable", "16i"),
+                ("min_priority", "5i"),
+                ("max_priority", "900000i"),
             ],
         ));
 
@@ -2938,19 +2733,19 @@ mod tests {
     fn test_the_slot_lists_revision_moves_only_when_a_list_does() {
         let tap = MetricsTap::default();
         let start = tap.slot_lists_revision();
-        tap.observe(&slot_point(430_789_128, &[("num_received", "500i")]));
+        tap.observe_point(&slot_point(430_789_128, &[("num_received", "500i")]));
         let after_waterfall = tap.slot_lists_revision();
         assert_ne!(after_waterfall, start);
-        tap.observe(&slot_point(430_789_128, &[("num_received", "5i")]));
+        tap.observe_point(&slot_point(430_789_128, &[("num_received", "5i")]));
         assert_eq!(tap.slot_lists_revision(), after_waterfall);
-        tap.observe(&cost_point(true, &[("bank_slot", "430789128i")]));
+        tap.observe_point(&cost_point(true, &[("bank_slot", "430789128i")]));
         assert_ne!(tap.slot_lists_revision(), after_waterfall);
     }
 
     #[test]
     fn test_a_block_this_validator_produced_is_kept() {
         let tap = MetricsTap::default();
-        tap.observe(&cost_point(
+        tap.observe_point(&cost_point(
             true,
             &[
                 ("bank_slot", "441034909i"),
@@ -2978,22 +2773,86 @@ mod tests {
         assert_eq!(held[0].contended, 412);
     }
 
+    fn shreds_at(tap: &MetricsTap, millis: u64, packets: &str) {
+        let mut point = DataPoint::new(SHREDS_TURBINE);
+        point.timestamp = UNIX_EPOCH
+            .checked_add(std::time::Duration::from_millis(millis))
+            .unwrap();
+        point.fields.push((PACKETS_COUNT, format!("{packets}i")));
+        tap.observe_external(&point);
+    }
+
     #[test]
-    fn test_other_validators_blocks_are_dropped() {
-        // This point arrives for every slot replayed; only the blocks we built are
-        // kept.
+    fn test_counters_are_read_as_they_stood_at_a_moment_of_point_time() {
         let tap = MetricsTap::default();
-        tap.observe(&cost_point(
-            false,
-            &[("bank_slot", "441034910i"), ("block_cost", "1i")],
-        ));
-        assert!(tap.slot_costs().is_empty());
+        assert_eq!(tap.points_through(), None);
+        shreds_at(&tap, 10_050, "5");
+        shreds_at(&tap, 10_150, "7");
+        // Nothing made after the moment has been read yet.
+        assert_eq!(tap.counters_at(10_100), None);
+        shreds_at(&tap, 10_450, "11");
+        shreds_at(&tap, 12_000, "13");
+        assert_eq!(tap.points_through(), Some(12_000));
+        // Up to the step after the moment: both points of its step.
+        assert_eq!(tap.counters_at(10_100).unwrap().network.shreds_turbine, 12);
+        assert_eq!(tap.counters_at(10_500).unwrap().network.shreds_turbine, 23);
+        assert_eq!(tap.counters().network.shreds_turbine, 36);
+    }
+
+    #[test]
+    fn test_point_time_set_back_starts_the_steps_over() {
+        let tap = MetricsTap::default();
+        const DAY_MILLIS: u64 = 86_400_000;
+        let before = 70 * DAY_MILLIS;
+        shreds_at(&tap, before, "5");
+        shreds_at(&tap, before + 500, "7");
+        // The validator's clock is set back 66 days.
+        let after = before - 66 * DAY_MILLIS;
+        shreds_at(&tap, after + 50, "11");
+        shreds_at(&tap, after + 450, "13");
+        assert_eq!(tap.points_through(), Some(after + 450));
+        assert_eq!(
+            tap.counters_at(after + 100).unwrap().network.shreds_turbine,
+            23
+        );
+        assert_eq!(tap.counters_at(after + 450), None);
+    }
+
+    #[test]
+    fn test_every_banks_figures_are_kept_beside_our_costs() {
+        let tap = MetricsTap::default();
+        let figures = [
+            ("block_cost", "1874211i"),
+            ("transaction_count", "1291i"),
+            ("total_transaction_fee", "8216330i"),
+            ("total_priority_fee", "1756330i"),
+        ];
+        let mut other = vec![("bank_slot", "441034910i")];
+        other.extend_from_slice(&figures);
+        tap.observe_point(&cost_point(false, &other));
+        let mut ours = vec![("bank_slot", "441034911i")];
+        ours.extend_from_slice(&figures);
+        tap.observe_point(&cost_point(true, &ours));
+
+        let expected = BankFigures {
+            block_cost: 1_874_211,
+            transactions: 1_291,
+            total_fees: 8_216_330,
+            priority_fees: 1_756_330,
+        };
+        assert_eq!(tap.bank_figures(441_034_910), Some(expected));
+        assert_eq!(tap.bank_figures(441_034_911), Some(expected));
+        assert_eq!(tap.bank_figures(441_034_912), None);
+        // Only our own block is a slot cost.
+        let held = tap.slot_costs();
+        assert_eq!(held.len(), 1);
+        assert_eq!(held[0].slot, 441_034_911);
     }
 
     #[test]
     fn test_a_cost_point_with_no_slot_is_dropped() {
         let tap = MetricsTap::default();
-        tap.observe(&cost_point(true, &[("block_cost", "42574937i")]));
+        tap.observe_point(&cost_point(true, &[("block_cost", "42574937i")]));
         assert!(tap.slot_costs().is_empty());
     }
 
@@ -3002,7 +2861,7 @@ mod tests {
         let tap = MetricsTap::default();
         let mut point = named(COST_TRACKER, &[("bank_slot", "441034909i")]);
         point.fields.push((IS_LEADER, "true".to_string()));
-        tap.observe(&point);
+        tap.observe_point(&point);
         assert!(
             tap.slot_costs().is_empty(),
             "the validator does not send it as a field"
@@ -3016,7 +2875,7 @@ mod tests {
     #[test]
     fn test_votor_timelines_are_kept_by_slot_until_taken() {
         let tap = MetricsTap::default();
-        tap.observe(&named(
+        tap.observe_point(&named(
             VOTE_TRACKING,
             &[
                 ("slot", "6726788i"),
@@ -3024,7 +2883,7 @@ mod tests {
                 ("vote_notarize", "413200i"),
             ],
         ));
-        tap.observe(&named(
+        tap.observe_point(&named(
             VOTE_TRACKING,
             &[
                 ("slot", "6726789i"),
@@ -3032,7 +2891,7 @@ mod tests {
                 ("vote_notarize", "150i"),
             ],
         ));
-        tap.observe(&named(VOTE_TRACKING, &[("first_shred", "5i")]));
+        tap.observe_point(&named(VOTE_TRACKING, &[("first_shred", "5i")]));
 
         let tracks = tap.take_vote_tracks();
         assert_eq!(tracks.len(), 2, "the point without a slot is dropped");
@@ -3067,11 +2926,11 @@ mod tests {
         point.timestamp = UNIX_EPOCH
             .checked_add(std::time::Duration::from_nanos(FULL_AT_NANOS))
             .unwrap();
-        tap.observe(&point);
+        tap.observe_point(&point);
     }
 
     fn finalized_89_ms_after_the_last_shred(tap: &MetricsTap) {
-        tap.observe(&named(
+        tap.observe_point(&named(
             VOTE_TRACKING,
             &[
                 ("slot", "100i"),
@@ -3079,16 +2938,6 @@ mod tests {
                 ("finalized", "270000i"),
             ],
         ));
-    }
-
-    #[test]
-    fn test_a_block_is_full_when_its_point_was_made() {
-        let tap = MetricsTap::default();
-        full_block_at(&tap, "100i", "180i");
-        assert_eq!(
-            tap.shred_fill(100).map(|fill| fill.full_at_nanos),
-            Some(FULL_AT_NANOS)
-        );
     }
 
     #[test]
@@ -3135,7 +2984,7 @@ mod tests {
     fn test_finality_and_our_vote_are_timed_from_the_last_shred() {
         let tap = MetricsTap::default();
         full_block_at(&tap, "100i", "180i");
-        tap.observe(&named(
+        tap.observe_point(&named(
             VOTE_TRACKING,
             &[
                 ("slot", "100i"),
@@ -3165,7 +3014,7 @@ mod tests {
     fn test_our_vote_is_timed_from_the_last_shred() {
         let tap = MetricsTap::default();
         full_block_at(&tap, "100i", "180i");
-        tap.observe(&named(
+        tap.observe_point(&named(
             VOTE_TRACKING,
             &[
                 ("slot", "100i"),
@@ -3190,7 +3039,7 @@ mod tests {
     fn test_finalized_paths_are_taken_once() {
         let tap = MetricsTap::default();
         for (slot, fast) in [("100i", "true"), ("101i", "false")] {
-            tap.observe(&named(
+            tap.observe_point(&named(
                 VOTE_TRACKING,
                 &[
                     ("slot", slot),
@@ -3200,7 +3049,7 @@ mod tests {
             ));
         }
         // Not finalized yet, so no path.
-        tap.observe(&named(VOTE_TRACKING, &[("slot", "102i")]));
+        tap.observe_point(&named(VOTE_TRACKING, &[("slot", "102i")]));
 
         assert_eq!(tap.take_finalized_paths(), vec![(100, true), (101, false)]);
         assert!(tap.take_finalized_paths().is_empty(), "taken once");
@@ -3210,7 +3059,7 @@ mod tests {
     fn test_finality_needs_the_first_shred_and_the_full_block() {
         let tap = MetricsTap::default();
         full_block_at(&tap, "101i", "100i");
-        tap.observe(&named(
+        tap.observe_point(&named(
             VOTE_TRACKING,
             &[
                 ("slot", "101i"),
@@ -3218,7 +3067,7 @@ mod tests {
                 ("finalized", "45000i"),
             ],
         ));
-        tap.observe(&named(
+        tap.observe_point(&named(
             VOTE_TRACKING,
             &[
                 ("slot", "102i"),
@@ -3227,7 +3076,7 @@ mod tests {
             ],
         ));
         full_block_at(&tap, "103i", "300i");
-        tap.observe(&named(
+        tap.observe_point(&named(
             VOTE_TRACKING,
             &[
                 ("slot", "103i"),
@@ -3244,7 +3093,7 @@ mod tests {
         let tap = MetricsTap::default();
         for (slot, voted) in [("104i", "30000i"), ("108i", "10000i"), ("112i", "20000i")] {
             full_block_at(&tap, slot, "0i");
-            tap.observe(&named(
+            tap.observe_point(&named(
                 VOTE_TRACKING,
                 &[
                     ("slot", slot),
@@ -3260,7 +3109,7 @@ mod tests {
     #[test]
     fn test_a_replayed_slot_is_read_field_by_field() {
         let tap = MetricsTap::default();
-        tap.observe(&replay_point(&[
+        tap.observe_point(&replay_point(&[
             ("fetch_entries_time", "2034i"),
             ("confirmation_without_replay_us", "17288i"),
             ("bank_complete_time_us", "443i"),
@@ -3288,7 +3137,7 @@ mod tests {
     #[test]
     fn test_an_alpenglow_slot_reports_the_same_timings_under_its_other_names() {
         let tap = MetricsTap::default();
-        tap.observe(&replay_point(&[
+        tap.observe_point(&replay_point(&[
             ("fetch_entries_time", "2034i"),
             ("confirmation_time_us", "17288i"),
             ("bank_complete_time_us", "443i"),
@@ -3309,14 +3158,14 @@ mod tests {
     fn test_the_status_field_carries_no_micros_suffix() {
         // Every figure around it ends `_us` and this one does not.
         let tap = MetricsTap::default();
-        tap.observe(&replay_point(&[("update_transaction_statuses", "1212i")]));
+        tap.observe_point(&replay_point(&[("update_transaction_statuses", "1212i")]));
         assert_eq!(tap.replay_slots()[0].other, 1_212);
     }
 
     #[test]
     fn test_the_costs_of_a_program_cache_miss_are_summed() {
         let tap = MetricsTap::default();
-        tap.observe(&replay_point(&[
+        tap.observe_point(&replay_point(&[
             ("execute_details_create_executor_load_elf_us", "12506i"),
             ("execute_details_create_executor_verify_code_us", "1701i"),
             ("execute_details_create_executor_jit_compile_us", "7486i"),
@@ -3328,7 +3177,7 @@ mod tests {
     fn test_a_point_naming_nothing_this_reads_is_dropped() {
         // A point this does not understand would drag every mean down.
         let tap = MetricsTap::default();
-        tap.observe(&replay_point(&[("some_field_from_a_later_release", "9i")]));
+        tap.observe_point(&replay_point(&[("some_field_from_a_later_release", "9i")]));
         assert!(tap.replay_slots().is_empty());
     }
 
@@ -3336,7 +3185,7 @@ mod tests {
     fn test_only_the_newest_replayed_slots_are_kept() {
         let tap = MetricsTap::default();
         for slot in 0..REPLAY_SLOTS.saturating_add(10) {
-            tap.observe(&replay_point(&[
+            tap.observe_point(&replay_point(&[
                 ("slot", &format!("{slot}i")),
                 ("execute_us", &format!("{slot}i")),
             ]));
@@ -3350,11 +3199,11 @@ mod tests {
     #[test]
     fn test_a_leader_slot_is_kept_whole_rather_than_accumulated() {
         let tap = MetricsTap::default();
-        tap.observe(&slot_point(
+        tap.observe_point(&slot_point(
             430_789_128,
             &[("num_received", "500i"), ("num_buffered", "80i")],
         ));
-        tap.observe(&slot_point(
+        tap.observe_point(&slot_point(
             430_789_129,
             &[("num_received", "600i"), ("num_buffered", "90i")],
         ));
@@ -3374,30 +3223,11 @@ mod tests {
         let mut bare = DataPoint::new(SCHEDULER_SLOT_COUNTS);
         bare.fields.push(("slot", "430789128".to_string()));
         bare.fields.push(("num_received", "500i".to_string()));
-        tap.observe(&bare);
+        tap.observe_point(&bare);
         assert!(tap.slot_waterfalls().is_empty());
 
-        tap.observe(&slot_point(430_789_128, &[("num_received", "500i")]));
+        tap.observe_point(&slot_point(430_789_128, &[("num_received", "500i")]));
         assert_eq!(tap.slot_waterfalls().len(), 1);
-    }
-
-    #[test]
-    fn test_a_waterfall_with_no_slot_is_dropped() {
-        let tap = MetricsTap::default();
-        tap.observe(&named(SCHEDULER_SLOT_COUNTS, &[("num_received", "500i")]));
-        assert!(tap.slot_waterfalls().is_empty());
-    }
-
-    #[test]
-    fn test_a_slot_reported_twice_keeps_one_row() {
-        // Appending would leave two rows for one slot.
-        let tap = MetricsTap::default();
-        tap.observe(&slot_point(100, &[("num_scheduled", "5i")]));
-        tap.observe(&slot_point(100, &[("num_scheduled", "9i")]));
-
-        let held = tap.slot_waterfalls();
-        assert_eq!(held.len(), 1);
-        assert_eq!(held[0].counts.scheduled, 9);
     }
 
     #[test]
@@ -3417,7 +3247,7 @@ mod tests {
                 } else {
                     &[("num_received", "710i"), ("num_buffered", "717i")]
                 };
-                tap.observe(&tagged_slot_point(id, 100, fields));
+                tap.observe_point(&tagged_slot_point(id, 100, fields));
             }
 
             let held = tap.slot_waterfalls();
@@ -3430,9 +3260,9 @@ mod tests {
     #[test]
     fn test_the_scheduler_that_built_the_slot_is_named() {
         let tap = MetricsTap::default();
-        tap.observe(&tagged_slot_point("0", 1, &[("num_scheduled", "5i")]));
-        tap.observe(&tagged_slot_point("10000", 2, &[("num_scheduled", "5i")]));
-        tap.observe(&slot_point(3, &[("num_scheduled", "5i")]));
+        tap.observe_point(&tagged_slot_point("0", 1, &[("num_scheduled", "5i")]));
+        tap.observe_point(&tagged_slot_point("10000", 2, &[("num_scheduled", "5i")]));
+        tap.observe_point(&slot_point(3, &[("num_scheduled", "5i")]));
 
         let held = tap.slot_waterfalls();
         let sources: Vec<SchedulerSource> = held.iter().map(|slot| slot.source).collect();
@@ -3449,8 +3279,8 @@ mod tests {
     #[test]
     fn test_an_empty_leader_slot_keeps_the_report_that_saw_the_most() {
         let tap = MetricsTap::default();
-        tap.observe(&tagged_slot_point("10000", 100, &[("num_received", "2i")]));
-        tap.observe(&tagged_slot_point("0", 100, &[("num_buffered", "31i")]));
+        tap.observe_point(&tagged_slot_point("10000", 100, &[("num_received", "2i")]));
+        tap.observe_point(&tagged_slot_point("0", 100, &[("num_buffered", "31i")]));
 
         let held = tap.slot_waterfalls();
         assert_eq!(held.len(), 1);
@@ -3462,14 +3292,14 @@ mod tests {
     fn test_leader_slots_below_the_floor_are_dropped_and_refused() {
         let tap = MetricsTap::default();
         for slot in 0..8 {
-            tap.observe(&slot_point(slot, &[("num_received", "1i")]));
-            tap.observe(&cost_point(true, &[("bank_slot", &format!("{slot}i"))]));
+            tap.observe_point(&slot_point(slot, &[("num_received", "1i")]));
+            tap.observe_point(&cost_point(true, &[("bank_slot", &format!("{slot}i"))]));
         }
         tap.take_changed_waterfalls();
         tap.hold_slots_from(5);
         assert_eq!(tap.slot_waterfalls().first().map(|w| w.slot), Some(5));
         assert_eq!(tap.slot_costs().first().map(|c| c.slot), Some(5));
-        tap.observe(&slot_point(2, &[("num_received", "1i")]));
+        tap.observe_point(&slot_point(2, &[("num_received", "1i")]));
         assert_eq!(tap.slot_waterfalls().len(), 3);
         assert!(tap.take_changed_waterfalls().is_empty());
     }
@@ -3477,8 +3307,8 @@ mod tests {
     #[test]
     fn test_each_slot_changed_is_taken_once() {
         let tap = MetricsTap::default();
-        tap.observe(&slot_point(20, &[("num_received", "1i")]));
-        tap.observe(&slot_point(21, &[("num_received", "1i")]));
+        tap.observe_point(&slot_point(20, &[("num_received", "1i")]));
+        tap.observe_point(&slot_point(21, &[("num_received", "1i")]));
         assert_eq!(
             tap.take_changed_waterfalls()
                 .iter()
@@ -3487,14 +3317,14 @@ mod tests {
             [20, 21]
         );
         assert!(tap.take_changed_waterfalls().is_empty());
-        tap.observe(&slot_point(20, &[("num_buffered", "9i")]));
+        tap.observe_point(&slot_point(20, &[("num_buffered", "9i")]));
         assert_eq!(tap.take_changed_waterfalls().len(), 1, "more work replaces");
-        tap.observe(&slot_point(20, &[("num_buffered", "2i")]));
+        tap.observe_point(&slot_point(20, &[("num_buffered", "2i")]));
         assert!(
             tap.take_changed_waterfalls().is_empty(),
             "less work does not"
         );
-        tap.observe(&cost_point(true, &[("bank_slot", "20i")]));
+        tap.observe_point(&cost_point(true, &[("bank_slot", "20i")]));
         assert_eq!(tap.take_changed_costs().len(), 1);
         assert_eq!(tap.recent_costs(8).len(), 1);
     }
@@ -3503,7 +3333,7 @@ mod tests {
     fn test_the_costliest_account_is_counted_over_the_blocks_held() {
         let tap = MetricsTap::default();
         for (slot, account, cost) in [(1, "A", "5i"), (2, "B", "9i"), (3, "A", "7i")] {
-            tap.observe(&cost_point(
+            tap.observe_point(&cost_point(
                 true,
                 &[
                     ("bank_slot", &format!("{slot}i")),
@@ -3523,22 +3353,6 @@ mod tests {
             })
         );
         assert_eq!(found.get("C"), None);
-    }
-
-    #[test]
-    fn test_the_flush_point_is_read() {
-        let tap = MetricsTap::default();
-        tap.observe(&named(
-            ACCOUNTS_FLUSH,
-            &[
-                ("num_accounts_stored", "500i"),
-                ("account_bytes_stored", "64000i"),
-            ],
-        ));
-
-        let read = tap.counters().accounts;
-        assert_eq!(read.stored_accounts, 500);
-        assert_eq!(read.stored_bytes, 64_000);
     }
 
     const QUIC_POINT: &[(&str, &str)] = &[
@@ -3570,10 +3384,10 @@ mod tests {
     fn test_the_quic_fields_are_the_ones_the_point_carries() {
         // A name from the struct rather than the wire reads nought for ever.
         let tap = MetricsTap::default();
-        tap.observe(&named(QUIC_TPU, QUIC_POINT));
+        tap.observe_point(&named(QUIC_TPU, QUIC_POINT));
 
         let read = tap.counters();
-        let quic = read.quic;
+        let quic = read.quic.totals;
         assert_eq!(quic.offered, 18_420);
         assert_eq!(quic.shed_all, 2_140);
         assert_eq!(quic.shed_address, 6_880);
@@ -3593,8 +3407,8 @@ mod tests {
         assert_eq!(quic.handed_on, 900);
         assert_eq!(quic.queue_full, 8);
         assert_eq!(quic.disconnected, 1);
-        assert_eq!(read.quic_levels.open, 1_284);
-        assert_eq!(read.quic_levels.active_streams, 46);
+        assert_eq!(read.quic.levels.open, 1_284);
+        assert_eq!(read.quic.levels.active_streams, 46);
     }
 
     #[test]
@@ -3602,17 +3416,18 @@ mod tests {
         // Four overlapping names for one refusal. The tap reads them apart; the panel
         // takes the larger rather than the sum.
         let tap = MetricsTap::default();
-        tap.observe(&named(
+        tap.observe_point(&named(
             QUIC_TPU,
             &[
                 ("connection_add_failed", "40i"),
                 ("connection_add_failed_staked_node", "3i"),
                 ("connection_add_failed_unstaked_node", "40i"),
                 ("connection_add_failed_banned", "2i"),
+                ("connection_add_failed_on_pruning", "9i"),
             ],
         ));
 
-        let quic = tap.counters().quic;
+        let quic = tap.counters().quic.totals;
         assert_eq!(quic.add_failed, 40);
         assert_eq!(quic.add_failed_staked, 3);
         assert_eq!(quic.add_failed_unstaked, 40);
@@ -3620,35 +3435,17 @@ mod tests {
     }
 
     #[test]
-    fn test_the_pruning_alias_is_left_out_of_the_refusals() {
-        let tap = MetricsTap::default();
-        tap.observe(&named(
-            QUIC_TPU,
-            &[
-                ("connection_add_failed_on_pruning", "9i"),
-                ("connection_add_failed_staked_node", "9i"),
-            ],
-        ));
-
-        let quic = tap.counters().quic;
-        assert_eq!(quic.add_failed_staked, 9);
-        assert_eq!(quic.add_failed, 0);
-        assert_eq!(quic.add_failed_unstaked, 0);
-        assert_eq!(quic.add_failed_banned, 0);
-    }
-
-    #[test]
     fn test_the_cumulative_offer_is_stored_rather_than_added() {
         // Every counter is reported with `swap` except the offer, which arrives cumulative.
         let tap = MetricsTap::default();
-        tap.observe(&named(
+        tap.observe_point(&named(
             QUIC_TPU,
             &[
                 ("total_incoming_connection_attempts", "1000i"),
                 ("new_streams", "10i"),
             ],
         ));
-        tap.observe(&named(
+        tap.observe_point(&named(
             QUIC_TPU,
             &[
                 ("total_incoming_connection_attempts", "1600i"),
@@ -3656,7 +3453,7 @@ mod tests {
             ],
         ));
 
-        let quic = tap.counters().quic;
+        let quic = tap.counters().quic.totals;
         assert_eq!(quic.offered, 1_600);
         assert_eq!(quic.streams, 20);
     }
@@ -3664,16 +3461,16 @@ mod tests {
     #[test]
     fn test_the_levels_are_the_latest_reading_rather_than_a_sum() {
         let tap = MetricsTap::default();
-        tap.observe(&named(
+        tap.observe_point(&named(
             QUIC_TPU,
             &[("open_connections", "900i"), ("active_streams", "12i")],
         ));
-        tap.observe(&named(
+        tap.observe_point(&named(
             QUIC_TPU,
             &[("open_connections", "870i"), ("active_streams", "9i")],
         ));
 
-        let levels = tap.counters().quic_levels;
+        let levels = tap.counters().quic.levels;
         assert_eq!(levels.open, 870);
         assert_eq!(levels.active_streams, 9);
     }
@@ -3683,20 +3480,20 @@ mod tests {
         // Three listeners share field names under three point names; summed, the busiest hides the
         // others.
         let tap = MetricsTap::default();
-        tap.observe(&named(QUIC_TPU, &[("new_streams", "900i")]));
-        tap.observe(&named(QUIC_TPU_FORWARDS, &[("new_streams", "40i")]));
-        tap.observe(&named(QUIC_TPU_VOTE, &[("new_streams", "70i")]));
+        tap.observe_point(&named(QUIC_TPU, &[("new_streams", "900i")]));
+        tap.observe_point(&named(QUIC_TPU_FORWARDS, &[("new_streams", "40i")]));
+        tap.observe_point(&named(QUIC_TPU_VOTE, &[("new_streams", "70i")]));
 
         let read = tap.counters();
-        assert_eq!(read.quic.streams, 900);
-        assert_eq!(read.quic_forwards.streams, 40);
-        assert_eq!(read.quic_vote.streams, 70);
+        assert_eq!(read.quic.totals.streams, 900);
+        assert_eq!(read.quic_forwards.totals.streams, 40);
+        assert_eq!(read.quic_vote.totals.streams, 70);
     }
 
     #[test]
     fn test_the_accounts_points_add_into_one_set_of_figures() {
         let tap = MetricsTap::default();
-        tap.observe(&named(
+        tap.observe_point(&named(
             ACCOUNTS_LOADS,
             &[
                 ("num_loaded_from_write_cache", "10i"),
@@ -3704,14 +3501,14 @@ mod tests {
                 ("num_loaded_from_index_storage", "40i"),
             ],
         ));
-        tap.observe(&named(
+        tap.observe_point(&named(
             ACCOUNTS_FLUSH,
             &[
                 ("num_accounts_stored", "500i"),
                 ("account_bytes_stored", "64000i"),
             ],
         ));
-        tap.observe(&named(
+        tap.observe_point(&named(
             ACCOUNTS_STORES,
             &[
                 ("total_bytes", "137400000000i"),
@@ -3721,10 +3518,105 @@ mod tests {
         ));
 
         let counters = tap.counters();
-        assert_eq!(counters.accounts.loaded_from_storage, 40);
-        assert_eq!(counters.accounts.stored_bytes, 64_000);
-        assert_eq!(counters.accounts_storage_alive_bytes, 27_700_000_000);
-        assert_eq!(counters.accounts_storage_count, 812);
+        assert_eq!(counters.accounts.totals.loaded_from_storage, 40);
+        assert_eq!(counters.accounts.totals.stored_accounts, 500);
+        assert_eq!(counters.accounts.totals.stored_bytes, 64_000);
+        assert_eq!(counters.accounts.levels.storage_alive_bytes, 27_700_000_000);
+        assert_eq!(counters.accounts.levels.storage_count, 812);
+    }
+
+    #[test]
+    fn test_upkeep_reads_each_point_by_its_own_fields() {
+        let tap = MetricsTap::default();
+        tap.observe_point(&named(
+            ACCOUNTS_INDEX,
+            &[
+                ("count", "900i"),
+                ("count_in_mem", "900i"),
+                ("capacity_in_mem", "1024i"),
+                ("estimate_mem_bytes", "64000i"),
+                ("gets_from_mem", "70i"),
+                ("gets_missing", "5i"),
+                ("inserts", "3i"),
+                ("deletes", "2i"),
+            ],
+        ));
+        tap.observe_point(&named(
+            ACCOUNTS_WRITE_CACHE,
+            &[
+                ("total_size", "700i"),
+                ("num_slots", "4i"),
+                ("total_accounts_count", "30i"),
+            ],
+        ));
+        for root in ["100i", "200i"] {
+            tap.observe_point(&named(
+                ACCOUNTS_CLEAN,
+                &[
+                    ("max_clean_root", root),
+                    ("total_us", "1500i"),
+                    ("slots_cleaned", "8i"),
+                    ("num_accounts_removed_from_index", "6i"),
+                ],
+            ));
+        }
+        // The flush stores accounts too, under a name shrink also reports.
+        let shrunk = [
+            ("num_slots_shrunk", "2i"),
+            ("accounts_removed", "11i"),
+            ("bytes_removed", "4000i"),
+            ("bytes_written", "9000i"),
+            ("num_accounts_stored", "50i"),
+        ];
+        tap.observe_point(&named(ACCOUNTS_SHRINK, &shrunk));
+        tap.observe_point(&named(ACCOUNTS_SHRINK_ANCIENT, &shrunk));
+        // A clean still running counts once it ends.
+        let active = |job, running, at_millis| {
+            let mut point = named(ACCOUNTS_ACTIVE, &[(job, running)]);
+            point.timestamp = UNIX_EPOCH + std::time::Duration::from_millis(at_millis);
+            point
+        };
+        tap.observe_point(&active("clean", "1i", 1_000));
+        tap.observe_point(&active("flush", "1i", 1_000));
+        tap.observe_point(&active("flush", "0i", 1_040));
+        tap.observe_point(&active("shrink", "1i", 1_100));
+        tap.observe_point(&active("shrink", "0i", 1_300));
+        tap.observe_point(&active("squash_ancient", "1i", 1_300));
+        tap.observe_point(&active("squash_ancient", "0i", 1_350));
+
+        let counters = tap.counters();
+        assert_eq!(
+            counters.accounts_upkeep.totals,
+            AccountsUpkeepTotals {
+                index_found: 70,
+                index_missing: 5,
+                index_inserts: 3,
+                index_deletes: 2,
+                clean_runs: 2,
+                cleaned_slots: 16,
+                cleaned_accounts: 12,
+                shrunk_slots: 4,
+                shrunk_accounts: 22,
+                shrunk_bytes: 8000,
+                rewritten_bytes: 18000,
+                clean_micros: 0,
+                shrink_micros: 250_000,
+                flush_micros: 40_000,
+            }
+        );
+        assert_eq!(
+            counters.accounts_upkeep.levels,
+            AccountsUpkeepLevels {
+                index_entries: 900,
+                index_capacity: 1024,
+                index_bytes: 64000,
+                write_cache_bytes: 700,
+                write_cache_slots: 4,
+                write_cache_accounts: 30,
+                cleaned_to: 200,
+            }
+        );
+        assert_eq!(counters.accounts.totals.stored_accounts, 0);
     }
 
     #[test]
@@ -3732,28 +3624,28 @@ mod tests {
         // A level, not a count: summed, a steady hundred gigabytes would read as
         // terabytes within a minute.
         let tap = MetricsTap::default();
-        tap.observe(&named(ACCOUNTS_STORES, &[("total_bytes", "100i")]));
-        tap.observe(&named(ACCOUNTS_STORES, &[("total_bytes", "104i")]));
-        assert_eq!(tap.counters().accounts_storage_bytes, 104);
+        tap.observe_point(&named(ACCOUNTS_STORES, &[("total_bytes", "100i")]));
+        tap.observe_point(&named(ACCOUNTS_STORES, &[("total_bytes", "104i")]));
+        assert_eq!(tap.counters().accounts.levels.storage_bytes, 104);
     }
 
     #[test]
     fn test_a_level_is_replaced_rather_than_accumulated() {
         let tap = MetricsTap::default();
-        tap.observe(&named(PROGRAM_CACHE, &[("water_level", "400i")]));
-        tap.observe(&named(PROGRAM_CACHE, &[("water_level", "412i")]));
-        assert_eq!(tap.counters().program_cache_water_level, 412);
+        tap.observe_point(&named(PROGRAM_CACHE, &[("water_level", "400i")]));
+        tap.observe_point(&named(PROGRAM_CACHE, &[("water_level", "412i")]));
+        assert_eq!(tap.counters().program_cache.water_level, 412);
     }
 
     #[test]
     fn test_replace_entry_lands_on_replacements() {
         let tap = MetricsTap::default();
-        tap.observe(&named(
+        tap.observe_point(&named(
             PROGRAM_CACHE,
             &[("replace_entry", "3i"), ("hits", "90i"), ("misses", "10i")],
         ));
 
-        let cache = tap.counters().program_cache;
+        let cache = tap.counters().program_cache.totals;
         assert_eq!(cache.replacements, 3);
         assert_eq!(cache.hits, 90);
         assert_eq!(cache.misses, 10);
@@ -3764,7 +3656,7 @@ mod tests {
         // No counter exists for a failed signature; it is what is left once duplicates, underpaying
         // and verified are taken off.
         let tap = MetricsTap::default();
-        tap.observe(&named(
+        tap.observe_point(&named(
             TPU_VERIFIER,
             &[
                 ("total_packets", "1000i"),
@@ -3788,7 +3680,7 @@ mod tests {
     fn test_the_bundle_stage_adds_into_one_set() {
         let tap = MetricsTap::default();
         for _ in 0..2 {
-            tap.observe(&named(
+            tap.observe_point(&named(
                 BUNDLE_STAGE,
                 &[
                     ("num_bundles_received", "3i"),
@@ -3809,7 +3701,7 @@ mod tests {
     fn test_every_worker_adds_into_the_same_execution_totals() {
         let tap = MetricsTap::default();
         for _ in 0..4 {
-            tap.observe(&named(
+            tap.observe_point(&named(
                 WORKER_COUNTS,
                 &[
                     ("transactions_attempted_processing_count", "100i"),
@@ -3828,7 +3720,7 @@ mod tests {
     #[test]
     fn test_worker_error_reasons_join_its_counts() {
         let tap = MetricsTap::default();
-        tap.observe(&named(
+        tap.observe_point(&named(
             WORKER_COUNTS,
             &[
                 ("transactions_attempted_processing_count", "101i"),
@@ -3837,7 +3729,7 @@ mod tests {
                 ("processed_with_successful_result_count", "63i"),
             ],
         ));
-        tap.observe(&named(
+        tap.observe_point(&named(
             WORKER_ERROR_METRICS,
             &[
                 ("blockhash_not_found", "12i"),
@@ -3865,43 +3757,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_the_vote_verifier_is_not_counted_with_the_rest() {
-        // Votes never reach the scheduler, so counting them at the top would inflate a
-        // total the stages below cannot account for.
-        let tap = MetricsTap::default();
-        tap.observe(&named("tpu-vote-verifier", &[("total_packets", "5000i")]));
-        assert_eq!(tap.counters().verify.received, 0);
-    }
-
-    #[test]
-    fn test_the_priority_gauges_are_left_out_of_the_waterfall() {
-        let tap = MetricsTap::default();
-        tap.observe(&slot_point(
-            7,
-            &[
-                ("min_priority", "5i"),
-                ("max_priority", "900000i"),
-                ("num_received", "7i"),
-            ],
-        ));
-        assert_eq!(tap.slot_waterfalls()[0].counts.received, 7);
-    }
-
-    #[test]
-    fn test_only_the_packet_count_is_taken_from_a_receiver() {
-        let tap = MetricsTap::default();
-        tap.observe(&named(
-            SHREDS_TURBINE,
-            &[
-                ("packet_batches_count", "7i"),
-                ("packets_count", "900i"),
-                ("channel_len", "3i"),
-            ],
-        ));
-        assert_eq!(tap.counters().shreds_turbine, 900);
-    }
-
     fn xdp_point(
         zero_copy: bool,
         driver: &str,
@@ -3923,7 +3778,7 @@ mod tests {
         // A tag keeps its value; a string field arrives wrapped in quotes for the line
         // protocol.
         let tap = MetricsTap::default();
-        tap.observe(&xdp_point(
+        tap.observe_point(&xdp_point(
             true,
             "ice",
             "Intel Corporation",
@@ -3942,7 +3797,7 @@ mod tests {
     #[test]
     fn test_there_is_no_xdp_config_where_none_was_ever_reported() {
         let tap = MetricsTap::default();
-        tap.observe(&named(SHREDS_TURBINE, &[("packets_count", "1i")]));
+        tap.observe_point(&named(SHREDS_TURBINE, &[("packets_count", "1i")]));
         assert!(tap.xdp().is_none());
     }
 
@@ -3952,7 +3807,7 @@ mod tests {
         point.add_tag("driver", "mlx5_core");
         point.add_field_str("model", "MT2892 Family");
         let tap = MetricsTap::default();
-        tap.observe(&point);
+        tap.observe_point(&point);
 
         let xdp = tap
             .xdp()
@@ -3966,8 +3821,8 @@ mod tests {
     fn test_the_latest_xdp_report_stands() {
         // Overwriting lets a config read once the PCI database is available win over an early read.
         let tap = MetricsTap::default();
-        tap.observe(&xdp_point(false, "ice", "unknown", "unknown", "6.8.0"));
-        tap.observe(&xdp_point(
+        tap.observe_point(&xdp_point(false, "ice", "unknown", "unknown", "6.8.0"));
+        tap.observe_point(&xdp_point(
             false,
             "ice",
             "Intel Corporation",
@@ -3990,7 +3845,7 @@ mod tests {
     fn test_the_stake_seen_in_gossip_is_read_in_lamports() {
         let tap = MetricsTap::default();
         assert!(tap.stake_in_gossip().is_none());
-        tap.observe(&named(
+        tap.observe_point(&named(
             WFSM_GOSSIP,
             &[
                 ("online_stake", "2350000000000000i"),
@@ -4010,7 +3865,7 @@ mod tests {
     #[test]
     fn test_a_stake_point_without_a_total_is_dropped() {
         let tap = MetricsTap::default();
-        tap.observe(&named(WFSM_GOSSIP, &[("online_stake", "5i")]));
+        tap.observe_point(&named(WFSM_GOSSIP, &[("online_stake", "5i")]));
         assert!(tap.stake_in_gossip().is_none());
     }
 
@@ -4018,7 +3873,7 @@ mod tests {
     fn test_the_latest_stake_count_stands() {
         let tap = MetricsTap::default();
         for online in ["1i", "2i"] {
-            tap.observe(&named(
+            tap.observe_point(&named(
                 WFSM_GOSSIP,
                 &[("online_stake", online), ("total_activated_stake", "10i")],
             ));
@@ -4030,7 +3885,7 @@ mod tests {
     fn test_gossip_reports_add_into_their_totals_and_levels() {
         let tap = MetricsTap::default();
         for _ in 0..2 {
-            tap.observe(&named(
+            tap.observe_point(&named(
                 "cluster_info_stats",
                 &[
                     ("table_size", "231904i"),
@@ -4039,7 +3894,7 @@ mod tests {
                     ("num_nodes_staked", "1212i"),
                 ],
             ));
-            tap.observe(&named(
+            tap.observe_point(&named(
                 "cluster_info_stats2",
                 &[
                     ("purge_count", "352i"),
@@ -4047,14 +3902,14 @@ mod tests {
                     ("handle_batch_push_messages_time", "600i"),
                 ],
             ));
-            tap.observe(&named(
+            tap.observe_point(&named(
                 "cluster_info_stats4",
                 &[
                     ("skip_push_message_shred_version", "14i"),
                     ("num_duplicate_push_messages", "8i"),
                 ],
             ));
-            tap.observe(&named(
+            tap.observe_point(&named(
                 "cluster_info_stats5",
                 &[
                     ("packets_received_count", "23100i"),
@@ -4066,7 +3921,7 @@ mod tests {
         }
         let counters = tap.counters();
         assert_eq!(
-            counters.gossip_levels,
+            counters.gossip.levels,
             GossipLevels {
                 table_size: 231_904,
                 pubkeys: 4_112,
@@ -4074,7 +3929,7 @@ mod tests {
                 staked_nodes: 1_212
             }
         );
-        let gossip = counters.gossip;
+        let gossip = counters.gossip.totals;
         assert_eq!(gossip.reports, 2);
         assert_eq!(gossip.expired, 704);
         assert_eq!((gossip.process_us, gossip.push_us), (1_800, 1_200));
@@ -4096,7 +3951,7 @@ mod tests {
     #[test]
     fn test_gossip_entries_count_by_type_and_in_total() {
         let tap = MetricsTap::default();
-        tap.observe(&named(
+        tap.observe_point(&named(
             GOSSIP_ENTRIES,
             &[
                 ("Vote-push", "3900i"),
@@ -4106,7 +3961,7 @@ mod tests {
                 ("all-pull", "41i"),
             ],
         ));
-        tap.observe(&named(
+        tap.observe_point(&named(
             GOSSIP_ENTRY_FAILS,
             &[
                 ("Vote-push", "280i"),
@@ -4124,7 +3979,7 @@ mod tests {
             .iter()
             .position(|kind| *kind == "ContactInfo")
             .unwrap();
-        let entries = counters.gossip_entries;
+        let entries = counters.gossip.entries;
         assert_eq!(
             (
                 entries.push[vote],
@@ -4134,7 +3989,7 @@ mod tests {
             (3_900, 41, 288)
         );
         assert_eq!(entries.push[contact], 318);
-        let gossip = counters.gossip;
+        let gossip = counters.gossip.totals;
         assert_eq!(
             (
                 gossip.accepted_push,
